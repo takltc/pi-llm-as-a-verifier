@@ -1,0 +1,24 @@
+{
+  "name": "omp-llm-verifier",
+  "version": "0.1.0",
+  "description": "LLM-as-a-Verifier plugin for omp: fine-grained logprob-based reward scoring and Probabilistic Pivot Tournament best-of-N selection, using opencode-go/deepseek-v4-flash.",
+  "type": "module",
+  "license": "MIT",
+  "module": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "bin": {
+    "llm-verifier": "./src/cli.ts"
+  },
+  "scripts": {
+    "verify": "bun run bin/verify.mjs"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "file:/Users/tak/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent",
+    "@types/bun": "latest"
+  }
+}
