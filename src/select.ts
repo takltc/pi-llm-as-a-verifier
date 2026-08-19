@@ -1,18 +1,20 @@
-/**
- * Single-task best-of-N selection (public `select` API).
- *
- * Scores directed pairs with the fine-grained reward and aggregates them
- * with a Probabilistic Pivot Tournament — O(Nk) verifier comparisons
- * instead of a full O(N²) round-robin. Identical inputs with the same
- * `seed` run the identical tournament.
- */
+/** Single-task public API for Probabilistic Pivot Tournament selection. */
 
-import { VerifierClient, USAGE, type UsageSnapshot } from "./client.ts";
-import { TERMINAL_BENCH_CRITERIA, type Criterion } from "./prompt.ts";
-import { extractScore, type VerifierReply } from "./scale.ts";
-import { ringCycle, bradleyTerry, selectPivots, pivotRoundPairs } from "./ppt.ts";
-import { directedReward } from "./cache.ts";
-import { mulberry32, scoreDirectedPairs } from "./run.ts";
+import { VerifierClient, USAGE, diffUsage, type UsageSnapshot } from "./client.ts";
+import {
+  GROUND_TRUTH_NOTE,
+  normalizeCriteria,
+  type Criterion,
+} from "./prompt.ts";
+import { bradleyTerry, pivotRoundPairs, ringCycle, selectPivots } from "./ppt.ts";
+import { directedReward, mergeCaches, type ScoreCache } from "./cache.ts";
+import {
+  contextResolver,
+  mulberry32,
+  scoreDirectedPairs,
+  validateVerifyOptions,
+} from "./run.ts";
+
 export interface Candidate {
   name: string;
   trace: string;
@@ -36,135 +38,140 @@ export interface SelectOptions {
 export interface SelectResult {
   index: number;
   best: string;
-  scores: number[]; // per-candidate mean preference w_i / c_i
+  scores: number[];
   ranking: number[];
   nComparisons: number;
   criteria: string[];
   usage: UsageSnapshot;
 }
 
-export function select(
+export async function select(
   problem: string,
   candidates: Candidate[],
   opts: SelectOptions = {},
 ): Promise<SelectResult> {
-  if (candidates.length === 0) {
-    throw new Error("select: no candidates given");
+  if (typeof problem !== "string" || !problem.trim()) {
+    throw new Error("select: problem must be a non-empty string");
   }
-  const criteria = normalizeCriteriaArg(opts.criteria);
-  const criteriaIds = criteria.map((c) => c.id);
-  const k = opts.pivots ?? 2;
-  const nReps = opts.nEvaluations ?? 2;
-  const seed = opts.seed ?? 0;
-  const maxWorkers = opts.maxWorkers ?? 16;
-  const note = opts.groundTruthNote ?? "";
+  if (!Array.isArray(candidates) || candidates.length < 2) {
+    throw new Error("select: at least two candidates are required");
+  }
+  for (const [index, candidate] of candidates.entries()) {
+    if (!candidate || typeof candidate !== "object" || typeof candidate.trace !== "string") {
+      throw new Error(`select: candidate ${index} trace must be a string`);
+    }
+    if (candidate.name !== undefined && typeof candidate.name !== "string") {
+      throw new Error(`select: candidate ${index} name must be a string`);
+    }
+    if (!candidate.trace.trim()) throw new Error(`select: candidate ${index} has an empty trace`);
+  }
+
+  const criteria = normalizeCriteria(opts.criteria ?? "terminal_bench");
+  const taskName = opts.taskName?.trim() || "task";
   const client = opts.client ?? new VerifierClient();
-  const taskName = opts.taskName ?? "task";
+  const note = opts.groundTruthNote === undefined ? GROUND_TRUTH_NOTE : opts.groundTruthNote;
+  const tasks = {
+    [taskName]: candidates.map((candidate, index) => ({
+      trialName: candidate.name?.trim() || `candidate_${index}`,
+      reward: 0 as const,
+      problem,
+      trace: candidate.trace,
+    })),
+  };
+  const { k, nReps, seed, maxWorkers } = validateVerifyOptions(tasks, criteria, {
+    pivots: opts.pivots,
+    nEvaluations: opts.nEvaluations,
+    seed: opts.seed,
+    maxWorkers: opts.maxWorkers,
+  });
+  const usageBefore = USAGE.snapshot();
   const rng = mulberry32(seed);
+  const ring = ringCycle(candidates.length, rng);
 
-  return (async () => {
-    // One task with N trials; rewards are unknown here, so keep the task in
-    // the swing set to force a full PPT regardless of outcome.
-    const tasks = {
-      [taskName]: candidates.map((c, i) => ({
-        trialName: c.name || `candidate_${i}`,
-        reward: 0 as const,
-        problem,
-        trace: c.trace,
-      })),
-    };
-    const ring = ringCycle(candidates.length, rng);
+  if (opts.progress !== false) console.log(`Phase A: ring pass (${ring.length} comparisons)`);
+  let scores = await scoreDirectedPairs(
+    client,
+    tasks,
+    { [taskName]: ring },
+    criteria,
+    note,
+    nReps,
+    maxWorkers,
+    opts.cacheFile,
+    {
+      onError: opts.onError,
+      progress: opts.progress,
+      signal: opts.signal,
+    },
+  );
 
-    console.log(`Phase A: ring pass (${ring.length} comparisons)`);
-    let scores = await scoreDirectedPairs(
-      client,
-      tasks,
-      { [taskName]: ring },
-      criteria,
-      note,
+  const directed = (scoreCache: ScoreCache, a: number, b: number): [number, number] =>
+    directedReward(
+      scoreCache,
+      taskName,
+      a,
+      b,
+      criteria.map((criterion) => criterion.id),
       nReps,
-      maxWorkers,
-      opts.cacheFile,
-      { onError: opts.onError, progress: opts.progress, signal: opts.signal },
+      contextResolver(client, tasks[taskName], taskName, a, b, note, criteria),
     );
 
-    const directed = (a: number, b: number): [number, number] =>
-      directedReward(scores, taskName, a, b, criteriaIds, nReps);
-
-    const n = candidates.length;
-    const w = new Array<number>(n).fill(0);
-    const c = new Array<number>(n).fill(0);
-    const accumulate = (pairs: Array<[number, number]>) => {
-      for (const [a, b] of pairs) {
-        const [ra, rb] = directed(a, b);
-        const p = bradleyTerry(ra, rb);
-        w[a] += p; c[a] += 1; w[b] += 1 - p; c[b] += 1;
-      }
-    };
-    accumulate(ring);
-
-    const pivots = selectPivots(w, c, k);
-    const prPairs = pivotRoundPairs(n, pivots);
-    console.log(`Phase B: pivot rounds (${prPairs.length} comparisons)`);
-    scores = await scoreDirectedPairs(
-      client,
-      tasks,
-      { [taskName]: prPairs },
-      criteria,
-      note,
-      nReps,
-      maxWorkers,
-      opts.cacheFile,
-      { onError: opts.onError, progress: opts.progress, signal: opts.signal },
-    );
-    accumulate(prPairs);
-
-    let best = 0;
-    const scoresPerCandidate = new Array<number>(n).fill(0);
-    for (let i = 0; i < n; i++) {
-      scoresPerCandidate[i] = c[i] ? w[i] / c[i] : 0;
-      // Strictly greater wins, so ties keep the earlier index — same
-      // tie-break as the reference (`max(range(n), key=(w/c, -i))` picks
-      // the lower index too).
-      if (i > 0 && scoresPerCandidate[i] > scoresPerCandidate[best]) {
-        best = i;
-      }
-    }
-    const ranking = Array.from({ length: n }, (_, i) => i).sort(
-      (a, b) => scoresPerCandidate[b] - scoresPerCandidate[a] || a - b,
-    );
-    return {
-      index: best,
-      best: candidates[best].name,
-      scores: scoresPerCandidate,
-      ranking,
-      nComparisons: ring.length + prPairs.length,
-      criteria: criteriaIds,
-      usage: USAGE.snapshot(),
-    };
-  })();
-}
-
-function normalizeCriteriaArg(
-  criteria: SelectOptions["criteria"],
-): Criterion[] {
-  if (criteria === undefined) return TERMINAL_BENCH_CRITERIA;
-  if (Array.isArray(criteria)) {
-    return criteria.map((c) =>
-      typeof c === "string"
-        ? { id: c.toLowerCase().replace(/\s+/g, "_"), name: c, description: c }
-        : c,
-    );
+  const n = candidates.length;
+  const w = new Array<number>(n).fill(0);
+  const c = new Array<number>(n).fill(0);
+  for (const [a, b] of ring) {
+    const [ra, rb] = directed(scores, a, b);
+    const preference = bradleyTerry(ra, rb);
+    w[a] += preference;
+    c[a] += 1;
+    w[b] += 1 - preference;
+    c[b] += 1;
   }
-  if (typeof criteria === "string") {
-    if (criteria === "terminal_bench" || criteria === "terminal_bench_2.1") {
-      return TERMINAL_BENCH_CRITERIA;
-    }
-    return [{ id: criteria, name: criteria, description: criteria }];
+  const pivots = selectPivots(w, c, Math.min(k, n));
+  const pivotPairs = pivotRoundPairs(n, pivots);
+  if (opts.progress !== false) console.log(`Phase B: pivot rounds (${pivotPairs.length} comparisons)`);
+  const phaseB = await scoreDirectedPairs(
+    client,
+    tasks,
+    { [taskName]: pivotPairs },
+    criteria,
+    note,
+    nReps,
+    maxWorkers,
+    opts.cacheFile,
+    {
+      onError: opts.onError,
+      progress: opts.progress,
+      signal: opts.signal,
+      initialCache: scores,
+    },
+  );
+  scores = mergeCaches(scores, phaseB);
+
+  for (const [a, b] of pivotPairs) {
+    const [ra, rb] = directed(scores, a, b);
+    const preference = bradleyTerry(ra, rb);
+    w[a] += preference;
+    c[a] += 1;
+    w[b] += 1 - preference;
+    c[b] += 1;
   }
-  return Object.entries(criteria).map(([name, description]) => ({
-    id: name.toLowerCase().replace(/\s+/g, "_"),
-    name,
-    description,
-  }));
+
+  const scoresPerCandidate = w.map((wins, index) => (c[index] ? wins / c[index] : 0));
+  let best = 0;
+  for (let index = 1; index < n; index++) {
+    if (scoresPerCandidate[index] > scoresPerCandidate[best]) best = index;
+  }
+  const ranking = Array.from({ length: n }, (_, index) => index).sort(
+    (a, b) => scoresPerCandidate[b] - scoresPerCandidate[a] || a - b,
+  );
+  return {
+    index: best,
+    best: candidates[best].name?.trim() || `candidate_${best}`,
+    scores: scoresPerCandidate,
+    ranking,
+    nComparisons: ring.length + pivotPairs.length,
+    criteria: criteria.map((criterion) => criterion.id),
+    usage: diffUsage(USAGE.snapshot(), usageBefore),
+  };
 }

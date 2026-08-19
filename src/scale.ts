@@ -156,3 +156,21 @@ export function extractScore(reply: VerifierReply, tag: string): number {
   }
   return 0.5;
 }
+
+/** Whether a reply contains a usable score for `tag`. */
+export function hasExtractableScore(reply: VerifierReply, tag: string): boolean {
+  const tagLp = findTagLogprobs(reply, tag);
+  if (tagLp?.some(([token, logprob]) => {
+    let normalized = token.trim();
+    if (normalized.startsWith(">")) normalized = normalized.slice(1).trim();
+    return LETTER_VALUES[normalized] !== undefined && Number.isFinite(logprob);
+  })) {
+    return true;
+  }
+  const tagName = tag.replace(/[<>]/g, "");
+  const pattern = new RegExp(
+    `<${tagName}>\\s*([A-T])\\s*</${tagName}>`,
+    "i",
+  );
+  return pattern.test(reply.text ?? "");
+}

@@ -1,241 +1,211 @@
-/**
- * omp LLM-as-a-Verifier plugin.
- *
- * Implements the LLM-as-a-Verifier framework (arXiv:2607.05391) inside omp:
- * fine-grained, logprob-based reward scoring and Probabilistic Pivot
- * Tournament best-of-N selection, using the same model the session already
- * uses — `opencode-go/deepseek-v4-flash:xhigh` by default — as the
- * self-verifier. The verifier reads token-level logprobs directly from the
- * opencode-go endpoint, so no session-model round-trip is involved.
- *
- * Surfaces:
- *   - `/verify <traj_dir>`        run self-verification over a trajectory
- *                                 directory (Terminal-Bench 2.1 layout), pick
- *                                 the best trial per task, report Pass@1 vs
- *                                 verifier vs oracle.
- *   - `/vcompare <a.json> <b.json>` fine-grained reward for one comparison.
- *   - tool `verifier_select`      best-of-N selection callable by the agent.
- */
+/** OMP extension entry point for LLM-as-a-Verifier self-verification. */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { statSync, readdirSync, readFileSync } from "node:fs";
-import { VerifierClient, formatUsage } from "./client.ts";
-import { buildPrompt, TERMINAL_BENCH_CRITERIA } from "./prompt.ts";
-import { extractScore } from "./scale.ts";
+import { isAbsolute, resolve } from "node:path";
 import {
+  DEFAULT_MODEL_SELECTOR,
+  VerifierClient,
+  formatUsage,
+} from "./client.ts";
+import {
+  GROUND_TRUTH_NOTE,
+  TERMINAL_BENCH_CRITERIA,
+  buildPrompt,
+  normalizeCriteria,
+} from "./prompt.ts";
+import { extractScore, hasExtractableScore } from "./scale.ts";
+import {
+  detectInputLayout,
   loadCandidateDir,
   loadTerminalDir,
-  formatTrace,
-  extractProblem,
+  loadTrajectoryFile,
+  type Tasks,
 } from "./loader.ts";
-import { runBenchmark, renderReport } from "./run.ts";
+import { renderReport, runBenchmark } from "./run.ts";
 import { select } from "./select.ts";
 
-export default function (pi: ExtensionAPI) {
+export default function verifierExtension(pi: ExtensionAPI): void {
   pi.setLabel("LLM-as-a-Verifier");
 
-  // ------------------------------------------------------------------
-  // /verify — batch self-verification over a trajectory directory
-  // ------------------------------------------------------------------
   pi.registerCommand("verify", {
     description:
-      "Run LLM-as-a-Verifier best-of-N selection over trajectory files " +
-      "(Terminal-Bench layout: <dir>/<task>/*_trajectory.json) and report " +
-      "Pass@1 / verifier / oracle. Options: --pivots N --k N --seed N " +
-      "--workers N --effort xhigh --cache <path> --trials N --tasks a,b",
+      "Run Terminal-Bench-style best-of-N self-verification. " +
+      "Usage: /verify <traj_dir> [--pivots 1] [--k 2] [--seed 0] " +
+      "[--workers 16] [--model opencode-go/deepseek-v4-flash:xhigh]",
     handler: async (args, ctx) => {
-      const cwd = ctx.cwd;
-      const parsed = parseArgs(args);
-      const dir = parsed.positionals[0] || cwd;
-      const options = {
-        pivots: parsed.optInt("pivots"),
-        nEvaluations: parsed.optInt("k") ?? parsed.optInt("evaluations"),
-        seed: parsed.optInt("seed"),
-        maxWorkers: parsed.optInt("workers"),
-        effort: parsed.opts["effort"],
-        maxTokens: parsed.optInt("max-tokens"),
-      };
-
-      ctx.ui.notify(
-        `LLM-as-a-Verifier: loading trajectories from ${dir} …`,
-        "info",
-      );
       try {
-        let tasks;
-        if (fsIsDir(dir) && hasSubdirs(dir)) {
-          ({ tasks } = loadTerminalDir(dir));
-        } else {
-          ({ tasks } = loadCandidateDir(dir, "task"));
-        }
-        if (Object.keys(tasks).length === 0) {
-          ctx.ui.notify("No trajectory JSON files found.", "error");
+        const parsed = parseArgs(args);
+        assertKnownOptions(parsed, [
+          "pivots",
+          "k",
+          "evaluations",
+          "seed",
+          "workers",
+          "effort",
+          "model",
+          "max-tokens",
+          "cache",
+          "trials",
+          "tasks",
+          "note",
+          "help",
+        ]);
+        if (parsed.opts.help) {
+          ctx.ui.notify(
+            "/verify <traj_dir> [--pivots 1] [--k 2] [--seed 0] [--workers 16] " +
+              "[--trials 5] [--tasks a,b] [--cache path] [--effort xhigh]",
+            "info",
+          );
           return;
         }
-        const trialLimit = parsed.optInt("trials");
-        if (trialLimit) {
-          for (const name of Object.keys(tasks)) {
-            tasks[name] = tasks[name].slice(0, trialLimit);
-          }
+        if (parsed.positionals.length > 1) {
+          throw new Error("/verify accepts one trajectory directory");
         }
-        const taskFilter = parsed.opts["tasks"];
+        const dir = resolvePath(ctx.cwd, parsed.positionals[0] || ctx.cwd);
+        ctx.ui.notify(`LLM-as-a-Verifier: loading trajectories from ${dir} …`, "info");
+
+        let tasks = loadTasks(dir);
+        const trialLimit = parsed.optInt("trials");
+        if (trialLimit !== undefined) {
+          if (trialLimit < 2) throw new Error("--trials must be at least 2");
+          tasks = Object.fromEntries(
+            Object.entries(tasks).map(([name, trials]) => [name, trials.slice(0, trialLimit)]),
+          );
+        }
+        const taskFilter = parsed.opts.tasks;
         if (taskFilter) {
-          const keep = new Set(taskFilter.split(",").map((s) => s.trim()));
+          const keep = new Set(
+            taskFilter.split(",").map((name) => name.trim()).filter(Boolean),
+          );
+          if (keep.size === 0) throw new Error("--tasks requires at least one task name");
           tasks = Object.fromEntries(
             Object.entries(tasks).filter(([name]) => keep.has(name)),
           );
+          if (Object.keys(tasks).length === 0) {
+            throw new Error("--tasks did not match any loaded task");
+          }
         }
-        const cacheFile =
-          parsed.opts["cache"] || `${cwd}/.verifier-cache.json`;
+
+        const cacheFile = resolvePath(
+          ctx.cwd,
+          parsed.opts.cache || ".verifier-cache.json",
+        );
         const client = new VerifierClient({
-          effort: options.effort,
-          maxTokens: options.maxTokens,
+          model: parsed.opts.model,
+          effort: parsed.opts.effort,
+          maxTokens: parsed.optInt("max-tokens"),
         });
         const stats = await runBenchmark(tasks, TERMINAL_BENCH_CRITERIA, {
-          pivots: options.pivots,
-          nEvaluations: options.nEvaluations,
-          seed: options.seed,
-          maxWorkers: options.maxWorkers,
+          pivots: parsed.optInt("pivots"),
+          nEvaluations: parsed.optInt("k") ?? parsed.optInt("evaluations"),
+          seed: parsed.optInt("seed"),
+          maxWorkers: parsed.optInt("workers"),
           cacheFile,
           client,
-          groundTruthNote: parsed.opts["note"] ?? "",
+          groundTruthNote:
+            parsed.opts.note === undefined ? GROUND_TRUTH_NOTE : parsed.opts.note,
         });
-        const report = renderReport(stats) + "\n" +
-          formatUsage(stats.usage).join("\n") + "\n\n" +
-          "Winners per task (verifier choice, ground-truth reward):\n" +
-          Object.entries(stats.bestPerTask)
-            .map(
-              ([task, b]) =>
-                `  ${task}: trial #${b.index} (reward=${b.reward}, ` +
-                `w=${b.w.toFixed(3)}, c=${b.c})`,
-            )
-            .join("\n");
+        const winners = Object.entries(stats.bestPerTask)
+          .map(
+            ([task, result]) =>
+              `  ${task}: trial #${result.index} (reward=${result.reward}, ` +
+              `w=${result.w.toFixed(3)}, c=${result.c})`,
+          )
+          .join("\n");
+        const report = [
+          renderReport(stats),
+          formatUsage(stats.usage).join("\n"),
+          winners ? `\nWinners per task (verifier choice, ground-truth reward):\n${winners}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n");
         console.log(report);
         ctx.ui.notify(
           `Verifier: ${stats.verifier}/${stats.nTasks} tasks ` +
             `(${((100 * stats.verifier) / stats.nTasks).toFixed(1)}%) — ` +
-            `best-of-${stats.nRuns} Oracle: ` +
-            `${((100 * stats.oracle) / stats.nTasks).toFixed(1)}%`,
+            `Oracle Bo${stats.nRuns}: ${((100 * stats.oracle) / stats.nTasks).toFixed(1)}%`,
           "info",
         );
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.error(e);
-        ctx.ui.notify(`verify failed: ${msg}`, "error");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`verify failed: ${message}`);
+        ctx.ui.notify(`verify failed: ${message}`, "error");
       }
     },
   });
 
-  // ------------------------------------------------------------------
-  // /vcompare — one directed comparison
-  // ------------------------------------------------------------------
   pi.registerCommand("vcompare", {
     description:
-      "Score one pairwise comparison between two trajectory JSON files. " +
+      "Score two trajectory JSON files with the Terminal-Bench criteria. " +
       "Usage: /vcompare <a.json> <b.json> [--effort xhigh]",
     handler: async (args, ctx) => {
-      const parsed = parseArgs(args);
-      const [fa, fb] = parsed.positionals;
-      if (!fa || !fb) {
-        ctx.ui.notify("Usage: /vcompare <a.json> <b.json>", "error");
-        return;
-      }
-      const resolve = (p: string) =>
-        p.startsWith("/") ? p : `${ctx.cwd}/${p}`;
       try {
-        const da = JSON.parse(readFileSync(resolve(fa), "utf8").toString()) as {
-          trajectory?: { steps?: Array<Record<string, unknown>> };
-        };
-        const db = JSON.parse(readFileSync(resolve(fb), "utf8").toString()) as {
-          trajectory?: { steps?: Array<Record<string, unknown>> };
-        };
-        const traceA = formatTrace(da.trajectory as never);
-        const traceB = formatTrace(db.trajectory as never);
-        const problem = extractProblem(
-          (da.trajectory?.steps ?? []) as never,
-          "task",
-        );
-        const client = new VerifierClient({ effort: parsed.opts["effort"] });
-        const note = "";
-        const out: string[] = [];
-        for (const crit of TERMINAL_BENCH_CRITERIA) {
-          const prompt = buildPrompt(problem, traceA, traceB, crit, note);
-          const reply = await client.scoreReply(prompt);
-          const ra = extractScore(reply, "<score_A>");
-          const rb = extractScore(reply, "<score_B>");
-          out.push(
-            `  ${crit.id}: A=${ra.toFixed(4)}  B=${rb.toFixed(4)}`,
+        const parsed = parseArgs(args);
+        assertKnownOptions(parsed, ["effort", "model", "max-tokens", "note"]);
+        const [fileA, fileB] = parsed.positionals;
+        if (!fileA || !fileB || parsed.positionals.length !== 2) {
+          throw new Error("Usage: /vcompare <a.json> <b.json>");
+        }
+        const trialA = loadTrajectoryFile(resolvePath(ctx.cwd, fileA), "task");
+        const trialB = loadTrajectoryFile(resolvePath(ctx.cwd, fileB), "task");
+        const note = parsed.opts.note === undefined ? GROUND_TRUTH_NOTE : parsed.opts.note;
+        const client = new VerifierClient({
+          model: parsed.opts.model,
+          effort: parsed.opts.effort,
+          maxTokens: parsed.optInt("max-tokens"),
+        });
+        const output: string[] = [];
+        for (const criterion of TERMINAL_BENCH_CRITERIA) {
+          const reply = await client.scoreReply(
+            buildPrompt(trialA.problem, trialA.trace, trialB.trace, criterion, note),
+          );
+          if (!hasExtractableScore(reply, "<score_A>") || !hasExtractableScore(reply, "<score_B>")) {
+            throw new Error(`Verifier response omitted score tags for ${criterion.id}`);
+          }
+          output.push(
+            `  ${criterion.id}: A=${extractScore(reply, "<score_A>").toFixed(4)}  ` +
+              `B=${extractScore(reply, "<score_B>").toFixed(4)}`,
           );
         }
-        const text = `Comparison ${fa} vs ${fb}:\n${out.join("\n")}`;
-        console.log(text);
+        console.log(`Comparison ${fileA} vs ${fileB}:\n${output.join("\n")}`);
         ctx.ui.notify("vcompare done", "info");
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        ctx.ui.notify(`vcompare failed: ${msg}`, "error");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`vcompare failed: ${message}`, "error");
       }
     },
   });
 
-  // ------------------------------------------------------------------
-  // verifier_select tool — agent-callable best-of-N selection
-  // ------------------------------------------------------------------
   const z = pi.zod;
   pi.registerTool({
     name: "verifier_select",
     label: "Verifier Select",
     description:
-      "Select the best of N candidate agent trajectories for a task using " +
-      "the LLM-as-a-Verifier framework (fine-grained logprob rewards + " +
-      "Probabilistic Pivot Tournament, O(Nk) comparisons). Verifier model: " +
-      "opencode-go/deepseek-v4-flash:xhigh by default. Use when you have " +
-      "several candidate solutions/rollouts for the same task and want the " +
-      "most likely correct one, or to rank alternatives.",
+      "Select the strongest candidate trajectory using the 20-level " +
+      "logprob reward and Probabilistic Pivot Tournament. Default verifier: " +
+      DEFAULT_MODEL_SELECTOR +
+      ".",
     parameters: z.object({
-      task: z
-        .string()
-        .describe("The task description shown to the verifier."),
+      task: z.string().min(1).describe("Task description shown to the verifier."),
       candidates: z
         .array(
           z.object({
-            name: z.string().describe("Short label for this candidate."),
-            trace: z
-              .string()
-              .describe(
-                "The full agent trajectory for this candidate: steps, " +
-                  "commands run, terminal outputs, results.",
-              ),
+            name: z.string().describe("Short candidate label."),
+            trace: z.string().min(1).describe("Full trajectory including terminal output."),
           }),
         )
         .min(2)
-        .max(20)
-        .describe("Candidate trajectories to rank (2-20)."),
-      criteria: z
-        .array(z.string())
-        .optional()
-        .describe(
-          "Optional criteria names (default: terminal-bench criteria " +
-            "Specification Adherence / Output Match / Error Signal Detection).",
-        ),
-      pivots: z
-        .number()
-        .int()
-        .min(1)
-        .max(8)
-        .optional()
-        .describe("Number of tournament pivots k (default 2)."),
-      nEvaluations: z
-        .number()
-        .int()
-        .min(1)
-        .max(8)
-        .optional()
-        .describe("Repeated verifications K per criterion (default 2)."),
-      cacheFile: z
-        .string()
-        .optional()
-        .describe(
-          "Optional path to reuse/update a score cache across calls.",
-        ),
+        .max(20),
+      criteria: z.array(z.string().min(1)).optional(),
+      pivots: z.number().int().min(1).max(20).optional().describe("Pivot count (default 1)."),
+      nEvaluations: z.number().int().min(1).max(8).optional().describe("Repeats per criterion (default 2)."),
+      seed: z.number().int().optional(),
+      maxWorkers: z.number().int().min(1).max(64).optional(),
+      model: z.string().optional().describe(`OMP model selector (default ${DEFAULT_MODEL_SELECTOR}).`),
+      effort: z.string().optional(),
+      maxTokens: z.number().int().min(1).optional(),
+      cacheFile: z.string().optional(),
+      groundTruthNote: z.string().optional(),
     }),
     async execute(_toolCallId, rawParams, signal, _onUpdate, ctx) {
       const params = rawParams as {
@@ -244,42 +214,47 @@ export default function (pi: ExtensionAPI) {
         criteria?: string[];
         pivots?: number;
         nEvaluations?: number;
+        seed?: number;
+        maxWorkers?: number;
+        model?: string;
+        effort?: string;
+        maxTokens?: number;
         cacheFile?: string;
+        groundTruthNote?: string;
       };
-      const criteria = params.criteria
-        ? params.criteria.map((name: string) => ({
-            id: name.toLowerCase().replace(/\s+/g, "_"),
-            name,
-            description: name,
-          }))
-        : TERMINAL_BENCH_CRITERIA;
-      const result = await select(
-        params.task,
-        params.candidates.map(
-          (c: { name: string; trace: string }, i: number) => ({
-            name: c.name || `candidate_${i}`,
-            trace: c.trace,
-          }),
-        ),
-        {
-          criteria,
-          pivots: params.pivots,
-          nEvaluations: params.nEvaluations,
-          cacheFile: params.cacheFile,
-          signal: signal ?? undefined,
-          progress: false,
-        },
-      );
-      const lines = [
-        `Best candidate: #${result.index} (${result.best})`,
-        `Scores (mean preference): ${result.scores
-          .map((s) => s.toFixed(4))
-          .join(", ")}`,
-        `Ranking: ${result.ranking.join(" > ")}`,
-        `Comparisons: ${result.nComparisons}, criteria: ${result.criteria.join(",")}`,
-      ];
+      const client = new VerifierClient({
+        model: params.model,
+        effort: params.effort,
+        maxTokens: params.maxTokens,
+      });
+      const result = await select(params.task, params.candidates, {
+        criteria: params.criteria
+          ? normalizeCriteria(params.criteria)
+          : TERMINAL_BENCH_CRITERIA,
+        pivots: params.pivots,
+        nEvaluations: params.nEvaluations,
+        seed: params.seed,
+        maxWorkers: params.maxWorkers,
+        cacheFile: params.cacheFile
+          ? resolvePath(ctx.cwd, params.cacheFile)
+          : undefined,
+        groundTruthNote: params.groundTruthNote,
+        signal: signal ?? undefined,
+        progress: false,
+        client,
+      });
       return {
-        content: [{ type: "text", text: lines.join("\n") }],
+        content: [
+          {
+            type: "text",
+            text: [
+              `Best candidate: #${result.index} (${result.best})`,
+              `Scores: ${result.scores.map((score) => score.toFixed(4)).join(", ")}`,
+              `Ranking: ${result.ranking.join(" > ")}`,
+              `Comparisons: ${result.nComparisons}; criteria: ${result.criteria.join(",")}`,
+            ].join("\n"),
+          },
+        ],
         details: result,
       };
     },
@@ -289,74 +264,132 @@ export default function (pi: ExtensionAPI) {
     const client = new VerifierClient();
     if (!client.ready) {
       ctx.ui.notify(
-        "LLM-as-a-Verifier: no opencode-go credential found — run " +
-          "`/login opencode-go` or set OPENCODE_API_KEY.",
+        "LLM-as-a-Verifier needs an opencode-go credential; run `/login opencode-go` " +
+          "or set OPENCODE_API_KEY.",
         "info",
       );
-    } else {
-      ctx.ui.notify(
-        `LLM-as-a-Verifier ready (${client.model}@${client.effort}). ` +
-          "Use /verify or /vcompare.",
-        "info",
-      );
+      return;
     }
+    ctx.ui.notify(
+      `LLM-as-a-Verifier ready (opencode-go/${client.model}:${client.effort}). ` +
+        "Use /verify, /vcompare, or verifier_select.",
+      "info",
+    );
   });
 }
 
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
+function loadTasks(dir: string): Tasks {
+  return detectInputLayout(dir) === "terminal"
+    ? loadTerminalDir(dir).tasks
+    : loadCandidateDir(dir, "task").tasks;
+}
 
-interface ParsedArgs {
+function resolvePath(cwd: string, value: string): string {
+  return isAbsolute(value) ? value : resolve(cwd, value);
+}
+
+export interface ParsedArgs {
   positionals: string[];
   opts: Record<string, string>;
   optInt(name: string): number | undefined;
 }
 
-function parseArgs(args: string): ParsedArgs {
-  const tokens = args.split(/\s+/).filter(Boolean);
+export function tokenizeArgs(input: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | undefined;
+  let escaped = false;
+  let started = false;
+  const push = () => {
+    if (started) tokens.push(current);
+    current = "";
+    started = false;
+  };
+
+  for (const char of input) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      started = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = undefined;
+        started = true;
+      } else if (char === "\\" && quote === '"') {
+        escaped = true;
+      } else {
+        current += char;
+        started = true;
+      }
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      started = true;
+    } else if (char === "\\") {
+      escaped = true;
+      started = true;
+    } else if (/\s/.test(char)) {
+      push();
+    } else {
+      current += char;
+      started = true;
+    }
+  }
+  if (escaped) throw new Error("Trailing escape in command arguments");
+  if (quote) throw new Error("Unterminated quote in command arguments");
+  push();
+  return tokens;
+}
+
+export function parseArgs(args: string): ParsedArgs {
+  const tokens = tokenizeArgs(args);
   const positionals: string[] = [];
   const opts: Record<string, string> = {};
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i];
-    if (t.startsWith("--")) {
-      const name = t.slice(2);
-      const eq = name.indexOf("=");
-      if (eq >= 0) {
-        opts[name.slice(0, eq)] = name.slice(eq + 1);
-      } else if (i + 1 < tokens.length && !tokens[i + 1].startsWith("--")) {
-        opts[name] = tokens[++i];
+  let optionsEnded = false;
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (!optionsEnded && token === "--") {
+      optionsEnded = true;
+      continue;
+    }
+    if (!optionsEnded && token.startsWith("--")) {
+      const raw = token.slice(2);
+      if (!raw) throw new Error("Invalid empty option");
+      const equals = raw.indexOf("=");
+      const name = equals >= 0 ? raw.slice(0, equals) : raw;
+      if (!name) throw new Error(`Invalid option: ${token}`);
+      if (equals >= 0) {
+        opts[name] = raw.slice(equals + 1);
+      } else if (index + 1 < tokens.length && !tokens[index + 1].startsWith("--")) {
+        opts[name] = tokens[++index];
       } else {
         opts[name] = "true";
       }
     } else {
-      positionals.push(t);
+      positionals.push(token);
     }
   }
   return {
     positionals,
     opts,
     optInt(name) {
-      const v = opts[name];
-      if (v === undefined || v === "true") return undefined;
-      const n = Number(v);
-      return Number.isFinite(n) ? Math.trunc(n) : undefined;
+      const raw = opts[name];
+      if (raw === undefined) return undefined;
+      if (raw === "true") throw new Error(`--${name} requires an integer value`);
+      if (!/^-?\d+$/.test(raw)) throw new Error(`--${name} must be an integer`);
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value)) throw new Error(`--${name} is outside the safe integer range`);
+      return value;
     },
   };
 }
 
-function fsIsDir(p: string): boolean {
-  try {
-    return statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-function hasSubdirs(p: string): boolean {
-  try {
-    return readdirSync(p, { withFileTypes: true }).some((e) => e.isDirectory());
-  } catch {
-    return false;
+function assertKnownOptions(parsed: ParsedArgs, allowed: string[]): void {
+  const known = new Set(allowed);
+  for (const option of Object.keys(parsed.opts)) {
+    if (!known.has(option)) throw new Error(`Unknown option: --${option}`);
   }
 }

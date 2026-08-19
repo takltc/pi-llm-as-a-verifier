@@ -18,6 +18,8 @@ import { Database } from "bun:sqlite";
 export const DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1";
 export const DEFAULT_MODEL = "deepseek-v4-flash";
 export const DEFAULT_EFFORT = "xhigh"; // omp: opencode-go/deepseek-v4-flash:xhigh
+export const DEFAULT_MODEL_SELECTOR =
+  "opencode-go/deepseek-v4-flash:xhigh";
 export const DEFAULT_MAX_TOKENS = 65536; // xhigh thinking shares the budget
 
 export interface VerifierConfig {
@@ -37,6 +39,23 @@ export interface UsageSnapshot {
   outputTokens: number;
   reasoningTokens: number;
   cacheHitRate: number;
+}
+
+export function diffUsage(after: UsageSnapshot, before: UsageSnapshot): UsageSnapshot {
+  const inputTokens = Math.max(0, after.inputTokens - before.inputTokens);
+  const cachedInputTokens = Math.max(
+    0,
+    after.cachedInputTokens - before.cachedInputTokens,
+  );
+  return {
+    calls: Math.max(0, after.calls - before.calls),
+    inputTokens,
+    cachedInputTokens,
+    uncachedInputTokens: Math.max(0, inputTokens - cachedInputTokens),
+    outputTokens: Math.max(0, after.outputTokens - before.outputTokens),
+    reasoningTokens: Math.max(0, after.reasoningTokens - before.reasoningTokens),
+    cacheHitRate: inputTokens ? cachedInputTokens / inputTokens : 0,
+  };
 }
 
 /** Process-wide, thread-safe verifier token counter (mirrors llm_verifier.USAGE). */
@@ -108,7 +127,34 @@ export interface AuthCredential {
 
 /** Directory that holds agent.db (PI_CODING_AGENT_DIR wins). */
 export function agentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR || `${Bun.env.HOME}/.omp/agent`;
+  return (
+    process.env.PI_CODING_AGENT_DIR ||
+    `${process.env.HOME || Bun.env.HOME || ""}/.omp/agent`
+  );
+}
+
+export interface ModelSelector {
+  provider?: string;
+  model: string;
+  effort?: string;
+}
+
+/** Split omp's provider/model:effort spelling into API fields. */
+export function parseModelSelector(selector: string): ModelSelector {
+  const trimmed = selector.trim();
+  if (!trimmed) throw new Error("Verifier model selector must be non-empty");
+  const colon = trimmed.lastIndexOf(":");
+  const withoutEffort = colon > trimmed.lastIndexOf("/")
+    ? trimmed.slice(0, colon)
+    : trimmed;
+  const effort = colon > trimmed.lastIndexOf("/")
+    ? trimmed.slice(colon + 1)
+    : undefined;
+  const slash = withoutEffort.indexOf("/");
+  const provider = slash > 0 ? withoutEffort.slice(0, slash) : undefined;
+  const model = slash > 0 ? withoutEffort.slice(slash + 1) : withoutEffort;
+  if (!model) throw new Error(`Invalid verifier model selector: ${selector}`);
+  return { provider, model, effort: effort || undefined };
 }
 
 /** Read the stored opencode-go API key from omp's auth store. */
@@ -152,10 +198,21 @@ export class VerifierClient {
     this.baseUrl = (cfg.baseUrl ||
       process.env.OPENCODE_BASE_URL ||
       DEFAULT_BASE_URL).replace(/\/+$/, "");
-    this.apiKey = cfg.apiKey || resolveApiKey() || "";
-    this.model = cfg.model || DEFAULT_MODEL;
-    this.effort = cfg.effort || process.env.VERIFIER_EFFORT || DEFAULT_EFFORT;
-    this.maxTokens = cfg.maxTokens || DEFAULT_MAX_TOKENS;
+    this.apiKey = (cfg.apiKey || resolveApiKey() || "").trim();
+    const selector = parseModelSelector(
+      cfg.model || process.env.VERIFIER_MODEL || DEFAULT_MODEL_SELECTOR,
+    );
+    this.model = selector.model;
+    this.effort =
+      cfg.effort ||
+      process.env.VERIFIER_EFFORT ||
+      selector.effort ||
+      DEFAULT_EFFORT;
+    const maxTokens = cfg.maxTokens ?? DEFAULT_MAX_TOKENS;
+    if (!Number.isInteger(maxTokens) || maxTokens < 1) {
+      throw new Error("Verifier maxTokens must be a positive integer");
+    }
+    this.maxTokens = maxTokens;
   }
 
   get ready(): boolean {
@@ -167,6 +224,7 @@ export class VerifierClient {
     signal?: AbortSignal;
     maxTokens?: number;
   } = {}): Promise<VerifierReply> {
+    if (!prompt.trim()) throw new Error("Verifier prompt must be non-empty");
     if (!this.ready) {
       throw new MissingAPIKeyError(
         "No verifier API key. Set OPENCODE_API_KEY or log in to " +
@@ -203,15 +261,28 @@ export class VerifierClient {
       ),
     });
     if (!res.ok) {
-      const detail = (await res.text()).slice(0, 500);
+      const detail = redactSecret((await res.text()).slice(0, 500), this.apiKey);
       throw new Error(
         `Verifier API ${res.status} ${res.statusText}: ${detail}`,
       );
     }
-    const data = (await res.json()) as Record<string, unknown>;
+    let data: Record<string, unknown>;
+    try {
+      const parsed: unknown = await res.json();
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("response is not an object");
+      }
+      data = parsed as Record<string, unknown>;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Verifier API returned invalid JSON: ${detail}`);
+    }
     this.recordUsage(data);
 
-    const choice = (data.choices as Array<Record<string, unknown>>)[0];
+    const choices = Array.isArray(data.choices)
+      ? (data.choices as Array<Record<string, unknown>>)
+      : [];
+    const choice = choices[0];
     if (!choice) throw new Error("Verifier API returned no choices");
     const msg = choice.message as Record<string, unknown> | undefined;
     const text: string =
@@ -225,16 +296,37 @@ export class VerifierClient {
     if (logprobs?.content?.length) {
       tokens = [];
       positionLogprobs = [];
-      for (const pos of logprobs.content) {
+      for (const rawPos of logprobs.content) {
+        if (!rawPos || typeof rawPos !== "object" || Array.isArray(rawPos)) {
+          tokens.push("");
+          positionLogprobs.push([]);
+          continue;
+        }
+        const pos = rawPos as Record<string, unknown>;
         const tok = String(pos.token ?? "");
         tokens.push(tok);
-        const alts = (pos.top_logprobs as
-          | Array<{ token?: unknown; logprob?: unknown }>
-          | undefined)?.map((alt) => [String(alt.token ?? ""), Number(alt.logprob ?? 0)] as [string, number]);
+        const rawAlternatives = Array.isArray(pos.top_logprobs)
+          ? (pos.top_logprobs as Array<unknown>)
+          : undefined;
+        const alts = rawAlternatives
+          ?.map((rawAlt) => {
+            if (!rawAlt || typeof rawAlt !== "object" || Array.isArray(rawAlt)) {
+              return undefined;
+            }
+            const alt = rawAlt as Record<string, unknown>;
+            return [String(alt.token ?? ""), Number(alt.logprob)] as [string, number];
+          })
+          .filter((alt): alt is [string, number] => alt !== undefined)
+          .filter(([, logprob]) => Number.isFinite(logprob));
         if (alts && alts.length > 0) {
           positionLogprobs.push(alts);
         } else {
-          positionLogprobs.push([[tok, Number(pos.logprob ?? 0)]]);
+          const logprob = Number(pos.logprob);
+          if (tok && Number.isFinite(logprob)) {
+            positionLogprobs.push([[tok, logprob]]);
+          } else {
+            positionLogprobs.push([]);
+          }
         }
       }
     }
@@ -260,14 +352,23 @@ export class VerifierClient {
         }
       | undefined;
     if (!usage) return;
-    let cached = usage.prompt_cache_hit_tokens ?? 0;
-    if (!cached) cached = usage.prompt_tokens_details?.cached_tokens ?? 0;
-    const reasoning = usage.completion_tokens_details?.reasoning_tokens ?? 0;
+    const numberOrZero = (value: unknown): number =>
+      typeof value === "number" && Number.isFinite(value) && value >= 0
+        ? value
+        : 0;
+    let cached = numberOrZero(usage.prompt_cache_hit_tokens);
+    if (!cached) cached = numberOrZero(usage.prompt_tokens_details?.cached_tokens);
+    const reasoning = numberOrZero(usage.completion_tokens_details?.reasoning_tokens);
     USAGE.add(
-      usage.prompt_tokens ?? 0,
+      numberOrZero(usage.prompt_tokens),
       cached,
-      usage.completion_tokens ?? 0,
+      numberOrZero(usage.completion_tokens),
       reasoning,
     );
   }
+}
+
+function redactSecret(text: string, secret: string): string {
+  if (!secret) return text;
+  return text.split(secret).join("[redacted]");
 }

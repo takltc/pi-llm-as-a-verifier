@@ -1,16 +1,14 @@
 /**
- * Trajectory loaders.
+ * Strict Terminal-Bench trajectory loaders.
  *
- * Primary format: Terminal-Bench 2.1 mini-swe-agent output — a directory of
- * `<task>/<trial>_trajectory.json` files, each with
- * `{ reward, trial_name, trajectory: { steps: [...] } }`. The verifier only
- * ever sees `problem` and `trace`; `reward` is the held-out ground truth
- * used to score selection.
- *
- * The same step format is accepted for a plain list of candidate JSON files
- * (one candidate per file), so self-verification works on any agent rollout
- * that records steps with source/message/tool_calls/observation.
+ * The loader keeps held-out `reward` values separate from the verifier input:
+ * only the task text and rendered trajectory enter the prompt. Invalid files
+ * fail with their path and reason so a benchmark cannot silently score a
+ * partial or malformed dataset.
  */
+
+import { readdirSync, readFileSync, statSync, type Dirent } from "node:fs";
+import { basename, join } from "node:path";
 
 export interface Trial {
   trialName: string;
@@ -21,7 +19,7 @@ export interface Trial {
 
 export type Tasks = Record<string, Trial[]>;
 
-interface TbStep {
+export interface TbStep {
   step_id?: number | string;
   source?: string;
   message?: string;
@@ -32,10 +30,12 @@ interface TbStep {
 }
 
 interface TbTrajectoryFile {
-  trial_name?: string;
-  reward?: number;
-  trajectory?: { steps?: TbStep[] };
+  trial_name?: unknown;
+  reward?: unknown;
+  trajectory?: { steps?: unknown };
 }
+
+export type InputLayout = "terminal" | "candidates";
 
 export function formatTrace(trajectory: { steps?: TbStep[] } | undefined): string {
   if (!trajectory?.steps?.length) return "(no trajectory data)";
@@ -47,135 +47,200 @@ export function formatTrace(trajectory: { steps?: TbStep[] } | undefined): strin
     if (source === "agent") {
       parts.push(`--- Agent Step ${step.step_id ?? "?"} ---`);
       if (message) parts.push(message);
-      for (const tc of step.tool_calls ?? []) {
-        const args = (tc.arguments ?? {}) as { keystrokes?: string };
-        const keystrokes = args.keystrokes ?? "";
-        if (keystrokes) parts.push(`[Command] ${keystrokes.trimEnd()}`);
+      for (const toolCall of step.tool_calls ?? []) {
+        const args = (toolCall.arguments ?? {}) as { keystrokes?: unknown };
+        if (typeof args.keystrokes === "string" && args.keystrokes) {
+          parts.push(`[Command] ${args.keystrokes.trimEnd()}`);
+        }
       }
-      const results = step.observation?.results ?? [];
-      for (const result of results) {
-        if (result.content) parts.push(`[Output]\n${result.content}`);
+      for (const result of step.observation?.results ?? []) {
+        if (typeof result.content === "string" && result.content) {
+          parts.push(`[Output]\n${result.content}`);
+        }
       }
       parts.push("");
     }
   }
-  return parts.join("\n");
+  return parts.join("\n").trim() || "(no trajectory data)";
 }
 
 export function extractProblem(steps: TbStep[], taskName: string): string {
   for (const step of steps) {
     if (step.source === "user") {
-      const msg = step.message ?? "";
-      if (msg && !(msg.startsWith("$") && msg.length < 5)) return msg;
+      const message = step.message ?? "";
+      if (message && !(message.startsWith("$") && message.length < 5)) {
+        return message;
+      }
     }
   }
-  const parts: string[] = [];
+  const initialAnalysis: string[] = [];
   for (const step of steps) {
     if (step.source !== "agent") continue;
-    const msg = step.message ?? "";
-    if (msg) parts.push(msg);
-    if (parts.length >= 2) break;
+    if (step.message) initialAnalysis.push(step.message);
+    if (initialAnalysis.length >= 2) break;
   }
-  if (parts.length > 0) {
+  if (initialAnalysis.length > 0) {
     return (
       `[Task: ${taskName}]\n` +
-      "The original task instruction was not captured. Below is the " +
-      "agent's initial analysis:\n\n" +
-      parts.join("\n\n")
+      "The original task instruction was not captured. Below is the agent's initial analysis:\n\n" +
+      initialAnalysis.join("\n\n")
     );
   }
   return `(Task: ${taskName})`;
 }
 
-function trialFromFile(d: TbTrajectoryFile, taskName: string): Trial | null {
-  const trajectory = d.trajectory;
-  if (!trajectory) return null;
-  const steps = trajectory.steps ?? [];
+function requireDirectory(dir: string): void {
+  let stats: ReturnType<typeof statSync>;
+  try {
+    stats = statSync(dir);
+  } catch {
+    throw new Error(`Trajectory directory does not exist: ${dir}`);
+  }
+  if (!stats.isDirectory()) throw new Error(`Trajectory path is not a directory: ${dir}`);
+}
+
+function parseJson(path: string): TbTrajectoryFile {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid trajectory JSON at ${path}: ${detail}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Trajectory JSON must be an object: ${path}`);
+  }
+  return parsed as TbTrajectoryFile;
+}
+
+function parseSteps(value: unknown, path: string): TbStep[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Missing trajectory object at ${path}`);
+  }
+  const steps = (value as { steps?: unknown }).steps;
+  if (!Array.isArray(steps) || steps.length === 0) {
+    throw new Error(`Trajectory has no steps at ${path}`);
+  }
+  const invalidIndex = steps.findIndex(
+    (step) => !step || typeof step !== "object" || Array.isArray(step),
+  );
+  if (invalidIndex >= 0) {
+    throw new Error(`Trajectory step ${invalidIndex} must be an object at ${path}`);
+  }
+  return steps as TbStep[];
+}
+
+function parseReward(value: unknown, path: string): 0 | 1 {
+  if (value === 0 || value === 1) return value;
+  throw new Error(`Trajectory reward must be numeric 0 or 1 at ${path}`);
+}
+
+function trialFromFile(path: string, taskName: string): Trial {
+  const data = parseJson(path);
+  const steps = parseSteps(data.trajectory, path);
+  const trace = formatTrace({ steps });
+  if (trace === "(no trajectory data)") {
+    throw new Error(`Trajectory has no agent steps at ${path}`);
+  }
+  const trialName =
+    typeof data.trial_name === "string" && data.trial_name.trim()
+      ? data.trial_name.trim()
+      : basename(path);
   return {
-    trialName: d.trial_name ?? "",
-    reward: d.reward ? 1 : 0,
+    trialName,
+    reward: parseReward(data.reward, path),
     problem: extractProblem(steps, taskName),
-    trace: formatTrace(trajectory),
+    trace,
   };
 }
 
-/**
- * Load a Terminal-Bench style directory: `<dir>/<task>/*_trajectory.json`.
- * Returns (tasks, nRuns) where tasks maps task name -> trials.
- */
-export function loadTerminalDir(dir: string): { tasks: Tasks; nRuns: number } {
-  const tasks: Tasks = {};
-  for (const taskDir of sortedDirEntries(dir)) {
-    const taskName = basename(taskDir);
-    const trajFiles = sortedDirEntries(taskDir).filter((f) =>
-      f.endsWith("_trajectory.json"),
-    );
-    const trials: Trial[] = [];
-    for (const trajFile of trajFiles) {
-      const d = JSON.parse(awaitRead(trajFile)) as TbTrajectoryFile;
-      const trial = trialFromFile(d, taskName);
-      if (trial) trials.push(trial);
-    }
-    if (trials.length > 0) tasks[taskName] = trials;
-  }
-  const nRuns = Math.max(0, ...Object.values(tasks).map((t) => t.length));
-  return { tasks, nRuns };
+export function loadTrajectoryFile(path: string, taskName = "task"): Trial {
+  return trialFromFile(path, taskName);
 }
 
-/**
- * Load a single task from a directory of candidate JSON files
- * (`<dir>/<trial>.json`), each in the same trajectory shape. Returns
- * (tasks, nRuns) with one task whose name is `taskName`.
- */
+function entries(dir: string): Dirent<string>[] {
+  return readdirSync(dir, { withFileTypes: true, encoding: "utf8" }).sort((a, b) =>
+    a.name.localeCompare(b.name),
+  );
+}
+
+function jsonFiles(dir: string): string[] {
+  return entries(dir)
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+    .map((entry) => join(dir, entry.name));
+}
+
+function terminalTaskDirs(dir: string): string[] {
+  return entries(dir)
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => join(dir, entry.name))
+    .filter((taskDir) =>
+      entries(taskDir).some(
+        (entry) => entry.isFile() && entry.name.endsWith("_trajectory.json"),
+      ),
+    );
+}
+
+/** Determine the layout from valid trajectory filenames, not arbitrary subdirs. */
+export function detectInputLayout(dir: string): InputLayout {
+  requireDirectory(dir);
+  const terminalDirs = terminalTaskDirs(dir);
+  const flatFiles = jsonFiles(dir);
+  if (terminalDirs.length > 0 && flatFiles.length > 0) {
+    throw new Error(
+      `Mixed trajectory layouts in ${dir}: found task subdirectories and root JSON files`,
+    );
+  }
+  if (terminalDirs.length > 0) return "terminal";
+  if (flatFiles.length > 0) return "candidates";
+  throw new Error(
+    `No trajectory JSON files found in ${dir}; expected <task>/*_trajectory.json or flat *.json`,
+  );
+}
+
+/** Load `<dir>/<task>/*_trajectory.json` files in stable task/file order. */
+export function loadTerminalDir(dir: string): { tasks: Tasks; nRuns: number } {
+  requireDirectory(dir);
+  const tasks: Tasks = {};
+  for (const taskDir of terminalTaskDirs(dir)) {
+    const taskName = basename(taskDir);
+    const files = entries(taskDir)
+      .filter((entry) => entry.isFile() && entry.name.endsWith("_trajectory.json"))
+      .map((entry) => join(taskDir, entry.name));
+    const trials = files.map((path) => trialFromFile(path, taskName));
+    if (trials.length > 0) tasks[taskName] = trials;
+  }
+  if (Object.keys(tasks).length === 0) {
+    throw new Error(`No valid Terminal-Bench task trajectories found in ${dir}`);
+  }
+  return {
+    tasks,
+    nRuns: Math.max(...Object.values(tasks).map((trials) => trials.length)),
+  };
+}
+
+/** Load one task from a flat directory of candidate JSON files. */
 export function loadCandidateDir(
   dir: string,
   taskName: string,
 ): { tasks: Tasks; nRuns: number } {
-  const files = sortedDirEntries(dir).filter((f) => f.endsWith(".json"));
-  const trials: Trial[] = [];
-  for (const file of files) {
-    const d = JSON.parse(awaitRead(file)) as TbTrajectoryFile;
-    const trial = trialFromFile(d, taskName);
-    if (trial) {
-      trial.trialName = trial.trialName || basename(file);
-      trials.push(trial);
-    }
-  }
-  const tasks: Tasks = {};
-  if (trials.length > 0) tasks[taskName] = trials;
-  return { tasks, nRuns: trials.length };
+  requireDirectory(dir);
+  if (!taskName.trim()) throw new Error("Flat candidate task name must be non-empty");
+  const files = jsonFiles(dir);
+  if (files.length === 0) throw new Error(`No candidate JSON files found in ${dir}`);
+  const trials = files.map((path) => trialFromFile(path, taskName));
+  if (trials.length === 0) throw new Error(`No valid candidates found in ${dir}`);
+  return { tasks: { [taskName]: trials }, nRuns: trials.length };
 }
 
-/**
- * Split tasks into all-pass (every trial succeeds) and swing tasks.
- * All-fail tasks (every trial fails) are unwinnable and need no
- * verification, mirroring `scripts/run.py#classify` in the reference.
- */
+/** Split all-pass and swing tasks; all-fail tasks are unwinnable. */
 export function classify(tasks: Tasks): { allPass: string[]; swing: string[] } {
   const allPass: string[] = [];
   const swing: string[] = [];
-  for (const [name, trials] of Object.entries(tasks)) {
-    if (trials.every((t) => t.reward === 1)) allPass.push(name);
-    else if (!trials.every((t) => t.reward === 0)) swing.push(name);
+  for (const name of Object.keys(tasks).sort()) {
+    const trials = tasks[name];
+    if (trials.every((trial) => trial.reward === 1)) allPass.push(name);
+    else if (!trials.every((trial) => trial.reward === 0)) swing.push(name);
   }
   return { allPass, swing };
-}
-
-import { readdirSync, readFileSync } from "node:fs";
-
-// -- tiny fs helpers -------------------------------------------------------
-
-function sortedDirEntries(dir: string): string[] {
-  return readdirSync(dir)
-    .map((name) => `${dir}/${name}`)
-    .sort();
-}
-
-function basename(p: string): string {
-  const parts = p.split("/");
-  return parts[parts.length - 1] ?? p;
-}
-
-function awaitRead(path: string): string {
-  return readFileSync(path, "utf8");
 }

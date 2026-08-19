@@ -19,8 +19,8 @@ LLM-as-a-Verifier 插件（oh-my-pi / omp）。实现论文
    ring pass 消除位置偏差 → 选 top-k pivots → pivot rounds 集中比较，
    总比较数 $N + k(N-k) + \binom{k}{2}$（对固定 k 关于 N 线性）。
 3. **自验证（Self-Verification）**：同一模型（默认
-   `opencode-go/deepseek-v4-flash:xhigh`）生成 N 条候选轨迹，再用**同一模型**
-   作为验证者挑选最佳——verifier 判断的是自己模型的工作，仍能显著超过 Pass@1。
+   `opencode-go/deepseek-v4-flash:xhigh`）生成 N 条候选轨迹，再用同一模型
+   作为验证者挑选最佳。
 
 ## 为什么直接调用 API
 
@@ -31,7 +31,7 @@ opencode-go 端点（`https://opencode.ai/zen/go/v1`，OpenAI 兼容）获取
 1. 环境变量 `OPENCODE_API_KEY`
 2. omp auth store（`~/.omp/agent/agent.db` 中 `opencode-go` 的登录凭据）
 
-端点与模型可覆盖：`OPENCODE_BASE_URL`、`--effort`、`--max-tokens`。
+端点与模型可覆盖：`OPENCODE_BASE_URL`、`--model`、`--effort`、`--max-tokens`。
 
 ## 安装
 
@@ -40,21 +40,22 @@ opencode-go 端点（`https://opencode.ai/zen/go/v1`，OpenAI 兼容）获取
 bun install
 ```
 
-插件加载到 omp 的三种方式任选其一：
+OMP 17.3.7 及以上支持把此包作为扩展加载：
 
 ```bash
-# 1) 会话内临时加载
-omp -e /path/to/pi-llm-as-a-verifier/src/index.ts
-
-# 2) 用户级扩展目录（每次会话自动加载）
-mkdir -p ~/.omp/agent/extensions
-ln -s /path/to/pi-llm-as-a-verifier/src/index.ts ~/.omp/agent/extensions/llm-verifier.ts
-
-# 3) 配置扩展路径
-# ~/.omp/agent/config.yml 增加:
-#   extensions:
-#     - /path/to/pi-llm-as-a-verifier/src/index.ts
+# 用户级链接，后续会话自动发现 package.json 中的 omp.extensions
+omp plugin link /path/to/pi-llm-as-a-verifier --scope user
+omp plugin doctor
 ```
+
+开发调试也可以使用会话内临时加载：
+
+```bash
+omp -e /path/to/pi-llm-as-a-verifier/src/index.ts
+```
+
+启动后，session start 会检查 `opencode-go` 凭据并提示可用命令。插件只报告
+模型、评分和 token 用量等验证结果，凭据内容不会进入日志。
 
 ## 使用
 
@@ -64,9 +65,9 @@ ln -s /path/to/pi-llm-as-a-verifier/src/index.ts ~/.omp/agent/extensions/llm-ver
 每个文件含 `reward` 与 `trajectory.steps`），或一个平铺目录（候选 JSON 列表）。
 
 ```text
-/verify data/e2e --pivots 2 --k 2 --seed 0 --workers 8
+/verify data/e2e --pivots 1 --k 2 --seed 0 --workers 8
 /verify data/e2e --tasks bn-fit-modify,cancel-async-tasks
-/verify data/e2e --effort high --cache .verifier-cache.json
+/verify data/e2e --model opencode-go/deepseek-v4-flash:xhigh --cache .verifier-cache.json
 ```
 
 输出：每任务的 Pass@1 / LLM-as-a-Verifier / Oracle（Best-of-N）对比表、
@@ -84,7 +85,7 @@ Error Signal Detection）分别输出 A、B 的细粒度奖励。
 task: <任务描述>
 candidates: [{name, trace}, ...]
 criteria: 可选（默认 terminal-bench 三条）
-pivots: 2, nEvaluations: 2
+pivots: 1, nEvaluations: 2
 ```
 
 返回最佳候选、各候选 mean preference（w_i/c_i）、排序、比较次数。
@@ -94,37 +95,35 @@ pivots: 2, nEvaluations: 2
 ```bash
 bun run src/cli.ts <traj_dir> [--pivots N] [--k N] [--seed N]
                  [--workers N] [--effort xhigh] [--max-tokens N]
+                 [--model opencode-go/deepseek-v4-flash:xhigh]
                  [--cache <path>] [--trials N] [--tasks a,b]
 ```
 
 ## 验证
 
 ```bash
-bun test                 # extract_score + PPT 单元测试
-bun run src/cli.ts data/e2e --k 2 --pivots 2 --seed 0 --workers 8
-                         # 端到端真实 API 验证（opencode-go/deepseek-v4-flash:xhigh）
+bun install --frozen-lockfile
+bun test
+bunx tsc --noEmit
+bun run verify -- --help
+omp plugin doctor
 ```
 
-### 实测结果（Terminal-Bench 2.1 轨迹，verifier = deepseek-v4-flash:xhigh）
-
-| 任务 | trials 奖励 | Pass@1 | LLM-as-a-Verifier | Oracle (Bo5) |
-|---|---|---|---|---|
-| bn-fit-modify | [1,1,1,0,1] | 80% | **100%** | 100% |
-| cancel-async-tasks | [1,1,0,0,1] | 60% | **100%** | 100% |
-| dna-assembly | [1,1,0,0,0] | 40% | **100%** | 100% |
-| gcode-to-text | [1,0,0,0,1] | 40% | **100%** | 100% |
-
-平均 Pass@1 55% → **verifier 100%**（4/4 任务选到 ground-truth 最优轨迹），
-与论文结论一致：自验证显著超过 Pass@1。缓存复用重跑时命中率 96.6%，
-同 seed 结果完全复现；失败调用按 tie（0.5/0.5）兜底且不污染缓存。
+真实模型验证需要本机已有 `opencode-go` 凭据。建议先用 `/vcompare` 做单次
+短轨迹 smoke，再运行完整 Terminal-Bench 2.1 Bo5；结果应记录实际任务数、
+Pass@1、verifier、Oracle、比较次数、token 用量和缓存命中率。历史运行结果不作为
+当前仓库的验证结论。
 
 ## 设计要点
 
 - **前缀缓存**：成对提示词把 criterion 放在尾部，同一 (task, slot-A, slot-B)
   的 3 个 criterion 共享前缀；评分时每个 distinct prefix 先打一个请求预热，
   其余并发请求命中缓存。
+- **缓存身份**：任务描述、候选轨迹、criterion id/name/description、模型、推理强度、
+  输出预算、端点、ground-truth note 和提示版本共同生成内容指纹。锁文件含持有者
+  token；缓存采用最新磁盘状态合并、临时文件 fsync 和原子 rename。
 - **有界并发**：默认 16 个并发 worker，失败按 `on_error="tie"` 记 0.5/0.5
-  （不写入缓存），避免单次失败中断整个 tournament。
+  （仅保留在本次运行内），避免单次失败中断整个 tournament。
 - **确定性**：同一 seed 生成相同的 ring（mulberry32），可复现。
 - **xhigh 预算**：xhigh 推理与答案共享输出预算，默认 `max_tokens=65536`；
   若调用因推理耗尽预算而无 logprobs，会显式报错并提示调整。

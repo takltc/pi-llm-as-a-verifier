@@ -9,6 +9,9 @@
 
 import { SCALE } from "./scale.ts";
 
+/** Bump whenever the prompt contract changes; it invalidates persisted scores. */
+export const PROMPT_VERSION = "terminal-bench-pairwise-v1";
+
 export interface Criterion {
   id: string;
   name: string;
@@ -68,24 +71,67 @@ export const TERMINAL_BENCH_CRITERIA: Criterion[] = [
 export function normalizeCriteria(
   criteria: Criterion[] | Record<string, string> | string[] | string,
 ): Criterion[] {
-  if (Array.isArray(criteria)) {
-    return criteria.map((c) =>
-      typeof c === "string"
-        ? { id: slug(c), name: c, description: c }
-        : { id: c.id || slug(c.name), name: c.name, description: c.description },
-    );
-  }
-  if (typeof criteria === "string") {
-    if (criteria === "terminal_bench" || criteria === "terminal_bench_2.1") {
-      return TERMINAL_BENCH_CRITERIA;
+  const normalized = (() => {
+    if (Array.isArray(criteria)) {
+      return criteria.map((c, index) => {
+        if (typeof c === "string") {
+          return { id: slug(c), name: c, description: c };
+        }
+        if (!c || typeof c !== "object") {
+          throw new Error(`Criterion ${index} must be a string or object`);
+        }
+        const item = c as Partial<Criterion>;
+        if (typeof item.name !== "string") {
+          throw new Error(`Criterion ${index} name must be a string`);
+        }
+        return {
+          id: typeof item.id === "string" && item.id ? item.id : slug(item.name),
+          name: item.name,
+          description: item.description as string,
+        };
+      });
     }
-    return [{ id: slug(criteria), name: criteria, description: criteria }];
+    if (typeof criteria === "string") {
+      if (criteria === "terminal_bench" || criteria === "terminal_bench_2.1") {
+        return TERMINAL_BENCH_CRITERIA;
+      }
+      return [{ id: slug(criteria), name: criteria, description: criteria }];
+    }
+    if (!criteria || typeof criteria !== "object") {
+      throw new Error("Criteria must be a string, array, or name-to-description object");
+    }
+    return Object.entries(criteria as Record<string, unknown>).map(([name, description]) => ({
+      id: slug(name),
+      name,
+      description: description as string,
+    }));
+  })();
+  validateCriteria(normalized);
+  return normalized;
+}
+
+export function validateCriteria(criteria: Criterion[]): void {
+  if (!Array.isArray(criteria) || criteria.length === 0) {
+    throw new Error("At least one criterion is required");
   }
-  return Object.entries(criteria).map(([name, description]) => ({
-    id: slug(name),
-    name,
-    description,
-  }));
+  const ids = new Set<string>();
+  for (const criterion of criteria) {
+    if (
+      !criterion ||
+      typeof criterion.id !== "string" ||
+      typeof criterion.name !== "string" ||
+      typeof criterion.description !== "string" ||
+      !criterion.id.trim() ||
+      !criterion.name.trim() ||
+      !criterion.description.trim()
+    ) {
+      throw new Error("Each criterion needs a non-empty id, name, and description");
+    }
+    if (ids.has(criterion.id)) {
+      throw new Error(`Duplicate criterion id: ${criterion.id}`);
+    }
+    ids.add(criterion.id);
+  }
 }
 
 function slug(text: string): string {
