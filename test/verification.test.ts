@@ -4,8 +4,14 @@ import { readFileSync } from "node:fs";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { cacheKey, loadCache, saveCache, type CacheContext } from "../src/cache.ts";
-import { createAutoVerifierStream, serializeAssistantMessage, serializeContext } from "../src/auto.ts";
-import { createDefaultVerifierClient } from "../src/index.ts";
+import {
+  AUTO_CANDIDATE_COUNT,
+  createAutoVerifierStream,
+  normalizeCandidateCount,
+  serializeAssistantMessage,
+  serializeContext,
+} from "../src/auto.ts";
+import { createDefaultVerifierClient, resolvePluginSettings } from "../src/index.ts";
 import { CODING_AGENT_CRITERIA, CODING_AGENT_GROUND_TRUTH_NOTE } from "../src/prompt.ts";
 import { SELF_VERIFICATION_DEFAULTS } from "../src/run.ts";
 import { VerifierClient, type VerifierConfig } from "../src/client.ts";
@@ -204,6 +210,23 @@ describe("automatic request-level provider", () => {
       type: "toolCall",
       arguments: { command: "printf candidate-2" },
     });
+  });
+
+  test("uses the configured candidate count", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const stream = createAutoVerifierStream(
+      {
+        originalModel: model(),
+        verifierClient: new RankingVerifier(),
+        apiKeyResolver: () => "original-key",
+        streamSimpleFn: fakeCandidateStreamFactory(calls),
+      },
+      context(),
+      {},
+      { candidateCount: 4 },
+    );
+    await collect(stream);
+    expect(calls).toHaveLength(4);
   });
 
   test("falls back to the first successful candidate when verification fails", async () => {
@@ -414,9 +437,33 @@ describe("cache and fixed paper defaults", () => {
 describe("documentation and plugin surface", () => {
   test("documents transparent configuration-driven use", () => {
     const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+    const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
     expect(readme).toContain("omp plugin install");
     expect(readme).toContain("omp plugin config set omp-llm-verifier enabled true");
+    expect(readme).toContain("omp plugin config set omp-llm-verifier enabled false");
+    expect(readme).toContain("omp plugin config set omp-llm-verifier candidateCount 3");
+    expect(manifest.omp.settings.enabled.default).toBe(false);
+    expect(manifest.omp.settings.candidateCount).toEqual({
+      type: "number",
+      default: 3,
+      min: 2,
+      max: 8,
+      step: 1,
+      description: "每次普通请求生成的候选数量（2-8，默认 3）",
+    });
     expect(readme).not.toContain("/verify");
     expect(readme).not.toContain("verifier_select");
+  });
+
+  test("normalizes plugin enablement and candidate-count settings", () => {
+    expect(resolvePluginSettings({ enabled: true, candidateCount: 5 })).toEqual({
+      enabled: true,
+      candidateCount: 5,
+    });
+    expect(resolvePluginSettings({ enabled: false, candidateCount: 99 })).toEqual({
+      enabled: false,
+      candidateCount: AUTO_CANDIDATE_COUNT,
+    });
+    expect(normalizeCandidateCount("4")).toBe(4);
   });
 });

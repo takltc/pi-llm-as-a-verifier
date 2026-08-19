@@ -15,6 +15,14 @@
         "type": "boolean",
         "default": false,
         "description": "为普通 OMP 模型请求启用自动候选生成与 LLM-as-a-Verifier 选择"
+      },
+      "candidateCount": {
+        "type": "number",
+        "default": 3,
+        "min": 2,
+        "max": 8,
+        "step": 1,
+        "description": "每次普通请求生成的候选数量（2-8，默认 3）"
       }
     }
   },

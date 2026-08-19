@@ -5,12 +5,21 @@ import { getPluginSettings } from "@oh-my-pi/pi-coding-agent/extensibility/plugi
 import { extractExplicitThinkingSelector } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { createHash } from "node:crypto";
-import { createWrappedProvider } from "./auto.ts";
+import {
+  AUTO_CANDIDATE_COUNT,
+  createWrappedProvider,
+  normalizeCandidateCount,
+} from "./auto.ts";
 import { createVerifierClient } from "./client.ts";
 
 const PLUGIN_NAME = "omp-llm-verifier";
 const WRAPPER_KEY = "omp-llm-verifier-internal";
 const WRAPPER_API_PREFIX = "omp-llm-verifier-api-";
+
+export interface VerifierPluginSettings {
+  enabled: boolean;
+  candidateCount: number;
+}
 
 export default function verifierExtension(pi: ExtensionAPI): void {
   pi.setLabel("LLM-as-a-Verifier");
@@ -23,9 +32,10 @@ export default function verifierExtension(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     try {
       const settings = await getPluginSettings(PLUGIN_NAME, ctx.cwd);
-      const enabled = settings.enabled === true || pi.getFlag("llm-verifier") === true;
+      const pluginSettings = resolvePluginSettings(settings);
+      const enabled = pluginSettings.enabled || pi.getFlag("llm-verifier") === true;
       if (!enabled) return;
-      await enableAutomaticVerification(pi, ctx);
+      await enableAutomaticVerification(pi, ctx, pluginSettings.candidateCount);
       ctx.ui.notify("LLM-as-a-Verifier 已启用：普通请求会自动生成候选并回放验证胜者。", "info");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -37,6 +47,7 @@ export default function verifierExtension(pi: ExtensionAPI): void {
 async function enableAutomaticVerification(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
+  candidateCount = AUTO_CANDIDATE_COUNT,
 ): Promise<void> {
   const originalModel = ctx.models.resolve("@default") ?? ctx.model;
   if (!originalModel) throw new Error("OMP modelRoles.default 没有解析到可用模型。");
@@ -72,24 +83,27 @@ async function enableAutomaticVerification(
     api: wrapperApi,
     apiKey: WRAPPER_KEY,
     authHeader: false,
-    streamSimple: createWrappedProvider({
-      originalModel: candidateModel,
-      verifierClient,
-      apiKeyResolver: resolver,
-      onDegraded: (event) => {
-        console.warn(JSON.stringify({
-          component: "omp-llm-verifier",
-          event: "degraded",
-          ...event,
-        }));
-        ctx.ui.notify(
-          event.reason === "verification_error"
-            ? "LLM-as-a-Verifier 本次评审失败，已返回首个候选响应。"
-            : "LLM-as-a-Verifier 可用候选不足，已返回唯一成功候选。",
-          "warning",
-        );
+    streamSimple: createWrappedProvider(
+      {
+        originalModel: candidateModel,
+        verifierClient,
+        apiKeyResolver: resolver,
+        onDegraded: (event) => {
+          console.warn(JSON.stringify({
+            component: "omp-llm-verifier",
+            event: "degraded",
+            ...event,
+          }));
+          ctx.ui.notify(
+            event.reason === "verification_error"
+              ? "LLM-as-a-Verifier 本次评审失败，已返回首个候选响应。"
+              : "LLM-as-a-Verifier 可用候选不足，已返回唯一成功候选。",
+            "warning",
+          );
+        },
       },
-    }),
+      { candidateCount },
+    ),
     models: [{
       id: modelId,
       name: "LLM-as-a-Verifier (" + originalModel.name + ")",
@@ -124,6 +138,15 @@ async function enableAutomaticVerification(
     throw new Error("OMP 无法切换到自动验证包装模型。");
   }
   if (thinkingLevel !== undefined) pi.setThinkingLevel(thinkingLevel);
+}
+
+export function resolvePluginSettings(
+  settings: Record<string, unknown>,
+): VerifierPluginSettings {
+  return {
+    enabled: settings.enabled === true,
+    candidateCount: normalizeCandidateCount(settings.candidateCount),
+  };
 }
 
 export async function createDefaultVerifierClient(

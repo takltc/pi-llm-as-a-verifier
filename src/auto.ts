@@ -20,6 +20,8 @@ import {
 import type { VerifierClient } from "./client.ts";
 
 export const AUTO_CANDIDATE_COUNT = 3;
+export const AUTO_CANDIDATE_COUNT_MIN = 2;
+export const AUTO_CANDIDATE_COUNT_MAX = 8;
 export const AUTO_SELECTION_DEFAULTS = {
   pivots: 1,
   nEvaluations: 2,
@@ -37,6 +39,21 @@ export interface AutoVerifierState {
 
 export interface AutoVerifierOptions {
   candidateCount?: number;
+}
+
+export function isValidCandidateCount(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= AUTO_CANDIDATE_COUNT_MIN &&
+    value <= AUTO_CANDIDATE_COUNT_MAX
+  );
+}
+
+/** Resolve the persisted plugin setting without allowing unbounded verifier fan-out. */
+export function normalizeCandidateCount(value: unknown): number {
+  const parsed = typeof value === "string" && value.trim() ? Number(value) : value;
+  return isValidCandidateCount(parsed) ? parsed : AUTO_CANDIDATE_COUNT;
 }
 
 export type AutoVerifierDegradedReason =
@@ -71,14 +88,17 @@ export function createAutoVerifierStream(
 ): AssistantMessageEventStream {
   const output = new AssistantMessageEventStream();
   const candidateCount = options.candidateCount ?? AUTO_CANDIDATE_COUNT;
-  if (!Number.isInteger(candidateCount) || candidateCount < 2) {
+  if (!isValidCandidateCount(candidateCount)) {
     output.push({
       type: "error",
       reason: "error",
       error: terminalMessage(
         state.originalModel,
         "error",
-        new Error("Automatic verifier candidateCount must be at least 2"),
+        new Error(
+          "Automatic verifier candidateCount must be an integer between " +
+            AUTO_CANDIDATE_COUNT_MIN + " and " + AUTO_CANDIDATE_COUNT_MAX,
+        ),
       ),
     });
     return output;
