@@ -16,7 +16,7 @@ import {
 } from "./run.ts";
 
 export interface Candidate {
-  name: string;
+  name?: string;
   trace: string;
 }
 
@@ -68,7 +68,10 @@ export async function select(
 
   const criteria = normalizeCriteria(opts.criteria ?? "terminal_bench");
   const taskName = opts.taskName?.trim() || "task";
-  const client = opts.client ?? new VerifierClient();
+  const client = opts.client;
+  if (!client) {
+    throw new Error("select requires a verifier client for the OMP default model.");
+  }
   const note = opts.groundTruthNote === undefined ? GROUND_TRUTH_NOTE : opts.groundTruthNote;
   const tasks = {
     [taskName]: candidates.map((candidate, index) => ({

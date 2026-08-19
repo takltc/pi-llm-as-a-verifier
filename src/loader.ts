@@ -35,6 +35,22 @@ interface TbTrajectoryFile {
   trajectory?: { steps?: unknown };
 }
 
+interface CandidateFile {
+  task?: unknown;
+  name?: unknown;
+  trace?: unknown;
+}
+
+export interface LoadedCandidate {
+  name: string;
+  trace: string;
+}
+
+export interface CandidateSet {
+  task: string;
+  candidates: LoadedCandidate[];
+}
+
 export type InputLayout = "terminal" | "candidates";
 
 export function formatTrace(trajectory: { steps?: TbStep[] } | undefined): string {
@@ -99,7 +115,7 @@ function requireDirectory(dir: string): void {
   if (!stats.isDirectory()) throw new Error(`Trajectory path is not a directory: ${dir}`);
 }
 
-function parseJson(path: string): TbTrajectoryFile {
+function parseJson(path: string): Record<string, unknown> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
@@ -110,7 +126,7 @@ function parseJson(path: string): TbTrajectoryFile {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(`Trajectory JSON must be an object: ${path}`);
   }
-  return parsed as TbTrajectoryFile;
+  return parsed as Record<string, unknown>;
 }
 
 function parseSteps(value: unknown, path: string): TbStep[] {
@@ -136,7 +152,7 @@ function parseReward(value: unknown, path: string): 0 | 1 {
 }
 
 function trialFromFile(path: string, taskName: string): Trial {
-  const data = parseJson(path);
+  const data = parseJson(path) as TbTrajectoryFile;
   const steps = parseSteps(data.trajectory, path);
   const trace = formatTrace({ steps });
   if (trace === "(no trajectory data)") {
@@ -151,6 +167,29 @@ function trialFromFile(path: string, taskName: string): Trial {
     reward: parseReward(data.reward, path),
     problem: extractProblem(steps, taskName),
     trace,
+  };
+}
+
+function candidateFromFile(
+  path: string,
+): LoadedCandidate & { task: string } {
+  const data = parseJson(path) as CandidateFile;
+  if (typeof data.task !== "string" || !data.task.trim()) {
+    throw new Error(`Candidate task must be a non-empty string at ${path}`);
+  }
+  if (typeof data.trace !== "string" || !data.trace.trim()) {
+    throw new Error(`Candidate trace must be a non-empty string at ${path}`);
+  }
+  if (data.name !== undefined && (typeof data.name !== "string" || !data.name.trim())) {
+    throw new Error(`Candidate name must be a non-empty string at ${path}`);
+  }
+  return {
+    task: data.task.trim(),
+    name:
+      typeof data.name === "string"
+        ? data.name.trim()
+        : basename(path, ".json"),
+    trace: data.trace.trim(),
   };
 }
 
@@ -219,18 +258,33 @@ export function loadTerminalDir(dir: string): { tasks: Tasks; nRuns: number } {
   };
 }
 
-/** Load one task from a flat directory of candidate JSON files. */
-export function loadCandidateDir(
-  dir: string,
-  taskName: string,
-): { tasks: Tasks; nRuns: number } {
+/** Load one selection request from flat `{ task, trace, name? }` JSON files. */
+export function loadCandidateDir(dir: string): CandidateSet {
   requireDirectory(dir);
-  if (!taskName.trim()) throw new Error("Flat candidate task name must be non-empty");
   const files = jsonFiles(dir);
-  if (files.length === 0) throw new Error(`No candidate JSON files found in ${dir}`);
-  const trials = files.map((path) => trialFromFile(path, taskName));
-  if (trials.length === 0) throw new Error(`No valid candidates found in ${dir}`);
-  return { tasks: { [taskName]: trials }, nRuns: trials.length };
+  if (files.length < 2) {
+    throw new Error(`At least two candidate JSON files are required in ${dir}`);
+  }
+  const loaded = files.map(candidateFromFile);
+  const task = loaded[0].task;
+  for (const candidate of loaded.slice(1)) {
+    if (candidate.task !== task) {
+      throw new Error(
+        `Candidate task mismatch in ${dir}: all files must use the same task`,
+      );
+    }
+  }
+  const seenNames = new Set<string>();
+  for (const candidate of loaded) {
+    if (seenNames.has(candidate.name)) {
+      throw new Error(`Duplicate candidate name in ${dir}: ${candidate.name}`);
+    }
+    seenNames.add(candidate.name);
+  }
+  return {
+    task,
+    candidates: loaded.map(({ name, trace }) => ({ name, trace })),
+  };
 }
 
 /** Split all-pass and swing tasks; all-fail tasks are unwinnable. */

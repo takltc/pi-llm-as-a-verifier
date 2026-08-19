@@ -16,18 +16,19 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
-export const CACHE_VERSION = 2;
+export const CACHE_VERSION = 4;
 const LOCK_TIMEOUT_MS = 30_000;
 const LOCK_STALE_MS = 120_000;
 
 interface LockHandle {
-  fd: number;
+  lockDir: string;
   token: string;
 }
 
@@ -52,10 +53,13 @@ export interface CacheContext {
   problem: string;
   traceA: string;
   traceB: string;
+  provider: string;
+  api: string;
   model: string;
   effort: string;
   maxTokens: number;
   baseUrl: string;
+  requestIdentity: string;
   groundTruthNote: string;
   promptVersion: string;
 }
@@ -143,11 +147,6 @@ export function loadCache(cacheFile?: string): ScoreCache {
   return cacheFile ? readCacheFile(cacheFile) : {};
 }
 
-function sleepSync(milliseconds: number): void {
-  const signal = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(signal, 0, 0, milliseconds);
-}
-
 function writeAll(fd: number, data: Buffer): void {
   let offset = 0;
   while (offset < data.length) {
@@ -157,9 +156,14 @@ function writeAll(fd: number, data: Buffer): void {
   }
 }
 
-function readLockMetadata(lockFile: string): LockMetadata | undefined {
+function sleepSync(milliseconds: number): void {
+  const signal = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(signal, 0, 0, milliseconds);
+}
+
+function readLockMetadata(lockDir: string): LockMetadata | undefined {
   try {
-    const parsed: unknown = JSON.parse(readFileSync(lockFile, "utf8"));
+    const parsed: unknown = JSON.parse(readFileSync(join(lockDir, "owner"), "utf8"));
     if (!parsed || typeof parsed !== "object") return undefined;
     const metadata = parsed as Record<string, unknown>;
     if (
@@ -192,31 +196,40 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-function reclaimStaleLock(lockFile: string): boolean {
+/** Move a stale lock aside atomically before removing it. */
+function reclaimStaleLock(lockDir: string): boolean {
   let lockStat: ReturnType<typeof statSync>;
   try {
-    lockStat = statSync(lockFile);
+    lockStat = statSync(lockDir);
   } catch {
     return true;
   }
   if (Date.now() - lockStat.mtimeMs <= LOCK_STALE_MS) return false;
-  const metadata = readLockMetadata(lockFile);
+  const metadata = readLockMetadata(lockDir);
   if (metadata && processIsAlive(metadata.pid)) return false;
+  const quarantine = `${lockDir}.reclaim-${process.pid}-${randomBytes(8).toString("hex")}`;
   try {
-    unlinkSync(lockFile);
-    return true;
+    renameSync(lockDir, quarantine);
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "ENOENT";
   }
+  try {
+    unlinkSync(join(quarantine, "owner"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  rmdirSync(quarantine);
+  return true;
 }
 
-function acquireLock(lockFile: string): LockHandle {
+function acquireLock(lockDir: string): LockHandle {
   const started = Date.now();
-  mkdirSync(dirname(lockFile), { recursive: true });
+  mkdirSync(dirname(lockDir), { recursive: true });
   while (true) {
     try {
-      const fd = openSync(lockFile, "wx", 0o600);
+      mkdirSync(lockDir);
       const token = `${process.pid}:${Date.now()}:${randomBytes(16).toString("hex")}`;
+      const fd = openSync(join(lockDir, "owner"), "wx", 0o600);
       try {
         writeAll(
           fd,
@@ -225,39 +238,38 @@ function acquireLock(lockFile: string): LockHandle {
           ),
         );
         fsyncSync(fd);
-        return { fd, token };
-      } catch (error) {
+        return { lockDir, token };
+      } finally {
         closeSync(fd);
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") {
         try {
-          unlinkSync(lockFile);
+          unlinkSync(join(lockDir, "owner"));
+          rmdirSync(lockDir);
         } catch {
           // Preserve the original lock initialization error.
         }
         throw error;
       }
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") throw error;
-
-      if (reclaimStaleLock(lockFile)) continue;
+      if (reclaimStaleLock(lockDir)) continue;
       if (Date.now() - started >= LOCK_TIMEOUT_MS) {
-        throw new Error(`Timed out waiting for cache lock: ${lockFile}`);
+        throw new Error(`Timed out waiting for cache lock: ${lockDir}`);
       }
       sleepSync(10);
     }
   }
 }
 
-function releaseLock(lockFile: string, handle: LockHandle): void {
+function releaseLock(handle: LockHandle): void {
   try {
-    closeSync(handle.fd);
-  } finally {
-    try {
-      const metadata = readLockMetadata(lockFile);
-      if (metadata?.token === handle.token) unlinkSync(lockFile);
-    } catch {
-      // Another process may own the recovered lock.
-    }
+    const metadata = readLockMetadata(handle.lockDir);
+    if (metadata?.token !== handle.token) return;
+    unlinkSync(join(handle.lockDir, "owner"));
+    rmdirSync(handle.lockDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }
 
@@ -296,8 +308,8 @@ function writeAtomic(cacheFile: string, cache: ScoreCache): void {
 
 /** Merge with the latest on-disk state while holding an inter-process lock. */
 export function saveCache(cacheFile: string, cache: ScoreCache): void {
-  const lockFile = `${cacheFile}.lock`;
-  const handle = acquireLock(lockFile);
+  mkdirSync(dirname(cacheFile), { recursive: true });
+  const lock = acquireLock(`${cacheFile}.lock`);
   try {
     const merged: ScoreCache = { ...readCacheFile(cacheFile) };
     for (const [key, entry] of Object.entries(cache)) {
@@ -305,7 +317,7 @@ export function saveCache(cacheFile: string, cache: ScoreCache): void {
     }
     writeAtomic(cacheFile, merged);
   } finally {
-    releaseLock(lockFile, handle);
+    releaseLock(lock);
   }
 }
 

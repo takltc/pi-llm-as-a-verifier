@@ -1,34 +1,35 @@
-/**
- * Verifier backend client for opencode-go (https://opencode.ai/zen/go/v1),
- * the OpenAI-compatible gateway omp uses for `opencode-go/deepseek-v4-flash`.
- *
- * The verifier needs token-level logprobs, which the omp session API does
- * not expose, so the plugin talks to the backend directly. Credentials are
- * resolved like omp does: OPENCODE_API_KEY env var first, then the stored
- * login credential in the omp auth store (`~/.omp/agent/agent.db`).
- *
- * DeepSeek-family models emit the `<score_X> letter </score_X>` tags
- * themselves, so unlike vLLM-style open models we read the distribution
- * straight from the response logprobs (no prefill trick needed).
- */
+/** OpenAI-compatible verifier client bound to OMP's configured default model. */
 
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { createHash } from "node:crypto";
 import type { VerifierReply } from "./scale.ts";
-import { Database } from "bun:sqlite";
 
-export const DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1";
-export const DEFAULT_MODEL = "deepseek-v4-flash";
-export const DEFAULT_EFFORT = "xhigh"; // omp: opencode-go/deepseek-v4-flash:xhigh
-export const DEFAULT_MODEL_SELECTOR =
-  "opencode-go/deepseek-v4-flash:xhigh";
-export const DEFAULT_MAX_TOKENS = 65536; // xhigh thinking shares the budget
+// Terminal-Bench 2.1 self-verification reference defaults for DeepSeek.
+export const DEFAULT_EFFORT = "high";
+export const DEFAULT_MAX_TOKENS = 32768;
 
 export interface VerifierConfig {
-  baseUrl?: string;
-  apiKey?: string;
-  model?: string;
-  effort?: string; // reasoning_effort: off | low | high | xhigh | max
-  maxTokens?: number;
-  maxWorkers?: number;
+  baseUrl: string;
+  apiKey: string;
+  provider: string;
+  api: string;
+  modelId: string;
+  headers?: Record<string, string>;
+  compat?: VerifierCompat;
+  keyless?: boolean;
+  effort: string;
+  maxTokens: number;
+}
+
+/** OMP's OpenAI transport compatibility policy, kept structural for plugin portability. */
+interface VerifierCompat {
+  supportsReasoningParams?: boolean;
+  supportsReasoningEffort?: boolean;
+  reasoningEffortMap?: Record<string, string>;
+  reasoningDisableMode?: string;
+  omitReasoningEffort?: boolean;
+  thinkingFormat?: string;
+  includeEncryptedReasoning?: boolean;
 }
 
 export interface UsageSnapshot {
@@ -91,6 +92,46 @@ class TokenUsage {
 
 export const USAGE = new TokenUsage();
 
+interface ParsedPositionLogprobs {
+  tokens: string[];
+  positionLogprobs: Array<Array<[string, number]>>;
+}
+
+function parsePositionLogprobs(raw: unknown): ParsedPositionLogprobs | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const tokens: string[] = [];
+  const positionLogprobs: Array<Array<[string, number]>> = [];
+  for (const rawPosition of raw) {
+    if (!rawPosition || typeof rawPosition !== "object" || Array.isArray(rawPosition)) {
+      tokens.push("");
+      positionLogprobs.push([]);
+      continue;
+    }
+    const position = rawPosition as Record<string, unknown>;
+    const token = String(position.token ?? "");
+    tokens.push(token);
+    const alternatives: Array<[string, number]> = [];
+    if (Array.isArray(position.top_logprobs)) {
+      for (const rawAlternative of position.top_logprobs) {
+        if (!rawAlternative || typeof rawAlternative !== "object" || Array.isArray(rawAlternative)) {
+          continue;
+        }
+        const alternative = rawAlternative as Record<string, unknown>;
+        const logprob = Number(alternative.logprob);
+        if (!Number.isFinite(logprob)) continue;
+        alternatives.push([String(alternative.token ?? ""), logprob]);
+      }
+    }
+    if (alternatives.length > 0) {
+      positionLogprobs.push(alternatives);
+      continue;
+    }
+    const logprob = Number(position.logprob);
+    positionLogprobs.push(token && Number.isFinite(logprob) ? [[token, logprob]] : []);
+  }
+  return { tokens, positionLogprobs };
+}
+
 export function formatUsage(usage: UsageSnapshot): string[] {
   return [
     `Verifier tokens (${usage.calls} verifier calls)`,
@@ -104,251 +145,302 @@ export function formatUsage(usage: UsageSnapshot): string[] {
 
 export class MissingAPIKeyError extends Error {}
 
-/** Combine an external abort signal with an internal timeout into one. */
+interface MergedAbortSignal {
+  signal: AbortSignal;
+  dispose(): void;
+}
+
+/** Combine an external abort signal with an internal timeout and release listeners. */
 function mergeAbortSignals(
   external: AbortSignal | undefined,
-  timeout: AbortSignal,
-): AbortSignal {
-  if (!external) return timeout;
-  if (external.aborted) return external;
+  timeoutMs: number,
+): MergedAbortSignal {
   const controller = new AbortController();
-  const onAbort = () => controller.abort(external.reason);
-  external.addEventListener("abort", onAbort, { once: true });
-  timeout.addEventListener("abort", () => controller.abort(timeout.reason), {
-    once: true,
-  });
-  return controller.signal;
-}
-
-export interface AuthCredential {
-  key?: string;
-  [k: string]: unknown;
-}
-
-/** Directory that holds agent.db (PI_CODING_AGENT_DIR wins). */
-export function agentDir(): string {
-  return (
-    process.env.PI_CODING_AGENT_DIR ||
-    `${process.env.HOME || Bun.env.HOME || ""}/.omp/agent`
+  const onExternalAbort = () => controller.abort(external?.reason);
+  if (external?.aborted) onExternalAbort();
+  else external?.addEventListener("abort", onExternalAbort, { once: true });
+  const timeout = setTimeout(
+    () => controller.abort(new DOMException("The operation timed out", "TimeoutError")),
+    timeoutMs,
   );
-}
-
-export interface ModelSelector {
-  provider?: string;
-  model: string;
-  effort?: string;
-}
-
-/** Split omp's provider/model:effort spelling into API fields. */
-export function parseModelSelector(selector: string): ModelSelector {
-  const trimmed = selector.trim();
-  if (!trimmed) throw new Error("Verifier model selector must be non-empty");
-  const colon = trimmed.lastIndexOf(":");
-  const withoutEffort = colon > trimmed.lastIndexOf("/")
-    ? trimmed.slice(0, colon)
-    : trimmed;
-  const effort = colon > trimmed.lastIndexOf("/")
-    ? trimmed.slice(colon + 1)
-    : undefined;
-  const slash = withoutEffort.indexOf("/");
-  const provider = slash > 0 ? withoutEffort.slice(0, slash) : undefined;
-  const model = slash > 0 ? withoutEffort.slice(slash + 1) : withoutEffort;
-  if (!model) throw new Error(`Invalid verifier model selector: ${selector}`);
-  return { provider, model, effort: effort || undefined };
-}
-
-/** Read the stored opencode-go API key from omp's auth store. */
-export function storedApiKey(provider = "opencode-go"): string | undefined {
-  try {
-    const db = new Database(`${agentDir()}/agent.db`, { readonly: true });
-    try {
-      const row = db
-        .query(
-          "SELECT data FROM auth_credentials WHERE provider = ? AND credential_type = 'api_key' ORDER BY updated_at DESC LIMIT 1",
-        )
-        .get(provider) as { data: string } | null;
-      if (row) {
-        const cred = JSON.parse(row.data) as AuthCredential;
-        if (typeof cred.key === "string" && cred.key.length > 0) {
-          return cred.key;
-        }
-      }
-    } finally {
-      db.close();
-    }
-  } catch {
-    // Not running inside omp (no auth store) — caller falls back to env.
-  }
-  return undefined;
-}
-
-/** Resolve the verifier API key: OPENCODE_API_KEY env, then auth store. */
-export function resolveApiKey(): string | undefined {
-  return process.env.OPENCODE_API_KEY || storedApiKey();
+  return {
+    signal: controller.signal,
+    dispose() {
+      clearTimeout(timeout);
+      external?.removeEventListener("abort", onExternalAbort);
+    },
+  };
 }
 
 export class VerifierClient {
   readonly baseUrl: string;
   readonly apiKey: string;
+  readonly provider: string;
+  readonly api: string;
   readonly model: string;
   readonly effort: string;
   readonly maxTokens: number;
+  readonly headers: Record<string, string>;
+  readonly compat: VerifierCompat;
+  readonly keyless: boolean;
+  readonly requestIdentity: string;
 
-  constructor(cfg: VerifierConfig = {}) {
-    this.baseUrl = (cfg.baseUrl ||
-      process.env.OPENCODE_BASE_URL ||
-      DEFAULT_BASE_URL).replace(/\/+$/, "");
-    this.apiKey = (cfg.apiKey || resolveApiKey() || "").trim();
-    const selector = parseModelSelector(
-      cfg.model || process.env.VERIFIER_MODEL || DEFAULT_MODEL_SELECTOR,
-    );
-    this.model = selector.model;
-    this.effort =
-      cfg.effort ||
-      process.env.VERIFIER_EFFORT ||
-      selector.effort ||
-      DEFAULT_EFFORT;
-    const maxTokens = cfg.maxTokens ?? DEFAULT_MAX_TOKENS;
+  constructor(cfg: VerifierConfig) {
+    this.baseUrl = cfg.baseUrl.replace(/\/+$/, "");
+    this.keyless = cfg.keyless === true || cfg.apiKey.trim() === "N/A";
+    this.apiKey = this.keyless ? "" : cfg.apiKey.trim();
+    this.provider = cfg.provider;
+    this.api = cfg.api;
+    this.model = cfg.modelId;
+    this.effort = cfg.effort;
+    const maxTokens = cfg.maxTokens;
     if (!Number.isInteger(maxTokens) || maxTokens < 1) {
       throw new Error("Verifier maxTokens must be a positive integer");
     }
+    if (!this.baseUrl || (!this.apiKey && !this.keyless) || !this.provider || !this.api || !this.model) {
+      throw new Error("Verifier client requires an authenticated OMP model.");
+    }
     this.maxTokens = maxTokens;
+    this.headers = { ...cfg.headers };
+    this.compat = { ...cfg.compat };
+    this.requestIdentity = buildRequestIdentity({
+      apiKey: this.apiKey,
+      keyless: this.keyless,
+      headers: this.headers,
+      compat: this.compat,
+    });
   }
 
   get ready(): boolean {
-    return this.apiKey.length > 0;
+    return this.keyless || this.apiKey.length > 0;
   }
 
-  /** Request a chat completion with token-level logprobs (DeepSeek path). */
-  async scoreReply(prompt: string, opts: {
-    signal?: AbortSignal;
-    maxTokens?: number;
-  } = {}): Promise<VerifierReply> {
+  /** Request a verifier response with token-level logprobs. */
+  async scoreReply(prompt: string, opts: { signal?: AbortSignal } = {}): Promise<VerifierReply> {
     if (!prompt.trim()) throw new Error("Verifier prompt must be non-empty");
     if (!this.ready) {
       throw new MissingAPIKeyError(
-        "No verifier API key. Set OPENCODE_API_KEY or log in to " +
-          "opencode-go in omp (`/login opencode-go`).",
+        "OMP 当前模型没有可用凭据。",
       );
     }
-    const maxTokens = opts.maxTokens ?? this.maxTokens;
-    const body: Record<string, unknown> = {
-      model: this.model,
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: maxTokens,
-      temperature: 1.0,
-      logprobs: true,
-      top_logprobs: 20,
-    };
     const effort = this.effort;
-    if (effort !== "off" && effort !== "disabled" && effort !== "none") {
-      body.thinking = { type: "enabled" };
-      body.reasoning_effort = effort;
+    const reasoningEnabled = effort !== "off" && effort !== "disabled" && effort !== "none";
+    const responses = this.api === "openai-responses";
+    const body: Record<string, unknown> = responses
+      ? {
+          model: this.model,
+          input: [
+            {
+              role: "user",
+              content: [{ type: "input_text", text: prompt }],
+            },
+          ],
+          max_output_tokens: this.maxTokens,
+          top_logprobs: 20,
+          include: [
+            "message.output_text.logprobs",
+            ...(this.compat.includeEncryptedReasoning ? ["reasoning.encrypted_content"] : []),
+          ],
+          store: false,
+          stream: false,
+        }
+      : {
+          model: this.model,
+          messages: [{ role: "user", content: prompt }],
+          max_tokens: this.maxTokens,
+          logprobs: true,
+          top_logprobs: 20,
+        };
+
+    if (responses) {
+      this.applyResponsesReasoning(body, effort, reasoningEnabled);
     } else {
-      body.thinking = { type: "disabled" };
+      this.applyChatReasoning(body, effort, reasoningEnabled);
     }
 
-    const res = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: mergeAbortSignals(
-        opts.signal,
-        AbortSignal.timeout(600_000), // xhigh thinking can take many minutes
-      ),
-    });
-    if (!res.ok) {
-      const detail = redactSecret((await res.text()).slice(0, 500), this.apiKey);
-      throw new Error(
-        `Verifier API ${res.status} ${res.statusText}: ${detail}`,
-      );
-    }
-    let data: Record<string, unknown>;
+    const requestAbort = mergeAbortSignals(opts.signal, 600_000);
     try {
-      const parsed: unknown = await res.json();
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error("response is not an object");
+      const res = await fetch(`${this.baseUrl}/${responses ? "responses" : "chat/completions"}`, {
+        method: "POST",
+        headers: this.requestHeaders(),
+        body: JSON.stringify(body),
+        signal: requestAbort.signal,
+      });
+      if (!res.ok) {
+        const detail = redactSecrets(
+          (await res.text()).slice(0, 500),
+          [
+            this.apiKey,
+            ...Object.values(this.headers),
+            ...Object.values(this.headers).flatMap(headerSecretParts),
+          ],
+        );
+        throw new Error(
+          `Verifier API ${res.status} ${res.statusText}: ${detail}`,
+        );
       }
-      data = parsed as Record<string, unknown>;
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(`Verifier API returned invalid JSON: ${detail}`);
+      let data: Record<string, unknown>;
+      try {
+        const parsed: unknown = await res.json();
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("response is not an object");
+        }
+        data = parsed as Record<string, unknown>;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Verifier API returned invalid JSON: ${detail}`);
+      }
+      this.recordUsage(data);
+      if (responses) return this.parseResponsesReply(data);
+
+      const choices = Array.isArray(data.choices)
+        ? (data.choices as Array<Record<string, unknown>>)
+        : [];
+      const choice = choices[0];
+      if (!choice) throw new Error("Verifier API returned no choices");
+      const msg = choice.message as Record<string, unknown> | undefined;
+      const text: string =
+        typeof msg?.content === "string" ? msg.content : "";
+      const logprobs = choice.logprobs as
+        | { content?: Array<Record<string, unknown>> }
+        | undefined;
+
+      const parsedLogprobs = parsePositionLogprobs(logprobs?.content);
+      const tokens = parsedLogprobs?.tokens;
+      const positionLogprobs = parsedLogprobs?.positionLogprobs;
+      if (!positionLogprobs || positionLogprobs.length === 0) {
+        throw new Error(
+          `Verifier returned no answer logprobs (finish_reason=${String(
+            choice.finish_reason ?? "?",
+          )}) — 当前 OMP 模型没有返回 token logprobs。`,
+        );
+      }
+      return { text, tokens, positionLogprobs };
+    } finally {
+      requestAbort.dispose();
     }
-    this.recordUsage(data);
+  }
 
-    const choices = Array.isArray(data.choices)
-      ? (data.choices as Array<Record<string, unknown>>)
-      : [];
-    const choice = choices[0];
-    if (!choice) throw new Error("Verifier API returned no choices");
-    const msg = choice.message as Record<string, unknown> | undefined;
-    const text: string =
-      typeof msg?.content === "string" ? msg.content : "";
-    const logprobs = choice.logprobs as
-      | { content?: Array<Record<string, unknown>> }
-      | undefined;
-
-    let tokens: string[] | undefined;
-    let positionLogprobs: VerifierReply["positionLogprobs"];
-    if (logprobs?.content?.length) {
-      tokens = [];
-      positionLogprobs = [];
-      for (const rawPos of logprobs.content) {
-        if (!rawPos || typeof rawPos !== "object" || Array.isArray(rawPos)) {
-          tokens.push("");
-          positionLogprobs.push([]);
-          continue;
-        }
-        const pos = rawPos as Record<string, unknown>;
-        const tok = String(pos.token ?? "");
-        tokens.push(tok);
-        const rawAlternatives = Array.isArray(pos.top_logprobs)
-          ? (pos.top_logprobs as Array<unknown>)
-          : undefined;
-        const alts = rawAlternatives
-          ?.map((rawAlt) => {
-            if (!rawAlt || typeof rawAlt !== "object" || Array.isArray(rawAlt)) {
-              return undefined;
-            }
-            const alt = rawAlt as Record<string, unknown>;
-            return [String(alt.token ?? ""), Number(alt.logprob)] as [string, number];
-          })
-          .filter((alt): alt is [string, number] => alt !== undefined)
-          .filter(([, logprob]) => Number.isFinite(logprob));
-        if (alts && alts.length > 0) {
-          positionLogprobs.push(alts);
-        } else {
-          const logprob = Number(pos.logprob);
-          if (tok && Number.isFinite(logprob)) {
-            positionLogprobs.push([[tok, logprob]]);
-          } else {
-            positionLogprobs.push([]);
-          }
-        }
+  private parseResponsesReply(data: Record<string, unknown>): VerifierReply {
+    const textParts: string[] = [];
+    const positions: unknown[] = [];
+    const output = Array.isArray(data.output) ? data.output : [];
+    for (const rawItem of output) {
+      if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) continue;
+      const item = rawItem as Record<string, unknown>;
+      const content = Array.isArray(item.content) ? item.content : [];
+      for (const rawPart of content) {
+        if (!rawPart || typeof rawPart !== "object" || Array.isArray(rawPart)) continue;
+        const part = rawPart as Record<string, unknown>;
+        if (part.type !== "output_text" && typeof part.text !== "string") continue;
+        if (typeof part.text === "string") textParts.push(part.text);
+        if (Array.isArray(part.logprobs)) positions.push(...part.logprobs);
       }
     }
-    if (!positionLogprobs || positionLogprobs.length === 0) {
+    const parsedLogprobs = parsePositionLogprobs(positions);
+    if (!parsedLogprobs || parsedLogprobs.positionLogprobs.length === 0) {
+      const status = typeof data.status === "string" ? data.status : "?";
       throw new Error(
-        `Verifier returned no answer logprobs (finish_reason=${String(
-          choice.finish_reason ?? "?",
-        )}) — xhigh thinking may have consumed the ${maxTokens}-token budget; ` +
-          "raise maxTokens or lower the reasoning effort.",
+        `Verifier returned no answer logprobs (status=${status}) — 当前 OMP 默认模型没有返回 token logprobs。`,
       );
     }
-    return { text, tokens, positionLogprobs };
+    return {
+      text:
+        textParts.join("") ||
+        (typeof data.output_text === "string" ? data.output_text : ""),
+      tokens: parsedLogprobs.tokens,
+      positionLogprobs: parsedLogprobs.positionLogprobs,
+    };
+  }
+
+  private requestHeaders(): Record<string, string> {
+    const headers = new Headers(this.headers);
+    if (!this.keyless && !headers.has("authorization")) {
+      headers.set("Authorization", "Bearer " + this.apiKey);
+    }
+    headers.set("Content-Type", "application/json");
+    return Object.fromEntries(headers.entries());
+  }
+
+  private applyChatReasoning(
+    body: Record<string, unknown>,
+    effort: string,
+    enabled: boolean,
+  ): void {
+    const supportsParams = this.compat.supportsReasoningParams !== false;
+    const supportsEffort = this.compat.supportsReasoningEffort !== false;
+    const mode = this.compat.reasoningDisableMode ?? "default";
+    const wireEffort = mapReasoningEffort(this.compat, effort);
+    if (!supportsParams) return;
+    if (enabled) {
+      switch (mode) {
+        case "zai-thinking-disabled":
+          body.thinking = { type: "enabled" };
+          if (supportsEffort) body.reasoning_effort = wireEffort;
+          break;
+        case "qwen-enable-thinking-false":
+          body.enable_thinking = true;
+          break;
+        case "qwen-template-false":
+          body.chat_template_kwargs = { enable_thinking: true };
+          break;
+        case "openrouter-enabled-false":
+          body.reasoning = { effort: wireEffort };
+          break;
+        default:
+          if (supportsEffort && !this.compat.omitReasoningEffort) {
+            body.reasoning_effort = wireEffort;
+          }
+          break;
+      }
+      return;
+    }
+    switch (mode) {
+      case "none-effort":
+        if (supportsEffort && !this.compat.omitReasoningEffort) body.reasoning_effort = "none";
+        break;
+      case "zai-thinking-disabled":
+        body.thinking = { type: "disabled" };
+        break;
+      case "qwen-enable-thinking-false":
+        body.enable_thinking = false;
+        break;
+      case "qwen-template-false":
+        body.chat_template_kwargs = { enable_thinking: false };
+        break;
+      case "openrouter-enabled-false":
+        body.reasoning = { enabled: false };
+        break;
+    }
+  }
+
+  private applyResponsesReasoning(
+    body: Record<string, unknown>,
+    effort: string,
+    enabled: boolean,
+  ): void {
+    if (this.compat.supportsReasoningParams === false || this.compat.omitReasoningEffort) return;
+    if (enabled && this.compat.supportsReasoningEffort !== false) {
+      body.reasoning = { effort: mapReasoningEffort(this.compat, effort) };
+      return;
+    }
+    if (!enabled && this.compat.supportsReasoningEffort !== false) {
+      body.reasoning = { effort: "none" };
+    }
   }
 
   private recordUsage(data: Record<string, unknown>): void {
     const usage = data.usage as
       | {
           prompt_tokens?: number;
+          input_tokens?: number;
           prompt_cache_hit_tokens?: number;
           completion_tokens?: number;
+          output_tokens?: number;
           prompt_tokens_details?: { cached_tokens?: number };
+          input_tokens_details?: { cached_tokens?: number };
           completion_tokens_details?: { reasoning_tokens?: number };
+          output_tokens_details?: { reasoning_tokens?: number };
         }
       | undefined;
     if (!usage) return;
@@ -358,17 +450,164 @@ export class VerifierClient {
         : 0;
     let cached = numberOrZero(usage.prompt_cache_hit_tokens);
     if (!cached) cached = numberOrZero(usage.prompt_tokens_details?.cached_tokens);
-    const reasoning = numberOrZero(usage.completion_tokens_details?.reasoning_tokens);
+    if (!cached) cached = numberOrZero(usage.input_tokens_details?.cached_tokens);
+    const reasoning =
+      numberOrZero(usage.completion_tokens_details?.reasoning_tokens) ||
+      numberOrZero(usage.output_tokens_details?.reasoning_tokens);
     USAGE.add(
-      numberOrZero(usage.prompt_tokens),
+      numberOrZero(usage.prompt_tokens ?? usage.input_tokens),
       cached,
-      numberOrZero(usage.completion_tokens),
+      numberOrZero(usage.completion_tokens ?? usage.output_tokens),
       reasoning,
     );
   }
 }
 
-function redactSecret(text: string, secret: string): string {
-  if (!secret) return text;
-  return text.split(secret).join("[redacted]");
+function mapReasoningEffort(compat: VerifierCompat, effort: string): string {
+  return compat.reasoningEffortMap?.[effort] ?? effort;
+}
+
+function normalizeCompat(raw: unknown): VerifierCompat {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const value = raw as Record<string, unknown>;
+  const booleanField = (name: string): boolean | undefined =>
+    typeof value[name] === "boolean" ? value[name] : undefined;
+  const stringField = (name: string): string | undefined =>
+    typeof value[name] === "string" ? value[name] : undefined;
+  const reasoningEffortMap =
+    value.reasoningEffortMap && typeof value.reasoningEffortMap === "object" && !Array.isArray(value.reasoningEffortMap)
+      ? Object.fromEntries(
+          Object.entries(value.reasoningEffortMap as Record<string, unknown>)
+            .filter(([, effort]) => typeof effort === "string"),
+        ) as Record<string, string>
+      : undefined;
+  return {
+    supportsReasoningParams: booleanField("supportsReasoningParams"),
+    supportsReasoningEffort: booleanField("supportsReasoningEffort"),
+    reasoningEffortMap,
+    reasoningDisableMode: stringField("reasoningDisableMode"),
+    omitReasoningEffort: booleanField("omitReasoningEffort"),
+    thinkingFormat: stringField("thinkingFormat"),
+    includeEncryptedReasoning: booleanField("includeEncryptedReasoning"),
+  };
+}
+
+function buildRequestIdentity(input: {
+  apiKey: string;
+  keyless: boolean;
+  headers: Record<string, string>;
+  compat: VerifierCompat;
+}): string {
+  const headers = Object.entries(input.headers)
+    .map(([name, value]) => [name.toLowerCase(), value.trim()] as const)
+    .sort(([a], [b]) => a.localeCompare(b));
+  return createHash("sha256")
+    .update(JSON.stringify({
+      auth: input.keyless ? "keyless" : "api-key",
+      apiKey: input.apiKey,
+      headers,
+      compat: stableValue(input.compat),
+    }))
+    .digest("hex")
+    .slice(0, 32);
+}
+
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, item]) => [key, stableValue(item)]),
+    );
+  }
+  return value;
+}
+
+function redactSecrets(text: string, secrets: string[]): string {
+  return [...new Set(secrets.map((secret) => secret.trim()).filter(Boolean))]
+    .sort((a, b) => b.length - a.length)
+    .reduce((redacted, secret) => redacted.split(secret).join("[redacted]"), text);
+}
+
+function headerSecretParts(value: string): string[] {
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+  const parts = new Set<string>([trimmed]);
+  const whitespace = trimmed.split(/\s+/);
+  if (whitespace.length > 1) parts.add(whitespace.at(-1) ?? "");
+  for (const assignment of trimmed.split(";")) {
+    const equals = assignment.indexOf("=");
+    if (equals >= 0) parts.add(assignment.slice(equals + 1).trim());
+  }
+  return [...parts].filter(Boolean);
+}
+
+type OmpModelContext = Pick<
+  ExtensionContext,
+  "models" | "modelRegistry"
+> & {
+  defaultThinkingLevel?: string;
+};
+
+function resolveOmpEffort(
+  model: {
+    reasoning?: boolean;
+    thinking?: { efforts?: readonly unknown[]; defaultLevel?: unknown };
+  },
+  configured?: string,
+): string {
+  const supported = model.thinking?.efforts?.map(String) ?? [];
+  if (!model.reasoning) return "off";
+  const requested = configured?.trim();
+  if (requested && requested !== "auto" && supported.includes(requested)) {
+    return requested;
+  }
+  const modelDefault = model.thinking?.defaultLevel
+    ? String(model.thinking.defaultLevel)
+    : undefined;
+  if (modelDefault && supported.includes(modelDefault)) return modelDefault;
+  if (supported.includes(DEFAULT_EFFORT)) return DEFAULT_EFFORT;
+  return supported.at(-1) ?? "off";
+}
+
+/** Create a verifier from OMP's configured default model and credentials. */
+export async function createVerifierClient(
+  ctx: OmpModelContext,
+): Promise<VerifierClient> {
+  const model = ctx.models.resolve("@default");
+  if (!model) {
+    throw new MissingAPIKeyError("OMP modelRoles.default 没有解析到可用模型。");
+  }
+  if (model.api !== "openai-completions" && model.api !== "openai-responses") {
+    throw new Error(
+      "OMP 默认模型 " + model.provider + "/" + model.id + " 使用 " + model.api +
+        "，LLM-as-a-Verifier 需要支持 OpenAI token logprobs 的模型。",
+    );
+  }
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok || auth.apiKey === undefined) {
+    throw new MissingAPIKeyError(
+      "OMP 默认模型 " + model.provider + "/" + model.id + " 没有可用凭据，请先在 OMP 登录对应 provider。",
+    );
+  }
+  const maxTokens =
+    typeof model.maxTokens === "number" && model.maxTokens > 0
+      ? Math.min(DEFAULT_MAX_TOKENS, model.maxTokens)
+      : DEFAULT_MAX_TOKENS;
+  return new VerifierClient({
+    baseUrl: model.baseUrl,
+    apiKey: auth.apiKey,
+    keyless: auth.apiKey === "N/A",
+    provider: model.provider,
+    api: model.api,
+    modelId: model.requestModelId ?? model.id,
+    headers: { ...model.headers, ...auth.headers },
+    compat: normalizeCompat(model.compat),
+    effort: resolveOmpEffort(
+      model,
+      ctx.defaultThinkingLevel,
+    ),
+    maxTokens,
+  });
 }

@@ -78,10 +78,15 @@ interface Job {
   context: CacheContext;
 }
 
-const DEFAULT_MAX_WORKERS = 16;
+export const SELF_VERIFICATION_DEFAULTS = {
+  pivots: 1,
+  nEvaluations: 2,
+  seed: 0,
+  maxWorkers: 8,
+} as const;
 
 export function defaultMaxWorkers(opts: VerifyOptions): number {
-  return opts.maxWorkers ?? DEFAULT_MAX_WORKERS;
+  return opts.maxWorkers ?? SELF_VERIFICATION_DEFAULTS.maxWorkers;
 }
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {
@@ -137,10 +142,13 @@ export function cacheContext(
     problem: trials[a].problem,
     traceA: trials[slotA].trace,
     traceB: trials[slotB].trace,
+    provider: String(client.provider ?? ""),
+    api: String(client.api ?? ""),
     model: String(client.model ?? ""),
     effort: String(client.effort ?? ""),
     maxTokens: Number(client.maxTokens ?? 0),
     baseUrl: String(client.baseUrl ?? ""),
+    requestIdentity: String(client.requestIdentity ?? ""),
     groundTruthNote,
     promptVersion: PROMPT_VERSION,
   };
@@ -181,7 +189,7 @@ export async function scoreDirectedPairs(
   criteria: Criterion[],
   groundTruthNote: string = GROUND_TRUTH_NOTE,
   nReps = 2,
-  maxWorkers = DEFAULT_MAX_WORKERS,
+  maxWorkers: number = SELF_VERIFICATION_DEFAULTS.maxWorkers,
   cacheFile?: string,
   opts: {
     onError?: "tie" | "raise";
@@ -192,8 +200,16 @@ export async function scoreDirectedPairs(
 ): Promise<ScoreCache> {
   validateTasks(tasks);
   validateCriteria(criteria);
-  const repetitions = positiveInteger(nReps, 2, "nEvaluations");
-  const workersLimit = positiveInteger(maxWorkers, DEFAULT_MAX_WORKERS, "maxWorkers");
+  const repetitions = positiveInteger(
+    nReps,
+    SELF_VERIFICATION_DEFAULTS.nEvaluations,
+    "nEvaluations",
+  );
+  const workersLimit = positiveInteger(
+    maxWorkers,
+    SELF_VERIFICATION_DEFAULTS.maxWorkers,
+    "maxWorkers",
+  );
   const note = groundTruthNote ?? GROUND_TRUTH_NOTE;
   const cached = mergeCaches(loadCache(cacheFile), opts.initialCache ?? {});
   const jobs: Job[] = [];
@@ -225,10 +241,13 @@ export async function scoreDirectedPairs(
               problem: trials[a].problem,
               traceA: trials[slotA].trace,
               traceB: trials[slotB].trace,
+              provider: context.provider,
+              api: context.api,
               model: context.model,
               effort: context.effort,
               maxTokens: context.maxTokens,
               baseUrl: context.baseUrl,
+              requestIdentity: context.requestIdentity,
               groundTruthNote: note,
               promptVersion: PROMPT_VERSION,
             }),
@@ -261,9 +280,25 @@ export async function scoreDirectedPairs(
   const results: ScoreCache = mergeCaches(cached);
   let errors = 0;
   let completed = 0;
+  let firstError: unknown;
+  const executionAbort = new AbortController();
+  const externalAbort = opts.signal;
+  const abortReason = (error?: unknown): unknown =>
+    error ?? new DOMException("The operation was aborted", "AbortError");
+  const abortExecution = (error?: unknown): void => {
+    if (!executionAbort.signal.aborted) executionAbort.abort(abortReason(error));
+  };
+  const onExternalAbort = (): void => {
+    firstError ??= abortReason(externalAbort?.reason);
+    abortExecution(firstError);
+  };
+  if (externalAbort?.aborted) onExternalAbort();
+  else externalAbort?.addEventListener("abort", onExternalAbort, { once: true });
 
   async function scoreOne(job: Job): Promise<void> {
-    if (opts.signal?.aborted) throw new DOMException("aborted", "AbortError");
+    if (executionAbort.signal.aborted) {
+      throw abortReason(firstError ?? executionAbort.signal.reason);
+    }
     const prompt = buildPrompt(
       job.problem,
       job.traceA,
@@ -273,12 +308,19 @@ export async function scoreDirectedPairs(
     );
     let reply: VerifierReply;
     try {
-      reply = await client.scoreReply(prompt, { signal: opts.signal });
+      reply = await client.scoreReply(prompt, { signal: executionAbort.signal });
       if (!hasExtractableScore(reply, "<score_A>") || !hasExtractableScore(reply, "<score_B>")) {
         throw new Error("Verifier response did not contain usable score tags");
       }
     } catch (error) {
-      if (opts.onError === "raise") throw error;
+      if (executionAbort.signal.aborted) {
+        throw abortReason(firstError ?? error);
+      }
+      if (opts.onError === "raise") {
+        firstError ??= error;
+        abortExecution(firstError);
+        throw error;
+      }
       errors += 1;
       results[job.key] = { score_A: 0.5, score_B: 0.5 };
       if (errors <= 3) log(`\n  Error: ${String(error)}`);
@@ -287,7 +329,12 @@ export async function scoreDirectedPairs(
     let scoreA = extractScore(reply, "<score_A>");
     let scoreB = extractScore(reply, "<score_B>");
     if (!Number.isFinite(scoreA) || !Number.isFinite(scoreB)) {
-      if (opts.onError === "raise") throw new Error("Verifier returned non-finite scores");
+      if (opts.onError === "raise") {
+        const error = new Error("Verifier returned non-finite scores");
+        firstError ??= error;
+        abortExecution(firstError);
+        throw error;
+      }
       errors += 1;
       results[job.key] = { score_A: 0.5, score_B: 0.5 };
       return;
@@ -305,22 +352,32 @@ export async function scoreDirectedPairs(
     const checkpoint = Math.max(1, Math.floor(phaseJobs.length / 20));
     async function worker(): Promise<void> {
       while (true) {
+        if (executionAbort.signal.aborted) return;
         const index = next++;
         if (index >= phaseJobs.length) return;
-        await scoreOne(phaseJobs[index]);
-        completed += 1;
-        if (cacheFile && completed % checkpoint === 0 && Object.keys(cached).length > 0) {
-          saveCache(cacheFile, cached);
+        try {
+          await scoreOne(phaseJobs[index]);
+          completed += 1;
+          if (cacheFile && completed % checkpoint === 0 && Object.keys(cached).length > 0) {
+            saveCache(cacheFile, cached);
+          }
+        } catch (error) {
+          firstError ??= error;
+          abortExecution(firstError);
+          return;
         }
       }
     }
-    await Promise.all(Array.from({ length: workers }, () => worker()));
+    await Promise.allSettled(Array.from({ length: workers }, () => worker()));
+    if (firstError) throw firstError;
   }
 
   try {
+    if (firstError) throw firstError;
     await runPhase(warm);
     await runPhase(rest);
   } finally {
+    externalAbort?.removeEventListener("abort", onExternalAbort);
     if (cacheFile && Object.keys(cached).length > 0) saveCache(cacheFile, cached);
   }
   log(`  Done (${errors} errors)`);
@@ -335,11 +392,23 @@ export function validateVerifyOptions(
   validateTasks(tasks);
   validateCriteria(criteria);
   const maxCandidates = Math.max(...Object.values(tasks).map((trials) => trials.length));
-  const requestedK = positiveInteger(opts.pivots, 1, "pivots");
+  const requestedK = positiveInteger(
+    opts.pivots,
+    SELF_VERIFICATION_DEFAULTS.pivots,
+    "pivots",
+  );
   const k = Math.min(requestedK, maxCandidates);
-  const nReps = positiveInteger(opts.nEvaluations, 2, "nEvaluations");
-  const maxWorkers = positiveInteger(opts.maxWorkers, DEFAULT_MAX_WORKERS, "maxWorkers");
-  const seed = opts.seed ?? 0;
+  const nReps = positiveInteger(
+    opts.nEvaluations,
+    SELF_VERIFICATION_DEFAULTS.nEvaluations,
+    "nEvaluations",
+  );
+  const maxWorkers = positiveInteger(
+    opts.maxWorkers,
+    SELF_VERIFICATION_DEFAULTS.maxWorkers,
+    "maxWorkers",
+  );
+  const seed = opts.seed ?? SELF_VERIFICATION_DEFAULTS.seed;
   if (!Number.isInteger(seed)) throw new Error("seed must be an integer");
   return { k, nReps, seed, maxWorkers };
 }
@@ -352,7 +421,10 @@ export async function runBenchmark(
 ): Promise<RunStats> {
   const { k, nReps, seed, maxWorkers } = validateVerifyOptions(tasks, criteria, opts);
   const note = opts.groundTruthNote === undefined ? GROUND_TRUTH_NOTE : opts.groundTruthNote;
-  const client = opts.client ?? new VerifierClient();
+  const client = opts.client;
+  if (!client) {
+    throw new Error("runBenchmark requires a verifier client for the OMP default model.");
+  }
   const criteriaIds = criteria.map((criterion) => criterion.id);
   const usageBefore = USAGE.snapshot();
   const { allPass, swing } = classify(tasks);
