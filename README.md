@@ -1,43 +1,29 @@
 # omp-llm-verifier
 
-用于 oh-my-pi（OMP）的 LLM-as-a-Verifier 自验证插件。它自动使用 OMP `modelRoles.default` 的模型、凭据和请求头，通过细粒度 logprob 奖励与 Probabilistic Pivot Tournament 从多条候选轨迹中选择最佳结果。
-
 ## 引用
 
 - [LLM-as-a-Verifier: A General-Purpose Verification Framework](https://arxiv.org/abs/2607.05391)
-- [参考实现：Self-Verification / Terminal-Bench 2.1](https://github.com/llm-as-a-verifier/llm-as-a-verifier#self-verification-terminal-bench-21)
+- [Self-Verification / Terminal-Bench 2.1 参考实现](https://github.com/llm-as-a-verifier/llm-as-a-verifier#self-verification-terminal-bench-21)
 
-插件固化参考实现的 Terminal-Bench 2.1 Bo5 设置：`pivots=1`、`K=2`、`seed=0`。验证器沿用 OMP 默认模型及其推理等级；该模型需要通过 OpenAI Chat Completions 或 Responses API 提供 token `logprobs`。
+插件采用论文的细粒度 20 级 logprob 评分与 Probabilistic Pivot Tournament。请求级默认配置为 3 个候选、1 个 pivot、2 次重复验证、固定 seed 0；候选和验证统一继承 OMP 的 modelRoles.default、推理等级、凭据、请求头与兼容配置。
 
-## 安装与使用
+## OMP 安装与使用
 
-```bash
+安装并开启插件：
+
+~~~bash
 omp plugin install https://github.com/takltc/pi-llm-as-a-verifier.git
+omp plugin config set omp-llm-verifier enabled true
 omp plugin doctor
-```
+~~~
 
-启动 OMP 后可直接使用：
+之后照常启动 OMP 并发送任务。插件会在每次普通模型请求中并发生成完整候选，使用同一个 OMP 默认模型验证候选，再把胜出响应的文本、推理、图片、工具调用和终止状态回放给 Agent。Agent 继续按原生 OMP 流程执行胜出的工具调用。
 
-```text
-/verify ./trajectories
-```
-
-`./trajectories` 放置至少两个 JSON 文件，每个文件只需任务与完整轨迹：
-
-```json
-{
-  "task": "修复项目中的失败测试并验证结果",
-  "trace": "候选执行轨迹与终端输出"
-}
-```
-
-所有候选使用相同的 `task`。可选 `name` 用于结果展示；文件名会作为默认名称。Terminal-Bench 的 `<task>/*_trajectory.json` 目录可直接用于复现实验。
-
-对话中的模型可直接调用 `verifier_select`。该工具只有两个顶层输入：任务描述 `task` 与候选轨迹 `candidates`；每条候选只需提供 `trace`，并可选提供 `name`。
+插件默认关闭；单次会话可用 --llm-verifier 临时开启。验证器需要当前 OMP 默认模型提供 OpenAI Chat Completions 或 Responses API 的 token logprobs。
 
 ## 本地开发
 
-```bash
+~~~bash
 git clone https://github.com/takltc/pi-llm-as-a-verifier.git omp-llm-verifier
 cd omp-llm-verifier
 bun install --frozen-lockfile
@@ -45,6 +31,6 @@ bun test
 bun run typecheck
 omp plugin link "$PWD"
 omp plugin doctor
-```
+~~~
 
-启动 OMP 后，使用 `/verify <traj_dir>` 或让模型调用 `verifier_select` 验证本地改动。
+本地修改后重新执行 bun test、bun run typecheck 和 omp plugin doctor，再启动 OMP 验证普通请求链路。

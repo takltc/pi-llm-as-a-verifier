@@ -1,751 +1,361 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import {
-  cacheKey,
-  loadCache,
-  saveCache,
-  type CacheContext,
-} from "../src/cache.ts";
-import { createVerifierClient, VerifierClient, type VerifierConfig } from "../src/client.ts";
-import verifierExtension, {
-  createDefaultVerifierClient,
-  parseArgs,
-  tokenizeArgs,
-} from "../src/index.ts";
-import { detectInputLayout, loadCandidateDir, loadTerminalDir } from "../src/loader.ts";
-import { TERMINAL_BENCH_CRITERIA } from "../src/prompt.ts";
-import {
-  runBenchmark,
-  scoreDirectedPairs,
-  SELF_VERIFICATION_DEFAULTS,
-  validateVerifyOptions,
-} from "../src/run.ts";
+import { describe, expect, test } from "bun:test";
+import { afterEach } from "bun:test";
+import { readFileSync } from "node:fs";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import type { AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { cacheKey, loadCache, saveCache, type CacheContext } from "../src/cache.ts";
+import { createAutoVerifierStream, serializeAssistantMessage, serializeContext } from "../src/auto.ts";
+import { createDefaultVerifierClient } from "../src/index.ts";
+import { CODING_AGENT_CRITERIA, CODING_AGENT_GROUND_TRUTH_NOTE } from "../src/prompt.ts";
+import { SELF_VERIFICATION_DEFAULTS } from "../src/run.ts";
+import { VerifierClient, type VerifierConfig } from "../src/client.ts";
 import type { VerifierReply } from "../src/scale.ts";
-import { select } from "../src/select.ts";
 
-const temporaryPaths: string[] = [];
+const temporaryFiles: string[] = [];
 
 afterEach(() => {
-  for (const path of temporaryPaths.splice(0)) {
-    rmSync(path, { recursive: true, force: true });
-  }
+  for (const path of temporaryFiles.splice(0)) Bun.file(path).delete().catch(() => undefined);
 });
-
-function tempDir(): string {
-  const path = join(tmpdir(), `omp-verifier-${crypto.randomUUID()}`);
-  mkdirSync(path, { recursive: true });
-  temporaryPaths.push(path);
-  return path;
-}
-
-function context(overrides: Partial<CacheContext> = {}): CacheContext {
-  return {
-    criterionId: "criterion",
-    criterionName: "Criterion",
-    criterionDescription: "Evaluate the criterion.",
-    problem: "problem",
-    traceA: "trace A",
-    traceB: "trace B",
-    provider: "opencode-go",
-    api: "openai-responses",
-    model: "deepseek-v4-flash",
-    effort: "high",
-    maxTokens: 32768,
-    baseUrl: "https://opencode.ai/zen/go/v1",
-    requestIdentity: "request-identity",
-    groundTruthNote: "terminal output is ground truth",
-    promptVersion: "terminal-bench-pairwise-v1",
-    ...overrides,
-  };
-}
 
 function clientConfig(overrides: Partial<VerifierConfig> = {}): VerifierConfig {
   return {
-    baseUrl: "https://opencode.ai/zen/go/v1",
+    baseUrl: "https://example.test/v1",
     apiKey: "test-key",
     provider: "opencode-go",
     api: "openai-completions",
-    modelId: "deepseek-v4-flash",
-    effort: "high",
+    modelId: "deepseek-v4-flash-0731",
+    effort: "max",
     maxTokens: 32768,
     ...overrides,
   };
 }
 
-function reply(scoreA: number, scoreB: number): VerifierReply {
-  const distribution = (score: number): Array<[string, number]> => {
-    if (score <= 0) return [["T", 0]];
-    if (score >= 1) return [["A", 0]];
-    return [
-      ["A", Math.log(score)],
-      ["T", Math.log(1 - score)],
-    ];
-  };
+function usage() {
   return {
-    text: "<score_A> A </score_A>\n<score_B> A </score_B>",
-    tokens: ["<score_A>", " A", " </score_A>\n<score_B>", " A", " </score_B>"],
-    positionLogprobs: [
-      [["<score_A>", 0]],
-      distribution(scoreA),
-      [[" </score_A>\n<score_B>", 0]],
-      distribution(scoreB),
-      [[" </score_B>", 0]],
-    ],
+    input: 1,
+    output: 1,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 2,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
 }
 
-class MatrixClient extends VerifierClient {
+function message(index: number, withTool = false): AssistantMessage {
+  const content: AssistantMessage["content"] = [
+    { type: "thinking", thinking: "candidate thinking " + index },
+    { type: "text", text: "candidate text " + index },
+  ];
+  if (withTool) {
+    content.push({
+      type: "toolCall",
+      id: "call-" + index,
+      name: "bash",
+      arguments: { command: "printf candidate-" + index },
+    });
+  }
+  return {
+    role: "assistant",
+    content,
+    api: "openai-completions",
+    provider: "opencode-go",
+    model: "deepseek-v4-flash-0731",
+    responseId: "response-" + index,
+    usage: usage(),
+    stopReason: withTool ? "toolUse" : "stop",
+    stopDetails: { type: "test" },
+    providerPayload: { type: "openaiResponsesHistory", items: [{ index }] },
+    duration: 10 + index,
+    ttft: 2,
+    timestamp: 1000 + index,
+  };
+}
+
+function fakeCandidateStreamFactory(
+  calls: Array<{ context: Context; options: SimpleStreamOptions }>,
+  failing = new Set<number>(),
+) {
+  let nextIndex = 0;
+  return (_model: Model, context: Context, options: SimpleStreamOptions = {}) => {
+    const index = nextIndex++;
+    calls.push({ context, options });
+    const stream = new AssistantMessageEventStream();
+    queueMicrotask(() => {
+      if (failing.has(index)) {
+        stream.fail(new Error("candidate " + index + " failed"));
+        return;
+      }
+      const result = message(index, index === 2);
+      stream.push({ type: "start", partial: result });
+      stream.push({
+        type: "done",
+        reason: result.stopReason === "toolUse" ? "toolUse" : "stop",
+        message: result,
+      });
+    });
+    return stream;
+  };
+}
+
+class RankingVerifier extends VerifierClient {
   calls = 0;
 
-  constructor() {
+  constructor(private readonly fail = false) {
     super(clientConfig());
   }
 
   override async scoreReply(prompt: string): Promise<VerifierReply> {
     this.calls += 1;
-    const match = /\*\*Trajectory A:\*\*\n([\s\S]*?)\n\n\*\*Trajectory B:\*\*\n([\s\S]*?)\n\n\*\*Rating Scale/.exec(prompt);
-    if (!match) throw new Error("test prompt did not contain trajectories");
-    const a = Number(/candidate-(\d+)/.exec(match[1])?.[1]);
-    const b = Number(/candidate-(\d+)/.exec(match[2])?.[1]);
-    const directedDiff = new Map<string, number>([
-      ["4,2", 1],
-      ["2,3", 1],
-      ["3,0", 0],
-      ["0,1", -0.5],
-      ["1,4", 0],
-      ["0,4", 1],
-      ["2,4", 1],
-      ["3,4", 0.5],
-    ]);
-    const diff = directedDiff.get(`${a},${b}`) ?? 0;
-    return reply((diff + 1) / 2, (1 - diff) / 2);
+    if (this.fail) throw new Error("verifier unavailable");
+    const a = /candidate text (\d+)/.exec(prompt)?.[1];
+    const b = /candidate text (\d+)/.exec(prompt.slice(prompt.indexOf("Trajectory B")))?.[1];
+    const aWins = a === "2" && b !== "2";
+    const bWins = b === "2" && a !== "2";
+    const scoreA = aWins ? "A" : bWins ? "T" : "A";
+    const scoreB = bWins ? "A" : aWins ? "T" : "A";
+    return { text: "<score_A> " + scoreA + " </score_A>\n<score_B> " + scoreB + " </score_B>" };
   }
 }
 
-class NoScoreClient extends VerifierClient {
-  constructor() {
-    super(clientConfig());
-  }
-
-  override async scoreReply(): Promise<VerifierReply> {
-    return { text: "analysis without verdict", tokens: ["analysis"], positionLogprobs: [[["analysis", 0]]] };
-  }
-}
-
-class CancellingClient extends VerifierClient {
-  started = 0;
-  settled = 0;
-  aborted = 0;
-  constructor(
-    private readonly failFirst: boolean,
-    private readonly slowMs = 100,
-    private readonly failMs = 5,
-  ) {
-    super(clientConfig());
-  }
-
-  override scoreReply(_prompt: string, opts: { signal?: AbortSignal } = {}): Promise<VerifierReply> {
-    const call = this.started++;
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const finish = (callback: () => void): void => {
-        if (settled) return;
-        settled = true;
-        this.settled += 1;
-        callback();
-      };
-      const timer = setTimeout(() => {
-        finish(() => {
-          if (this.failFirst && call === 0) reject(new Error("first verifier failure"));
-          else resolve(reply(1, 0));
-        });
-      }, call === 0 ? this.failMs : this.slowMs);
-      opts.signal?.addEventListener("abort", () => {
-        clearTimeout(timer);
-        this.aborted += 1;
-        finish(() => reject(opts.signal?.reason ?? new DOMException("aborted", "AbortError")));
-      }, { once: true });
-    });
-  }
-}
-
-function trajectory(reward: 0 | 1, id: number): Record<string, unknown> {
+function model(): Model {
   return {
-    trial_name: `trial-${id}`,
-    reward,
-    trajectory: {
-      steps: [
-        { source: "user", message: "Solve the task exactly." },
-        {
-          source: "agent",
-          step_id: 1,
-          message: `candidate-${id}`,
-          tool_calls: [{ arguments: { keystrokes: "npm test" } }],
-          observation: { results: [{ content: "tests passed" }] },
-        },
-      ],
-    },
+    provider: "opencode-go",
+    id: "deepseek-v4-flash-0731",
+    name: "DeepSeek V4 Flash",
+    api: "openai-completions",
+    baseUrl: "https://example.test/v1",
+    reasoning: true,
+    thinking: { mode: "effort", efforts: ["low", "high", "max"] },
+    input: ["text"],
+    supportsTools: true,
+    cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 },
+    contextWindow: 128000,
+    maxTokens: 64000,
+  } as unknown as Model;
+}
+
+function context(): Context {
+  return {
+    systemPrompt: ["You are an OMP coding agent."],
+    messages: [{ role: "user", content: "Fix the failing test and verify it.", timestamp: 1 }],
+    tools: [{ name: "bash", description: "run a shell command", parameters: {} }],
   };
 }
 
-describe("cache identity and durability", () => {
-  test("key changes for every prompt-affecting identity field", () => {
-    const base = cacheKey("criterion", "task", 0, 1, 0, context());
-    expect(cacheKey("criterion", "task", 0, 1, 0, context({ traceA: "changed" }))).not.toBe(base);
-    expect(cacheKey("criterion", "task", 0, 1, 0, context({ problem: "changed" }))).not.toBe(base);
-    expect(cacheKey("criterion", "task", 0, 1, 0, context({ provider: "other" }))).not.toBe(base);
-    expect(cacheKey("criterion", "task", 0, 1, 0, context({ api: "openai-completions" }))).not.toBe(base);
-    expect(cacheKey("criterion", "task", 0, 1, 0, context({ model: "other" }))).not.toBe(base);
-    expect(cacheKey("criterion", "task", 0, 1, 0, context({ effort: "xhigh" }))).not.toBe(base);
-    expect(cacheKey("criterion", "task", 0, 1, 0, context({ requestIdentity: "rotated" }))).not.toBe(base);
-    expect(cacheKey("criterion", "task", 0, 1, 0, context({ criterionName: "Renamed" }))).not.toBe(base);
-    expect(cacheKey("criterion", "task", 0, 1, 0, context({ criterionDescription: "Changed rubric" }))).not.toBe(base);
-    expect(cacheKey("criterion", "task", 0, 1, 0, context({ promptVersion: "v2" }))).not.toBe(base);
-  });
+async function collect(stream: AssistantMessageEventStream) {
+  const events: unknown[] = [];
+  const reader = (async () => {
+    for await (const event of stream) events.push(event);
+  })();
+  const result = await stream.result();
+  await reader;
+  return { events, result };
+}
 
-  test("request identity is hashed and never stores credential material", () => {
-    const first = new VerifierClient(clientConfig({ apiKey: "secret-one", headers: { "X-Route": "a" } }));
-    const second = new VerifierClient(clientConfig({ apiKey: "secret-two", headers: { "X-Route": "a" } }));
-    const third = new VerifierClient(clientConfig({ apiKey: "secret-one", headers: { "X-Route": "b" } }));
-    const fourth = new VerifierClient(clientConfig({
-      compat: { reasoningEffortMap: { high: "xhigh" } },
-    }));
-    expect(first.requestIdentity).not.toBe(second.requestIdentity);
-    expect(first.requestIdentity).not.toBe(third.requestIdentity);
-    expect(first.requestIdentity).not.toBe(fourth.requestIdentity);
-    expect(first.requestIdentity).not.toContain("secret-one");
-    expect(first.requestIdentity).not.toContain("X-Route");
-  });
+describe("automatic request-level provider", () => {
+  test("generates three candidates and replays the verified winner", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const verifier = new RankingVerifier();
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls),
+    }, context());
+    const { events, result } = await collect(stream);
 
-  test("corrupt cache is isolated and later writes use an atomic merged file", () => {
-    const dir = tempDir();
-    const file = join(dir, "nested", "cache.json");
-    mkdirSync(join(dir, "nested"), { recursive: true });
-    writeFileSync(file, "{corrupt");
-    expect(loadCache(file)).toEqual({});
-    saveCache(file, { first: { score_A: 0.2, score_B: 0.8 } });
-    saveCache(file, { second: { score_A: 0.7, score_B: 0.3 } });
-    expect(loadCache(file)).toEqual({
-      first: { score_A: 0.2, score_B: 0.8 },
-      second: { score_A: 0.7, score_B: 0.3 },
+    expect(calls).toHaveLength(3);
+    expect(verifier.calls).toBeGreaterThan(0);
+    expect(verifier.calls % 6).toBe(0);
+    expect(calls.every((call) => call.options.statefulResponses === false)).toBe(true);
+    expect(calls.every((call) => call.options.sessionId === undefined)).toBe(true);
+    expect(calls.every((call) => call.options.providerSessionState === undefined)).toBe(true);
+    expect(calls.every((call) => call.options.promptCacheKey === undefined)).toBe(true);
+    expect(result.responseId).toBe("response-2");
+    expect(result.stopReason).toBe("toolUse");
+    expect(result.content.some((block) => block.type === "toolCall")).toBe(true);
+    expect((events as Array<{ type: string }>).map((event) => event.type)).toEqual([
+      "start",
+      "thinking_start",
+      "thinking_delta",
+      "thinking_end",
+      "text_start",
+      "text_delta",
+      "text_end",
+      "toolcall_start",
+      "toolcall_delta",
+      "toolcall_end",
+      "done",
+    ]);
+    const replayEvents = events as Array<{ type: string; partial?: AssistantMessage }>;
+    const textStart = replayEvents.find((event) => event.type === "text_start");
+    const textDelta = replayEvents.find((event) => event.type === "text_delta");
+    const toolStart = replayEvents.find((event) => event.type === "toolcall_start");
+    const toolDelta = replayEvents.find((event) => event.type === "toolcall_delta");
+    expect(textStart?.partial?.content[1]).toEqual({ type: "text", text: "" });
+    expect(textDelta?.partial?.content[1]).toMatchObject({ type: "text", text: "candidate text 2" });
+    expect(toolStart?.partial?.content[2]).toMatchObject({
+      type: "toolCall",
+      id: "call-2",
+      name: "bash",
+      arguments: {},
     });
-    expect(readdirSync(join(dir, "nested")).some((name) => name.includes(".tmp-") || name.endsWith(".lock"))).toBe(false);
-  });
-
-  test("independent writer processes preserve each entry", async () => {
-    const dir = tempDir();
-    const file = join(dir, "scores.json");
-    const cacheModule = resolve(import.meta.dir, "../src/cache.ts");
-    const children = Array.from({ length: 8 }, (_, index) => {
-      const source = `import { saveCache } from ${JSON.stringify(cacheModule)}; saveCache(${JSON.stringify(file)}, {${JSON.stringify(`k${index}`)}: {score_A: ${index / 10}, score_B: ${(9 - index) / 10}}});`;
-      return Bun.spawn(["bun", "-e", source], { stdout: "ignore", stderr: "ignore" });
+    expect(toolDelta?.partial?.content[2]).toMatchObject({
+      type: "toolCall",
+      arguments: { command: "printf candidate-2" },
     });
-    const codes = await Promise.all(children.map((child) => child.exited));
-    expect(codes).toEqual(new Array(8).fill(0));
-    expect(Object.keys(loadCache(file)).sort()).toEqual(
-      Array.from({ length: 8 }, (_, index) => `k${index}`),
-    );
-  });
-});
-
-describe("benchmark pipeline", () => {
-  test("keeps phase-A scores when phase B runs without a cache file", async () => {
-    const client = new MatrixClient();
-    const tasks = {
-      task: Array.from({ length: 5 }, (_, index) => ({
-        trialName: `candidate-${index}`,
-        reward: index === 2 ? (1 as const) : (0 as const),
-        problem: "Solve the task exactly.",
-        trace: `candidate-${index}`,
-      })),
-    };
-    const stats = await runBenchmark(tasks, TERMINAL_BENCH_CRITERIA, {
-      client,
-      pivots: 1,
-      nEvaluations: 1,
-      seed: 0,
-      maxWorkers: 1,
-      progress: false,
-    });
-    expect(stats.totalComparisons).toBe(9);
-    expect(stats.bestPerTask.task.index).toBe(2);
-    expect(stats.bestPerTask.task.reward).toBe(1);
-    // Pair (1,4) appears in both phases and is reused from the in-memory cache.
-    expect(client.calls).toBe(8 * 3);
   });
 
-  test("failed replies return temporary ties and never persist", async () => {
-    const dir = tempDir();
-    const cacheFile = join(dir, "scores.json");
-    const tasks = {
-      task: [
-        { trialName: "a", reward: 0 as const, problem: "p", trace: "a" },
-        { trialName: "b", reward: 1 as const, problem: "p", trace: "b" },
-      ],
-    };
-    const scores = await scoreDirectedPairs(
-      new NoScoreClient(),
-      tasks,
-      { task: [[0, 1]] },
-      [TERMINAL_BENCH_CRITERIA[0]],
-      undefined,
-      1,
-      1,
-      cacheFile,
-      { progress: false },
-    );
-    expect(Object.values(scores)).toEqual([{ score_A: 0.5, score_B: 0.5 }]);
-    expect(existsSync(cacheFile)).toBe(false);
+  test("falls back to the first successful candidate when verification fails", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(true),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls),
+    }, context());
+    const { result } = await collect(stream);
+    expect(result.responseId).toBe("response-0");
   });
 
-  test("raise cancels in-flight workers, waits for them, and preserves completed cache entries", async () => {
-    const dir = tempDir();
-    const cacheFile = join(dir, "scores.json");
-    const client = new CancellingClient(true, 1, 20);
-    const tasks = {
-      task: [
-        { trialName: "a", reward: 0 as const, problem: "p", trace: "a" },
-        { trialName: "b", reward: 1 as const, problem: "p", trace: "b" },
-        { trialName: "c", reward: 0 as const, problem: "p", trace: "c" },
-      ],
-    };
-    await expect(scoreDirectedPairs(
-      client,
-      tasks,
-      { task: [[0, 1], [0, 2]] },
-      [TERMINAL_BENCH_CRITERIA[0]],
-      undefined,
-      1,
-      2,
-      cacheFile,
-      { onError: "raise", progress: false },
-    )).rejects.toThrow("first verifier failure");
-    expect(client.started).toBe(client.settled);
-    expect(client.aborted).toBeGreaterThan(0);
-    expect(Object.keys(loadCache(cacheFile)).length).toBeGreaterThanOrEqual(1);
+  test("keeps successful candidates when one candidate request fails", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls, new Set([0])),
+    }, context());
+    const { result } = await collect(stream);
+    expect(result.responseId).toBe("response-2");
+    expect(calls).toHaveLength(3);
   });
 
-  test("external cancellation propagates in tie mode", async () => {
+  test("returns an OMP error event when every candidate fails", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls, new Set([0, 1, 2])),
+    }, context());
+    const { events, result } = await collect(stream);
+    expect(result.stopReason).toBe("error");
+    expect((events as Array<{ type: string }>).map((event) => event.type)).toEqual(["error"]);
+    expect(calls).toHaveLength(3);
+  });
+
+  test("returns an OMP aborted event when the request is cancelled", async () => {
     const controller = new AbortController();
-    const client = new CancellingClient(false, 200);
-    const promise = scoreDirectedPairs(
-      client,
-      {
-        task: [
-          { trialName: "a", reward: 0 as const, problem: "p", trace: "a" },
-          { trialName: "b", reward: 1 as const, problem: "p", trace: "b" },
-        ],
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: (_model, _context, options = {}) => {
+        const candidate = new AssistantMessageEventStream();
+        const abort = () => candidate.push({
+          type: "error",
+          reason: "aborted",
+          error: { ...message(0), content: [], stopReason: "aborted", errorMessage: "cancelled" },
+        });
+        if (options.signal?.aborted) queueMicrotask(abort);
+        else options.signal?.addEventListener("abort", abort, { once: true });
+        return candidate;
       },
-      { task: [[0, 1]] },
-      [TERMINAL_BENCH_CRITERIA[0]],
-      undefined,
-      1,
-      1,
-      undefined,
-      { onError: "tie", progress: false, signal: controller.signal },
-    );
-    setTimeout(() => controller.abort(new Error("caller cancelled")), 5);
-    await expect(promise).rejects.toThrow("caller cancelled");
-    expect(client.started).toBe(client.settled);
+    }, context(), { signal: controller.signal });
+    controller.abort();
+    const { events, result } = await collect(stream);
+    expect(result.stopReason).toBe("aborted");
+    expect((events as Array<{ type: string }>).map((event) => event.type)).toEqual(["error"]);
   });
 
-  test("select injects the Terminal-Bench terminal-output ground-truth note by default", async () => {
-    let prompt = "";
-    class CaptureClient extends VerifierClient {
-      constructor() { super(clientConfig()); }
-      override async scoreReply(value: string): Promise<VerifierReply> {
-        prompt = value;
-        return reply(1, 0);
-      }
-    }
-    await select("do work", [{ name: "a", trace: "a" }, { name: "b", trace: "b" }], {
-      client: new CaptureClient(),
-      nEvaluations: 1,
-      maxWorkers: 1,
-      progress: false,
-    });
-    expect(prompt).toContain("Focus on TERMINAL OUTPUT as ground truth");
-  });
-
-  test("benchmark validation reports non-string task fields", async () => {
-    await expect(
-      runBenchmark(
-        {
-          task: [
-            { trialName: "a", reward: 0, problem: 42 as unknown as string, trace: "a" },
-            { trialName: "b", reward: 1, problem: "p", trace: "b" },
-          ],
-        },
-        [TERMINAL_BENCH_CRITERIA[0]],
-        { progress: false },
-      ),
-    ).rejects.toThrow("problem and trace must be strings");
+  test("serializes current context and candidate metadata", () => {
+    const current = context();
+    const contextText = serializeContext(current);
+    const candidateText = serializeAssistantMessage(message(2, true));
+    expect(contextText).toContain("Fix the failing test and verify it.");
+    expect(contextText).toContain("Message 1 (user)");
+    expect(candidateText).toContain("response-2");
+    expect(candidateText).toContain("candidate thinking 2");
+    expect(candidateText).toContain("call-2");
   });
 });
 
-describe("loader, OMP model binding, and extension interface", () => {
-  test("recognizes Terminal-Bench layout by trajectory files and validates reward", () => {
-    const dir = tempDir();
-    mkdirSync(join(dir, "notes"));
-    mkdirSync(join(dir, "task-a"));
-    writeFileSync(join(dir, "task-a", "one_trajectory.json"), JSON.stringify(trajectory(1, 1)));
-    writeFileSync(join(dir, "task-a", "two_trajectory.json"), JSON.stringify(trajectory(0, 2)));
-    expect(detectInputLayout(dir)).toBe("terminal");
-    expect(loadTerminalDir(dir).tasks["task-a"]).toHaveLength(2);
-
-    const bad = tempDir();
-    mkdirSync(join(bad, "task-b"));
-    writeFileSync(
-      join(bad, "task-b", "bad_trajectory.json"),
-      JSON.stringify({ ...trajectory(1, 1), reward: 2 }),
-    );
-    expect(() => loadTerminalDir(bad)).toThrow("Trajectory reward must be numeric 0 or 1");
-
-    const malformed = tempDir();
-    mkdirSync(join(malformed, "task-c"));
-    writeFileSync(
-      join(malformed, "task-c", "malformed_trajectory.json"),
-      JSON.stringify({ ...trajectory(1, 3), trajectory: { steps: [null] } }),
-    );
-    expect(() => loadTerminalDir(malformed)).toThrow("Trajectory step 0 must be an object");
-  });
-
-  test("loads a flat candidate directory with a shared task", () => {
-    const dir = tempDir();
-    writeFileSync(
-      join(dir, "alpha.json"),
-      JSON.stringify({ task: "solve the issue", trace: "alpha trace" }),
-    );
-    writeFileSync(
-      join(dir, "beta.json"),
-      JSON.stringify({ task: "solve the issue", name: "Beta", trace: "beta trace" }),
-    );
-    expect(detectInputLayout(dir)).toBe("candidates");
-    expect(loadCandidateDir(dir)).toEqual({
-      task: "solve the issue",
-      candidates: [
-        { name: "alpha", trace: "alpha trace" },
-        { name: "Beta", trace: "beta trace" },
-      ],
-    });
-  });
-
-  test("rejects invalid flat candidate sets", () => {
-    const one = tempDir();
-    writeFileSync(join(one, "only.json"), JSON.stringify({ task: "t", trace: "x" }));
-    expect(() => loadCandidateDir(one)).toThrow("At least two candidate JSON files");
-
-    const mismatch = tempDir();
-    writeFileSync(join(mismatch, "a.json"), JSON.stringify({ task: "a", trace: "x" }));
-    writeFileSync(join(mismatch, "b.json"), JSON.stringify({ task: "b", trace: "y" }));
-    expect(() => loadCandidateDir(mismatch)).toThrow("Candidate task mismatch");
-
-    const duplicate = tempDir();
-    writeFileSync(join(duplicate, "a.json"), JSON.stringify({ task: "t", name: "same", trace: "x" }));
-    writeFileSync(join(duplicate, "b.json"), JSON.stringify({ task: "t", name: "same", trace: "y" }));
-    expect(() => loadCandidateDir(duplicate)).toThrow("Duplicate candidate name");
-  });
-
-  test("rejects mixed layouts and parses quoted extension command arguments", () => {
-    const dir = tempDir();
-    mkdirSync(join(dir, "task"));
-    writeFileSync(join(dir, "task", "one_trajectory.json"), JSON.stringify(trajectory(1, 1)));
-    writeFileSync(join(dir, "candidate.json"), JSON.stringify(trajectory(0, 2)));
-    expect(() => detectInputLayout(dir)).toThrow("Mixed trajectory layouts");
-    expect(tokenizeArgs("'folder with spaces' --note \"terminal output only\"")).toEqual(["folder with spaces", "--note", "terminal output only"]);
-    const parsed = parseArgs("'folder with spaces' --k=2");
-    expect(parsed.positionals).toEqual(["folder with spaces"]);
-    expect(parsed.opts.k).toBe("2");
-    expect(() => parseArgs("'unterminated")).toThrow("Unterminated quote");
-  });
-
-  test("uses the configured OMP default model, explicit effort, and authenticated request settings", async () => {
-    const activeModel = {
-      provider: "active-provider",
-      id: "active-model",
-      api: "openai-completions",
-      baseUrl: "https://active.example/v1",
-      maxTokens: 100_000,
-      reasoning: true,
-      thinking: { efforts: ["low", "high", "xhigh"] },
-    };
+describe("OMP default model inheritance", () => {
+  test("uses modelRoles.default and preserves its explicit thinking selector", async () => {
     const defaultModel = {
-      provider: "default-provider",
-      id: "default-model",
-      requestModelId: "default-wire-model",
+      ...model(),
+      provider: "inferx",
+      id: "deepseek-v4-flash-0731",
       api: "openai-responses",
-      baseUrl: "https://default.example/v1",
-      headers: { "X-Model": "model-header" },
-      maxTokens: 100_000,
-      reasoning: true,
-      thinking: { efforts: ["low", "high", "xhigh"] },
+      thinking: { mode: "effort", efforts: ["low", "high", "max"] },
+    } as unknown as Model;
+    const registry = {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "default-key", headers: { "X-Auth": "yes" } }),
+      resolver: () => () => "default-key",
     };
-    let authenticatedModel: unknown;
-    const client = await createVerifierClient({
-      model: activeModel,
-      models: {
-        current: () => activeModel,
-        resolve: (spec: string) => spec === "@default" ? defaultModel : undefined,
-      },
-      modelRegistry: {
-        getApiKeyAndHeaders: async (model: unknown) => {
-          authenticatedModel = model;
-          return {
-            ok: true,
-            apiKey: "session-key",
-            headers: { "X-Auth": "auth-header" },
-          };
+    const client = await createDefaultVerifierClient({
+      pi: {
+        settings: {
+          getModelRole: (role: string) => role === "default" ? "inferx/deepseek-v4-flash-0731:max" : undefined,
         },
       },
-      defaultThinkingLevel: "xhigh",
+    } as never, {
+      models: { resolve: (spec: string) => spec === "@default" ? defaultModel : undefined },
+      modelRegistry: registry,
     } as never);
-    expect(authenticatedModel).toBe(defaultModel);
-    expect(client.provider).toBe("default-provider");
-    expect(client.api).toBe("openai-responses");
-    expect(client.model).toBe("default-wire-model");
-    expect(client.baseUrl).toBe("https://default.example/v1");
-    expect(client.apiKey).toBe("session-key");
-    expect(client.effort).toBe("xhigh");
-    expect(client.maxTokens).toBe(32768);
-    expect(client.headers).toEqual({ "X-Model": "model-header", "X-Auth": "auth-header" });
+    expect(client.provider).toBe("inferx");
+    expect(client.model).toBe("deepseek-v4-flash-0731");
+    expect(client.effort).toBe("max");
+    expect(client.headers).toEqual({ "X-Auth": "yes" });
+    expect(client.apiKeyResolver).toBeDefined();
   });
+});
 
-  test("reads the explicit thinking level from OMP modelRoles.default", async () => {
-    const defaultModel = {
-      provider: "opencode-go",
-      id: "deepseek-v4-flash",
+describe("cache and fixed paper defaults", () => {
+  test("cache identity includes model, effort, prompt and request lineage", () => {
+    const base: CacheContext = {
+      criterionId: "criterion",
+      criterionName: "Criterion",
+      criterionDescription: "description",
+      problem: "problem",
+      traceA: "a",
+      traceB: "b",
+      provider: "inferx",
       api: "openai-responses",
-      baseUrl: "https://opencode.ai/zen/go/v1",
-      maxTokens: 100_000,
-      reasoning: true,
-      thinking: { efforts: ["low", "high", "xhigh"] },
+      model: "deepseek-v4-flash-0731",
+      effort: "max",
+      maxTokens: 32768,
+      baseUrl: "https://example.test/v1",
+      requestIdentity: "identity",
+      groundTruthNote: CODING_AGENT_GROUND_TRUTH_NOTE,
+      promptVersion: "pairwise-granularity20-v2",
     };
-    const client = await createDefaultVerifierClient(
-      {
-        pi: {
-          settings: {
-            getModelRole: (role: string) =>
-              role === "default"
-                ? "opencode-go/deepseek-v4-flash:xhigh"
-                : undefined,
-          },
-        },
-      } as never,
-      {
-        models: {
-          resolve: (spec: string) => spec === "@default" ? defaultModel : undefined,
-        },
-        modelRegistry: {
-          getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "session-key" }),
-        },
-      } as never,
-    );
-    expect(client.effort).toBe("xhigh");
+    const key = cacheKey("criterion", "task", 0, 1, 0, base);
+    expect(cacheKey("criterion", "task", 0, 1, 0, { ...base, effort: "high" })).not.toBe(key);
+    expect(cacheKey("criterion", "task", 0, 1, 0, { ...base, traceA: "changed" })).not.toBe(key);
   });
 
-  test("client keeps token and logprob positions aligned for malformed entries", async () => {
-    const originalFetch = globalThis.fetch;
-    let request: Record<string, unknown> | undefined;
-    globalThis.fetch = (async (_input, init) => {
-      request = JSON.parse(String(init?.body));
-      return new Response(
-        JSON.stringify({
-          choices: [
-            {
-              message: { content: "<score_A> A </score_A>" },
-              finish_reason: "stop",
-              logprobs: {
-                content: [
-                  { token: "<score_A>", top_logprobs: [{ token: "<score_A>", logprob: 0 }] },
-                  { token: " A", top_logprobs: [{ token: " A", logprob: 0 }] },
-                  { token: "", top_logprobs: [null], logprob: "invalid" },
-                ],
-              },
-            },
-          ],
-          usage: {},
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
-    }) as typeof fetch;
-    try {
-      const reply = await new VerifierClient({
-        ...clientConfig({ maxTokens: 128, headers: { "X-Test": "preserved" } }),
-      }).scoreReply("short prompt");
-      expect(request?.model).toBe("deepseek-v4-flash");
-      expect(request?.reasoning_effort).toBe("high");
-      expect(request?.max_tokens).toBe(128);
-      expect(request?.temperature).toBeUndefined();
-      expect(request?.logprobs).toBe(true);
-      expect(request?.top_logprobs).toBe(20);
-      expect(reply.tokens?.length).toBe(3);
-      expect(reply.positionLogprobs?.length).toBe(3);
-      expect(reply.positionLogprobs?.[2]).toEqual([]);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+  test("saveCache merges entries durably", () => {
+    const path = "/tmp/omp-verifier-" + crypto.randomUUID() + ".json";
+    temporaryFiles.push(path);
+    saveCache(path, { first: { score_A: 0.2, score_B: 0.8 } });
+    saveCache(path, { second: { score_A: 0.7, score_B: 0.3 } });
+    expect(Object.keys(loadCache(path)).sort()).toEqual(["first", "second"]);
   });
 
-  test("uses the Responses transport and parses output token logprobs", async () => {
-    const originalFetch = globalThis.fetch;
-    let requestUrl = "";
-    let request: Record<string, unknown> | undefined;
-    globalThis.fetch = (async (input, init) => {
-      requestUrl = String(input);
-      request = JSON.parse(String(init?.body));
-      return new Response(
-        JSON.stringify({
-          status: "completed",
-          output: [
-            {
-              type: "message",
-              content: [
-                {
-                  type: "output_text",
-                  text: "<score_A> A </score_A>",
-                  logprobs: [
-                    { token: "<score_A>", logprob: 0, top_logprobs: [] },
-                    {
-                      token: " A",
-                      logprob: -0.1,
-                      top_logprobs: [
-                        { token: " A", logprob: -0.1 },
-                        { token: " B", logprob: -2.4 },
-                      ],
-                    },
-                  ],
-                },
-              ],
-            },
-          ],
-          usage: {
-            input_tokens: 30,
-            output_tokens: 7,
-            input_tokens_details: { cached_tokens: 20 },
-            output_tokens_details: { reasoning_tokens: 4 },
-          },
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
-    }) as typeof fetch;
-    try {
-      const result = await new VerifierClient({
-        ...clientConfig({ api: "openai-responses", effort: "xhigh", maxTokens: 256 }),
-      }).scoreReply("short prompt");
-      expect(requestUrl).toBe("https://opencode.ai/zen/go/v1/responses");
-      expect(request?.max_output_tokens).toBe(256);
-      expect(request?.top_logprobs).toBe(20);
-      expect(request?.include).toEqual(["message.output_text.logprobs"]);
-      expect(request?.reasoning).toEqual({ effort: "xhigh" });
-      expect(request?.temperature).toBeUndefined();
-      expect(request?.messages).toBeUndefined();
-      expect(result.text).toBe("<score_A> A </score_A>");
-      expect(result.tokens).toEqual(["<score_A>", " A"]);
-      expect(result.positionLogprobs?.[1]).toEqual([
-        [" A", -0.1],
-        [" B", -2.4],
-      ]);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+  test("uses the paper's small self-verification defaults", () => {
+    expect(SELF_VERIFICATION_DEFAULTS).toEqual({ pivots: 1, nEvaluations: 2, seed: 0, maxWorkers: 8 });
+    expect(CODING_AGENT_CRITERIA).toHaveLength(3);
   });
+});
 
-  test("keyless OMP auth preserves routing headers without Bearer N/A", async () => {
-    const originalFetch = globalThis.fetch;
-    let requestHeaders: Headers | undefined;
-    globalThis.fetch = (async (_input, init) => {
-      requestHeaders = new Headers(init?.headers);
-      return new Response(
-        JSON.stringify({
-          choices: [{
-            message: { content: "<score_A> A </score_A>" },
-            logprobs: { content: [{ token: " A", logprob: 0 }] },
-          }],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
-    }) as typeof fetch;
-    try {
-      await new VerifierClient(clientConfig({
-        apiKey: "N/A",
-        headers: { "X-Route": "gateway-route" },
-      })).scoreReply("short prompt");
-      expect(requestHeaders?.get("authorization")).toBeNull();
-      expect(requestHeaders?.get("x-route")).toBe("gateway-route");
-      expect(requestHeaders?.get("content-type")).toBe("application/json");
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  test("redacts API credentials and routing header values from API errors", async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () =>
-      new Response(
-        JSON.stringify({ error: "Bearer test-key route-secret cookie-secret" }),
-        { status: 401, statusText: "Unauthorized" },
-      )) as unknown as typeof fetch;
-    try {
-      const client = new VerifierClient(clientConfig({
-        headers: {
-          "X-Route": "route-secret",
-          Cookie: "session=cookie-secret",
-        },
-      }));
-      let message = "";
-      try {
-        await client.scoreReply("short prompt");
-      } catch (error) {
-        message = error instanceof Error ? error.message : String(error);
-      }
-      expect(message).toContain("[redacted]");
-      expect(message).not.toContain("test-key");
-      expect(message).not.toContain("route-secret");
-      expect(message).not.toContain("cookie-secret");
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  test("registers /verify and verifier_select with OMP's extension API", () => {
-    const commands: string[] = [];
-    const tools: string[] = [];
-    const schema = () => {
-      const chain = {
-        min: () => chain,
-        max: () => chain,
-        int: () => chain,
-        optional: () => chain,
-        describe: () => chain,
-      };
-      return chain;
-    };
-    const pi = {
-      zod: { string: schema, number: schema, array: schema, object: schema },
-      setLabel: () => {},
-      registerCommand: (name: string) => commands.push(name),
-      registerTool: (definition: { name: string }) => tools.push(definition.name),
-      on: () => {},
-    };
-    verifierExtension(pi as never);
-    expect(commands).toEqual(["verify"]);
-    expect(tools).toEqual(["verifier_select"]);
-  });
-
-  test("uses the paper Bo5 defaults without caller-supplied tuning parameters", () => {
-    const tasks = {
-      task: [
-        { trialName: "a", reward: 0 as const, problem: "p", trace: "a" },
-        { trialName: "b", reward: 1 as const, problem: "p", trace: "b" },
-      ],
-    };
-    expect(validateVerifyOptions(tasks, TERMINAL_BENCH_CRITERIA, {})).toEqual({
-      k: SELF_VERIFICATION_DEFAULTS.pivots,
-      nReps: SELF_VERIFICATION_DEFAULTS.nEvaluations,
-      seed: SELF_VERIFICATION_DEFAULTS.seed,
-      maxWorkers: SELF_VERIFICATION_DEFAULTS.maxWorkers,
-    });
+describe("documentation and plugin surface", () => {
+  test("documents transparent configuration-driven use", () => {
+    const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+    expect(readme).toContain("omp plugin install");
+    expect(readme).toContain("omp plugin config set omp-llm-verifier enabled true");
+    expect(readme).not.toContain("/verify");
+    expect(readme).not.toContain("verifier_select");
   });
 });

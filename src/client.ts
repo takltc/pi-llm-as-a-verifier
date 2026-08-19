@@ -1,6 +1,13 @@
 /** OpenAI-compatible verifier client bound to OMP's configured default model. */
 
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import {
+  isAuthRetryableError,
+  seedApiKeyResolver,
+  withAuth,
+  type ApiKeyResolver,
+} from "@oh-my-pi/pi-ai/auth-retry";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { createHash } from "node:crypto";
 import type { VerifierReply } from "./scale.ts";
 
@@ -11,6 +18,7 @@ export const DEFAULT_MAX_TOKENS = 32768;
 export interface VerifierConfig {
   baseUrl: string;
   apiKey: string;
+  apiKeyResolver?: ApiKeyResolver;
   provider: string;
   api: string;
   modelId: string;
@@ -175,6 +183,7 @@ function mergeAbortSignals(
 export class VerifierClient {
   readonly baseUrl: string;
   readonly apiKey: string;
+  readonly apiKeyResolver?: ApiKeyResolver;
   readonly provider: string;
   readonly api: string;
   readonly model: string;
@@ -189,6 +198,7 @@ export class VerifierClient {
     this.baseUrl = cfg.baseUrl.replace(/\/+$/, "");
     this.keyless = cfg.keyless === true || cfg.apiKey.trim() === "N/A";
     this.apiKey = this.keyless ? "" : cfg.apiKey.trim();
+    this.apiKeyResolver = cfg.apiKeyResolver;
     this.provider = cfg.provider;
     this.api = cfg.api;
     this.model = cfg.modelId;
@@ -197,7 +207,13 @@ export class VerifierClient {
     if (!Number.isInteger(maxTokens) || maxTokens < 1) {
       throw new Error("Verifier maxTokens must be a positive integer");
     }
-    if (!this.baseUrl || (!this.apiKey && !this.keyless) || !this.provider || !this.api || !this.model) {
+    if (
+      !this.baseUrl ||
+      (!this.apiKey && !this.apiKeyResolver && !this.keyless) ||
+      !this.provider ||
+      !this.api ||
+      !this.model
+    ) {
       throw new Error("Verifier client requires an authenticated OMP model.");
     }
     this.maxTokens = maxTokens;
@@ -212,7 +228,7 @@ export class VerifierClient {
   }
 
   get ready(): boolean {
-    return this.keyless || this.apiKey.length > 0;
+    return this.keyless || this.apiKey.length > 0 || this.apiKeyResolver !== undefined;
   }
 
   /** Request a verifier response with token-level logprobs. */
@@ -260,36 +276,50 @@ export class VerifierClient {
 
     const requestAbort = mergeAbortSignals(opts.signal, 600_000);
     try {
-      const res = await fetch(`${this.baseUrl}/${responses ? "responses" : "chat/completions"}`, {
-        method: "POST",
-        headers: this.requestHeaders(),
-        body: JSON.stringify(body),
-        signal: requestAbort.signal,
-      });
-      if (!res.ok) {
-        const detail = redactSecrets(
-          (await res.text()).slice(0, 500),
-          [
-            this.apiKey,
-            ...Object.values(this.headers),
-            ...Object.values(this.headers).flatMap(headerSecretParts),
-          ],
-        );
-        throw new Error(
-          `Verifier API ${res.status} ${res.statusText}: ${detail}`,
-        );
-      }
-      let data: Record<string, unknown>;
-      try {
-        const parsed: unknown = await res.json();
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-          throw new Error("response is not an object");
-        }
-        data = parsed as Record<string, unknown>;
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        throw new Error(`Verifier API returned invalid JSON: ${detail}`);
-      }
+      const credential = this.apiKeyResolver ?? (this.keyless ? "N/A" : this.apiKey);
+      const data = await withAuth(
+        credential,
+        async (apiKey) => {
+          const endpoint = this.baseUrl + "/" + (responses ? "responses" : "chat/completions");
+          const res = await fetch(endpoint, {
+            method: "POST",
+            headers: this.requestHeaders(apiKey),
+            body: JSON.stringify(body),
+            signal: requestAbort.signal,
+          });
+          if (!res.ok) {
+            const detail = redactSecrets(
+              (await res.text()).slice(0, 500),
+              [
+                apiKey,
+                this.apiKey,
+                ...Object.values(this.headers),
+                ...Object.values(this.headers).flatMap(headerSecretParts),
+              ],
+            );
+            const error = new Error(
+              "Verifier API " + res.status + " " + res.statusText + ": " + detail,
+            ) as Error & { status?: number };
+            error.status = res.status;
+            throw error;
+          }
+          try {
+            const parsed: unknown = await res.json();
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+              throw new Error("response is not an object");
+            }
+            return parsed as Record<string, unknown>;
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            throw new Error("Verifier API returned invalid JSON: " + detail);
+          }
+        },
+        {
+          isAuthError: isAuthRetryableError,
+          signal: requestAbort.signal,
+          missingKeyMessage: "OMP 当前模型没有可用凭据。",
+        },
+      );
       this.recordUsage(data);
       if (responses) return this.parseResponsesReply(data);
 
@@ -353,10 +383,10 @@ export class VerifierClient {
     };
   }
 
-  private requestHeaders(): Record<string, string> {
+  private requestHeaders(apiKey: string): Record<string, string> {
     const headers = new Headers(this.headers);
-    if (!this.keyless && !headers.has("authorization")) {
-      headers.set("Authorization", "Bearer " + this.apiKey);
+    if (!this.keyless && apiKey !== "N/A" && !headers.has("authorization")) {
+      headers.set("Authorization", "Bearer " + apiKey);
     }
     headers.set("Content-Type", "application/json");
     return Object.fromEntries(headers.entries());
@@ -548,6 +578,7 @@ type OmpModelContext = Pick<
   "models" | "modelRegistry"
 > & {
   defaultThinkingLevel?: string;
+  sessionId?: string;
 };
 
 function resolveOmpEffort(
@@ -585,8 +616,18 @@ export async function createVerifierClient(
         "，LLM-as-a-Verifier 需要支持 OpenAI token logprobs 的模型。",
     );
   }
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok || auth.apiKey === undefined) {
+  const resolver = ctx.modelRegistry.resolver(model, ctx.sessionId);
+  const auth = await resolveOmpAuth(ctx, model);
+  if (!auth.ok) {
+    throw new MissingAPIKeyError(
+      "OMP 默认模型 " + model.provider + "/" + model.id + " 没有可用凭据，请先在 OMP 登录对应 provider。",
+    );
+  }
+  const initialKey = auth.apiKey ?? "";
+  const apiKeyResolver = initialKey && initialKey !== "N/A"
+    ? seedApiKeyResolver(initialKey, resolver)
+    : undefined;
+  if (!initialKey && !apiKeyResolver) {
     throw new MissingAPIKeyError(
       "OMP 默认模型 " + model.provider + "/" + model.id + " 没有可用凭据，请先在 OMP 登录对应 provider。",
     );
@@ -597,8 +638,9 @@ export async function createVerifierClient(
       : DEFAULT_MAX_TOKENS;
   return new VerifierClient({
     baseUrl: model.baseUrl,
-    apiKey: auth.apiKey,
-    keyless: auth.apiKey === "N/A",
+    apiKey: initialKey,
+    apiKeyResolver,
+    keyless: initialKey === "N/A",
     provider: model.provider,
     api: model.api,
     modelId: model.requestModelId ?? model.id,
@@ -610,4 +652,27 @@ export async function createVerifierClient(
     ),
     maxTokens,
   });
+}
+
+async function resolveOmpAuth(
+  ctx: OmpModelContext,
+  model: Model,
+): Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }> {
+  const registry = ctx.modelRegistry as ExtensionContext["modelRegistry"] & {
+    getProviderHeaders?: (provider: string) => Record<string, string> | undefined;
+  };
+  if (typeof registry.getApiKey === "function") {
+    try {
+      const apiKey = await registry.getApiKey(model, ctx.sessionId);
+      if (apiKey === undefined) return { ok: false, error: "No API key found for " + model.provider };
+      return {
+        ok: true,
+        apiKey,
+        headers: registry.getProviderHeaders?.(model.provider),
+      };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  return ctx.modelRegistry.getApiKeyAndHeaders(model);
 }
