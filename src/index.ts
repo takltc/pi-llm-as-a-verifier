@@ -76,6 +76,19 @@ async function enableAutomaticVerification(
       originalModel: candidateModel,
       verifierClient,
       apiKeyResolver: resolver,
+      onDegraded: (event) => {
+        console.warn(JSON.stringify({
+          component: "omp-llm-verifier",
+          event: "degraded",
+          ...event,
+        }));
+        ctx.ui.notify(
+          event.reason === "verification_error"
+            ? "LLM-as-a-Verifier 本次评审失败，已返回首个候选响应。"
+            : "LLM-as-a-Verifier 可用候选不足，已返回唯一成功候选。",
+          "warning",
+        );
+      },
     }),
     models: [{
       id: modelId,

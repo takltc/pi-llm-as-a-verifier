@@ -208,27 +208,57 @@ describe("automatic request-level provider", () => {
 
   test("falls back to the first successful candidate when verification fails", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const degraded: unknown[] = [];
     const stream = createAutoVerifierStream({
       originalModel: model(),
       verifierClient: new RankingVerifier(true),
       apiKeyResolver: () => "original-key",
       streamSimpleFn: fakeCandidateStreamFactory(calls),
+      onDegraded: (event) => degraded.push(event),
     }, context());
     const { result } = await collect(stream);
     expect(result.responseId).toBe("response-0");
+    expect(degraded).toEqual([{
+      reason: "verification_error",
+      candidateCount: 3,
+      successfulCandidates: 3,
+      error: "verifier unavailable",
+    }]);
   });
 
   test("keeps successful candidates when one candidate request fails", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const degraded: unknown[] = [];
     const stream = createAutoVerifierStream({
       originalModel: model(),
       verifierClient: new RankingVerifier(),
       apiKeyResolver: () => "original-key",
       streamSimpleFn: fakeCandidateStreamFactory(calls, new Set([0])),
+      onDegraded: (event) => degraded.push(event),
     }, context());
     const { result } = await collect(stream);
     expect(result.responseId).toBe("response-2");
     expect(calls).toHaveLength(3);
+    expect(degraded).toEqual([]);
+  });
+
+  test("reports degradation when only one candidate succeeds", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const degraded: unknown[] = [];
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls, new Set([0, 1])),
+      onDegraded: (event) => degraded.push(event),
+    }, context());
+    const { result } = await collect(stream);
+    expect(result.responseId).toBe("response-2");
+    expect(degraded).toEqual([{
+      reason: "insufficient_candidates",
+      candidateCount: 3,
+      successfulCandidates: 1,
+    }]);
   });
 
   test("returns an OMP error event when every candidate fails", async () => {
@@ -278,6 +308,37 @@ describe("automatic request-level provider", () => {
     expect(candidateText).toContain("response-2");
     expect(candidateText).toContain("candidate thinking 2");
     expect(candidateText).toContain("call-2");
+  });
+
+  test("preserves image bytes and complete tool contracts for verification", () => {
+    const rich: Context = {
+      systemPrompt: ["You are an OMP coding agent."],
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "Inspect this screenshot." },
+          { type: "image", data: "aGVsbG8=", mimeType: "image/png", detail: "high" },
+        ],
+        timestamp: 1,
+      }],
+      tools: [{
+        name: "bash",
+        description: "run a shell command",
+        parameters: {
+          type: "object",
+          properties: { command: { type: "string" } },
+          required: ["command"],
+        },
+        strict: true,
+        customWireName: "bash",
+      }],
+    };
+    const serialized = serializeContext(rich);
+    expect(serialized).toContain("Available tools");
+    expect(serialized).toContain("customWireName");
+    expect(serialized).toContain("required");
+    expect(serialized).toContain("aGVsbG8=");
+    expect(serialized).toContain("image/png");
   });
 });
 

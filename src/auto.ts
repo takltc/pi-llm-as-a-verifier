@@ -32,10 +32,22 @@ export interface AutoVerifierState {
   verifierClient: VerifierClient;
   apiKeyResolver: ApiKeyResolver;
   streamSimpleFn?: typeof streamSimple;
+  onDegraded?: (event: AutoVerifierDegradedEvent) => void;
 }
 
 export interface AutoVerifierOptions {
   candidateCount?: number;
+}
+
+export type AutoVerifierDegradedReason =
+  | "insufficient_candidates"
+  | "verification_error";
+
+export interface AutoVerifierDegradedEvent {
+  reason: AutoVerifierDegradedReason;
+  candidateCount: number;
+  successfulCandidates: number;
+  error?: string;
 }
 
 interface CandidateResult {
@@ -114,6 +126,13 @@ async function runAutomaticVerification(
     }
 
     let winner = successful[0];
+    if (successful.length < 2) {
+      reportDegraded(state, {
+        reason: "insufficient_candidates",
+        candidateCount,
+        successfulCandidates: successful.length,
+      });
+    }
     if (successful.length >= 2) {
       try {
         const selection = await select(
@@ -136,7 +155,12 @@ async function runAutomaticVerification(
         winner = successful[selection.index] ?? winner;
       } catch (error) {
         if (controller.signal.aborted || isAbortError(error)) throw error;
-        // Verifier failures leave the first complete candidate available.
+        reportDegraded(state, {
+          reason: "verification_error",
+          candidateCount,
+          successfulCandidates: successful.length,
+          error: errorMessage(error),
+        });
       }
     }
     replayAssistantMessage(output, winner.message);
@@ -193,26 +217,28 @@ export function serializeContext(context: Context): string {
   if (context.systemPrompt?.length) {
     sections.push("System prompt:\n" + context.systemPrompt.join("\n\n"));
   }
+  if (context.tools?.length) {
+    sections.push(
+      "Available tools:\n" +
+      context.tools.map((tool, index) =>
+        "Tool " + (index + 1) + ":\n" + serializeStructured(tool),
+      ).join("\n\n"),
+    );
+  }
   for (const [index, message] of context.messages.entries()) {
+    const { content, ...metadata } = message;
     sections.push(
       "Message " + (index + 1) + " (" + message.role + "):\n" +
-      serializeMessageContent(message.content),
+      "Metadata:\n" + serializeStructured(metadata) +
+      "\nContent:\n" + serializeMessageContent(content),
     );
   }
   return sections.join("\n\n") || "The current coding-agent request has no prior context.";
 }
 
 export function serializeAssistantMessage(message: AssistantMessage): string {
-  const metadata = {
-    api: message.api,
-    provider: message.provider,
-    model: message.model,
-    responseId: message.responseId,
-    stopReason: message.stopReason,
-    stopDetails: message.stopDetails,
-    usage: message.usage,
-  };
-  return "Assistant metadata:\n" + JSON.stringify(metadata) +
+  const { content, ...metadata } = message;
+  return "Assistant metadata:\n" + serializeStructured(metadata) +
     "\n\nAssistant content:\n" + serializeMessageContent(message.content);
 }
 
@@ -222,17 +248,31 @@ function serializeMessageContent(content: unknown): string {
   return content.map((block) => {
     if (!block || typeof block !== "object") return String(block);
     const value = block as Record<string, unknown>;
-    if (value.type === "text") return "[text]\n" + String(value.text ?? "");
-    if (value.type === "thinking") return "[thinking]\n" + String(value.thinking ?? "");
-    if (value.type === "toolCall") {
-      return "[toolCall " + String(value.name ?? "") + "]\n" + JSON.stringify({
-        id: value.id,
-        arguments: value.arguments,
-      });
+    if (value.type === "text") {
+      return "[text]\n" + String(value.text ?? "") + "\n" + serializeStructured(value);
     }
-    if (value.type === "image") return "[image " + String(value.mimeType ?? "unknown") + "]";
-    return JSON.stringify(value);
+    if (value.type === "thinking") {
+      return "[thinking]\n" + String(value.thinking ?? "") + "\n" + serializeStructured(value);
+    }
+    if (value.type === "toolCall") {
+      return "[toolCall " + String(value.name ?? "") + "]\n" + serializeStructured(value);
+    }
+    if (value.type === "image") return "[image]\n" + serializeStructured(value);
+    return serializeStructured(value);
   }).join("\n\n");
+}
+
+function serializeStructured(value: unknown): string {
+  const seen = new WeakSet<object>();
+  const serialized = JSON.stringify(value, (_key, item: unknown) => {
+    if (typeof item === "bigint") return String(item) + "n";
+    if (typeof item === "function") return "[Function]";
+    if (!item || typeof item !== "object") return item;
+    if (seen.has(item)) return "[Circular]";
+    seen.add(item);
+    return item;
+  }, 2);
+  return serialized === undefined ? String(value) : serialized;
 }
 
 function replayAssistantMessage(
@@ -330,6 +370,18 @@ function abortReason(): DOMException {
 function isAbortError(error: unknown): boolean {
   return (error instanceof DOMException && error.name === "AbortError") ||
     (error instanceof Error && error.name === "AbortError");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function reportDegraded(state: AutoVerifierState, event: AutoVerifierDegradedEvent): void {
+  try {
+    state.onDegraded?.(event);
+  } catch {
+    // A diagnostic callback cannot change the provider result.
+  }
 }
 
 function terminalMessage(
