@@ -441,6 +441,8 @@ describe("documentation and plugin surface", () => {
     expect(readme).toContain("omp plugin install");
     expect(readme).toContain("omp plugin config set omp-llm-verifier enabled true");
     expect(readme).toContain("omp plugin config set omp-llm-verifier enabled false");
+    expect(readme).toContain("omp plugin disable omp-llm-verifier");
+    expect(readme).toContain("omp plugin enable omp-llm-verifier");
     expect(readme).toContain("omp plugin config set omp-llm-verifier candidateCount 3");
     expect(manifest.omp.settings.enabled.default).toBe(false);
     expect(manifest.omp.settings.candidateCount).toEqual({
