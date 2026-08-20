@@ -5,6 +5,7 @@ import { getPluginSettings } from "@oh-my-pi/pi-coding-agent/extensibility/plugi
 import { extractExplicitThinkingSelector } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import {
   AUTO_CANDIDATE_COUNT,
   createWrappedProvider,
@@ -294,6 +295,7 @@ async function createVerificationBinding(
         originalModel: candidateModel,
         verifierClient,
         apiKeyResolver: resolver,
+        cacheFile: ctx.cwd ? join(ctx.cwd, ".omp-llm-verifier-cache.json") : undefined,
         onDegraded: (event) => {
           console.warn(JSON.stringify({ component: PLUGIN_NAME, event: "degraded", ...event }));
           ctx.ui.notify(

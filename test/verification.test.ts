@@ -248,9 +248,10 @@ describe("automatic request-level provider", () => {
     expect(verifier.calls).toBeGreaterThan(0);
     expect(verifier.calls % 6).toBe(0);
     expect(calls.every((call) => call.options.statefulResponses === false)).toBe(true);
-    expect(calls.every((call) => call.options.sessionId === undefined)).toBe(true);
-    expect(calls.every((call) => call.options.providerSessionState === undefined)).toBe(true);
-    expect(calls.every((call) => call.options.promptCacheKey === undefined)).toBe(true);
+    // The wrapper's credentials are threaded onto candidate calls; OMP's
+    // session/cache identity is preserved (asserted in the affinity test below).
+    const resolver = calls[0]?.options.apiKey;
+    expect(typeof resolver).toBe("function");
     expect(result.responseId).toBe("response-2");
     expect(result.stopReason).toBe("toolUse");
     expect(result.content.some((block) => block.type === "toolCall")).toBe(true);
@@ -303,6 +304,109 @@ describe("automatic request-level provider", () => {
     expect(calls).toHaveLength(4);
   });
 
+  test("replays a tool-use turn directly without expanding or verifying", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const verifier = new RankingVerifier();
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: (_m, _context, _o = {}) => {
+        calls.push({ context: _context, options: _o });
+        const out = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          const result = message(0, true); // stopReason toolUse
+          out.push({ type: "start", partial: result });
+          out.push({ type: "done", reason: "toolUse", message: result });
+        });
+        return out;
+      },
+    }, context());
+    const { events, result } = await collect(stream);
+    // terminal gating: an intermediate tool-use turn is the agent's own next
+    // action, so the wrapper replays it and never fans out or verifies.
+    expect(calls).toHaveLength(1);
+    expect(verifier.calls).toBe(0);
+    expect(result.stopReason).toBe("toolUse");
+    expect(result.responseId).toBe("response-0");
+    expect((events as Array<{ type: string }>).map((event) => event.type)).toEqual([
+      "start",
+      "thinking_start",
+      "thinking_delta",
+      "thinking_end",
+      "text_start",
+      "text_delta",
+      "text_end",
+      "toolcall_start",
+      "toolcall_delta",
+      "toolcall_end",
+      "done",
+    ]);
+  });
+
+  test("skips the verifier when an exact-action majority agrees", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const verifier = new RankingVerifier();
+    let next = 0;
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: (_m, _context, _o = {}) => {
+        calls.push({ context: _context, options: _o });
+        const index = next++;
+        const out = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          const text = index === 2 ? "different plan B" : "same plan A";
+          const result = {
+            ...message(index),
+            content: [{ type: "text" as const, text }],
+            stopReason: "stop" as const,
+          };
+          out.push({ type: "start", partial: result });
+          out.push({ type: "done", reason: "stop", message: result });
+        });
+        return out;
+      },
+    }, context());
+    const { result } = await collect(stream);
+    // TurboAgent-style shortcut: 2 of 3 candidates share the same normalized
+    // action (> N/2), so selecting among them cannot change the answer and the
+    // whole verifier tournament is skipped.
+    expect(calls).toHaveLength(3);
+    expect(verifier.calls).toBe(0);
+    expect(result.responseId).toBe("response-0");
+    expect(result.content).toEqual([{ type: "text", text: "same plan A" }]);
+  });
+
+  test("preserves the OMP cache/session identity on candidate calls", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const sessionState = new Map<string, { close(): void }>([
+      ["opencode-go", { close: () => undefined }],
+    ]);
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls),
+    }, context(), {
+      sessionId: "session-cache-id",
+      promptCacheKey: "prompt-cache-key",
+      providerSessionState: sessionState,
+    });
+    await collect(stream);
+    expect(calls.length).toBeGreaterThan(0);
+    // Only turn chaining must be off; every candidate keeps the OMP default-call
+    // identity so the full-context prefix hits the provider's cache instead of
+    // paying a fresh uncached write per candidate.
+    for (const call of calls) {
+      expect(call.options.statefulResponses).toBe(false);
+      expect(call.options.sessionId).toBe("session-cache-id");
+      expect(call.options.promptCacheKey).toBe("prompt-cache-key");
+      expect(call.options.providerSessionState).toBe(sessionState);
+    }
+  });
+
   test("falls back to the first successful candidate when verification fails", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
     const degraded: unknown[] = [];
@@ -315,12 +419,9 @@ describe("automatic request-level provider", () => {
     }, context());
     const { result } = await collect(stream);
     expect(result.responseId).toBe("response-0");
-    expect(degraded).toEqual([{
-      reason: "verification_error",
-      candidateCount: 3,
-      successfulCandidates: 3,
-      error: "verifier unavailable",
-    }]);
+    // reference on_error="tie": a failed verifier call scores 0.5/0.5
+    // instead of aborting the tournament or degrading the response.
+    expect(degraded).toEqual([]);
   });
 
   test("keeps successful candidates when one candidate request fails", async () => {
@@ -396,18 +497,21 @@ describe("automatic request-level provider", () => {
     expect((events as Array<{ type: string }>).map((event) => event.type)).toEqual(["error"]);
   });
 
-  test("serializes current context and candidate metadata", () => {
+  test("serializes the task and a compact candidate trace", () => {
     const current = context();
     const contextText = serializeContext(current);
     const candidateText = serializeAssistantMessage(message(2, true));
     expect(contextText).toContain("Fix the failing test and verify it.");
-    expect(contextText).toContain("Message 1 (user)");
-    expect(candidateText).toContain("response-2");
-    expect(candidateText).toContain("candidate thinking 2");
-    expect(candidateText).toContain("call-2");
-  });
+   expect(contextText).not.toContain("Message 1 (user)");
+   expect(candidateText).toContain("candidate text 2");
+   expect(candidateText).toContain("[proposed tool call] bash");
+   expect(candidateText).not.toContain("response-2");
+    // Reasoning is not part of the reference trace; only visible text and
+    // tool calls are scored, so thinking must not leak into the prompt.
+    expect(candidateText).not.toContain("candidate thinking 2");
+ });
 
-  test("preserves image bytes and complete tool contracts for verification", () => {
+  test("reduces user context to the task and counts images", () => {
     const rich: Context = {
       systemPrompt: ["You are an OMP coding agent."],
       messages: [{
@@ -431,11 +535,98 @@ describe("automatic request-level provider", () => {
       }],
     };
     const serialized = serializeContext(rich);
-    expect(serialized).toContain("Available tools");
-    expect(serialized).toContain("customWireName");
-    expect(serialized).toContain("required");
-    expect(serialized).toContain("aGVsbG8=");
-    expect(serialized).toContain("image/png");
+    expect(serialized).toContain("Inspect this screenshot.");
+    expect(serialized).toContain("1 image(s)");
+    expect(serialized).not.toContain("Available tools");
+    expect(serialized).not.toContain("aGVsbG8=");
+  });
+
+  test("bounds a many-block candidate trace to the total budget", () => {
+    const hugeArgs = { command: "build ".repeat(20_000) }; // ~130k chars
+    const giant = "x".repeat(100_000);
+    const content: AssistantMessage["content"] = [];
+    for (let i = 0; i < 6; i++) {
+      content.push({ type: "text", text: giant });
+      content.push({ type: "toolCall", id: "c" + i, name: "bash", arguments: hugeArgs });
+    }
+    const candidate = {
+      role: "assistant",
+      content,
+      api: "openai-completions",
+      provider: "opencode-go",
+      model: "deepseek-v4-flash-0731",
+      responseId: "response-bloat",
+      usage: usage(),
+      stopReason: "stop",
+      timestamp: 1,
+    } as AssistantMessage;
+    const serialized = serializeAssistantMessage(candidate);
+    // Per-block (2k) and per-trace (8k, separators included) caps keep one
+    // oversized candidate from blowing up every pairwise verifier prompt.
+    expect(serialized.length).toBeLessThanOrEqual(8_000);
+    expect(serialized).toContain("[truncated]");
+  });
+
+  test("keeps many near-cap text blocks within the 8k trace budget", () => {
+    const cap = 1950; // just under the 2000 per-block cap
+    const slabs: Array<string> = [];
+    for (let i = 0; i < 20; i++) slabs.push("block-" + i + " " + "y".repeat(cap));
+    const content: AssistantMessage["content"] = slabs.map((text) => ({ type: "text", text }));
+    const candidate = {
+      role: "assistant",
+      content,
+      api: "openai-completions",
+      provider: "opencode-go",
+      model: "deepseek-v4-flash-0731",
+      responseId: "response-many",
+      usage: usage(),
+      stopReason: "stop",
+      timestamp: 1,
+    } as AssistantMessage;
+    // 20 blocks at ~1950 chars each would join to ~39k without the total cap;
+    // separators (every join) must count against the 8k budget.
+    expect(serializeAssistantMessage(candidate).length).toBeLessThanOrEqual(8_000);
+  });
+
+  test("keeps the serialized problem within the 16k input budget", () => {
+    const hugeArgs = { command: "build ".repeat(20_000) }; // ~130k chars
+    const giant = "x".repeat(100_000);
+    const messages: Context["messages"] = [
+      {
+        role: "user",
+        content: "Overhaul " + "the project ".repeat(3_000) + " end-to-end.",
+        timestamp: 1,
+      },
+    ];
+    for (let i = 0; i < 8; i++) {
+      messages.push({
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "let me reason " + "y".repeat(50_000) },
+          { type: "text", text: giant },
+          { type: "toolCall", id: "c" + i, name: "bash", arguments: hugeArgs },
+        ],
+        api: "openai-completions",
+        provider: "opencode-go",
+        model: "deepseek-v4-flash-0731",
+        usage: usage(),
+        stopReason: "toolUse",
+        timestamp: 2 + i,
+      } as unknown as AssistantMessage);
+      messages.push({
+        role: "toolResult",
+        toolCallId: "c" + i,
+        toolName: "bash",
+        isError: i % 2 === 1,
+        content: [{ type: "text", text: "result ".repeat(50_000) }],
+        timestamp: 3 + i,
+      });
+    }
+    const serialized = serializeContext({ ...context(), messages });
+    // Task + trajectory evidence share a hard 16k char budget, so no pair
+    // prompt can exceed it even for a very long session.
+    expect(serialized.length).toBeLessThanOrEqual(16_000);
+    expect(serialized).toContain("... [task truncated]");
   });
 });
 
