@@ -194,10 +194,12 @@ async function runAutomaticVerification(
     let winner = successful[0];
     const majority = successful.length >= 2 ? exactActionMajority(successful) : undefined;
     if (majority !== undefined) {
-      // TurboAgent-style shortcut: when more than N/2 candidates produced
-      // the same normalized action, selecting among them cannot change the
-      // answer, so skip the verifier entirely. Normal success path, no
-      // degradation signal.
+      // Self-consistency gate (cost optimization, not part of the paper's
+      // tournament): when a strict majority (> N/2) of candidates produced
+      // the same normalized action, majority voting already decides the
+      // answer, so the verifier is never called. Every request without a
+      // majority runs the paper's full PPT selection below unchanged. Normal
+      // success path, no degradation signal.
       winner = majority;
     } else if (successful.length < 2) {
       reportDegraded(state, {

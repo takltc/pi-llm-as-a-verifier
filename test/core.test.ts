@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { extractScore, GRANULARITY, SCALE, type VerifierReply } from "../src/scale.ts";
 import { bradleyTerry, pivotRoundPairs, ringCycle, selectBest, selectPivots } from "../src/ppt.ts";
+import { cacheKey, directedReward, type ScoreCache } from "../src/cache.ts";
 import { mulberry32 } from "../src/run.ts";
 
 describe("extractScore", () => {
@@ -145,14 +146,77 @@ describe("PPT", () => {
     };
     const rng = mulberry32(0);
     const ring = ringCycle(5, rng);
-    const { bestIndex } = selectBest(5, ring, 2, score);
+    const { bestIndex, nComparisons } = selectBest(5, ring, 2, score);
     expect(bestIndex).toBe(2);
+    // Paper's O(Nk) budget: N ring + k(N-k) non-pivot-vs-pivot + C(k,2)
+    // pivot-vs-pivot directed comparisons.
+    expect(nComparisons).toBe(5 + 2 * 3 + 1);
   });
 
   test("selectPivots picks ring leaders", () => {
     const w = [0.2, 0.8, 0.5];
     const c = [2, 2, 2];
     expect(selectPivots(w, c, 2)).toEqual([1, 2]);
+  });
+});
+
+describe("directedReward", () => {
+  test("averages fine-grained rewards over criteria and repeats (1/CK)", () => {
+    const scores: ScoreCache = {
+      [cacheKey("c1", "task", 0, 1, 0)]: { score_A: 1, score_B: 0 },
+      [cacheKey("c1", "task", 0, 1, 1)]: { score_A: 0.5, score_B: 0.5 },
+      [cacheKey("c2", "task", 0, 1, 0)]: { score_A: 0, score_B: 1 },
+      [cacheKey("c2", "task", 0, 1, 1)]: { score_A: 1, score_B: 0 },
+    };
+    const [ra, rb] = directedReward(scores, "task", 0, 1, ["c1", "c2"], 2);
+    expect(ra).toBeCloseTo((1 + 0.5 + 0 + 1) / 4, 10);
+    expect(rb).toBeCloseTo((0 + 0.5 + 1 + 0) / 4, 10);
+  });
+
+  test("missing entries default to the neutral 0.5 tie", () => {
+    const scores: ScoreCache = {
+      [cacheKey("c1", "task", 0, 1, 0)]: { score_A: 1, score_B: 0 },
+    };
+    // rep 0 present as (1, 0); rep 1 missing and counted as (0.5, 0.5).
+    const [ra, rb] = directedReward(scores, "task", 0, 1, ["c1"], 2);
+    expect(ra).toBeCloseTo((1 + 0.5) / 2, 10);
+    expect(rb).toBeCloseTo((0 + 0.5) / 2, 10);
+    expect(directedReward({}, "task", 0, 1, ["c1"], 3)).toEqual([0.5, 0.5]);
+  });
+
+  test("self-comparison is neutral and reads no cache entries", () => {
+    expect(directedReward({}, "task", 2, 2, ["c1"], 1)).toEqual([0.5, 0.5]);
+  });
+
+  test("resolves context-fingerprinted keys the way production scoring writes them", () => {
+    // The writer (scoreDirectedPairs) and reader (directedReward) must agree
+    // on the key for the same (criterion, task, a, b, rep, context).
+    const context = {
+      criterionId: "c1",
+      criterionName: "C1",
+      criterionDescription: "desc",
+      problem: "p",
+      traceA: "ta",
+      traceB: "tb",
+      provider: "prov",
+      api: "openai-completions",
+      model: "m",
+      effort: "high",
+      maxTokens: 32768,
+      baseUrl: "https://example.test/v1",
+      requestIdentity: "id",
+      groundTruthNote: "note",
+      promptVersion: "v",
+    };
+    const scores: ScoreCache = {
+      [cacheKey("c1", "task", 0, 1, 0, context)]: { score_A: 0.8, score_B: 0.2 },
+    };
+    const [ra, rb] = directedReward(scores, "task", 0, 1, ["c1"], 1, context);
+    expect(ra).toBeCloseTo(0.8, 10);
+    expect(rb).toBeCloseTo(0.2, 10);
+    // A different context must NOT see the entry (no stale-score reuse).
+    const drifted = { ...context, model: "other-model" };
+    expect(directedReward(scores, "task", 0, 1, ["c1"], 1, drifted)).toEqual([0.5, 0.5]);
   });
 });
 

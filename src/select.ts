@@ -6,8 +6,8 @@ import {
   normalizeCriteria,
   type Criterion,
 } from "./prompt.ts";
-import { bradleyTerry, pivotRoundPairs, ringCycle, selectPivots } from "./ppt.ts";
-import { directedReward, mergeCaches, type ScoreCache } from "./cache.ts";
+import { accumulate, pivotRoundPairs, ringCycle, selectPivots } from "./ppt.ts";
+import { directedReward, type ScoreCache } from "./cache.ts";
 import {
   contextResolver,
   mulberry32,
@@ -122,14 +122,7 @@ export async function select(
   const n = candidates.length;
   const w = new Array<number>(n).fill(0);
   const c = new Array<number>(n).fill(0);
-  for (const [a, b] of ring) {
-    const [ra, rb] = directed(scores, a, b);
-    const preference = bradleyTerry(ra, rb);
-    w[a] += preference;
-    c[a] += 1;
-    w[b] += 1 - preference;
-    c[b] += 1;
-  }
+  accumulate(ring, (a, b) => directed(scores, a, b), w, c);
   const pivots = selectPivots(w, c, Math.min(k, n));
   const pivotPairs = pivotRoundPairs(n, pivots);
   if (opts.progress !== false) console.log(`Phase B: pivot rounds (${pivotPairs.length} comparisons)`);
@@ -149,16 +142,11 @@ export async function select(
       initialCache: scores,
     },
   );
-  scores = mergeCaches(scores, phaseB);
+  // Phase B was seeded with the phase-A cache, so its result already carries
+  // every ring score.
+  scores = phaseB;
 
-  for (const [a, b] of pivotPairs) {
-    const [ra, rb] = directed(scores, a, b);
-    const preference = bradleyTerry(ra, rb);
-    w[a] += preference;
-    c[a] += 1;
-    w[b] += 1 - preference;
-    c[b] += 1;
-  }
+  accumulate(pivotPairs, (a, b) => directed(scores, a, b), w, c);
 
   const scoresPerCandidate = w.map((wins, index) => (c[index] ? wins / c[index] : 0));
   let best = 0;

@@ -20,7 +20,7 @@ import {
   type Criterion,
 } from "./prompt.ts";
 import { extractScore, hasExtractableScore, type VerifierReply } from "./scale.ts";
-import { bradleyTerry, pivotRoundPairs, ringCycle, selectPivots } from "./ppt.ts";
+import { accumulate, pivotRoundPairs, ringCycle, selectPivots } from "./ppt.ts";
 import {
   cacheKey,
   directedReward,
@@ -471,14 +471,7 @@ export async function runBenchmark(
     const n = tasks[task].length;
     const w = new Array<number>(n).fill(0);
     const c = new Array<number>(n).fill(0);
-    for (const [a, b] of rings[task]) {
-      const [ra, rb] = directed(scores, task, a, b);
-      const preference = bradleyTerry(ra, rb);
-      w[a] += preference;
-      c[a] += 1;
-      w[b] += 1 - preference;
-      c[b] += 1;
-    }
+    accumulate(rings[task], (a, b) => directed(scores, task, a, b), w, c);
     pivotPairs[task] = pivotRoundPairs(n, selectPivots(w, c, Math.min(k, n)));
   }
 
@@ -494,7 +487,9 @@ export async function runBenchmark(
     opts.cacheFile,
     { ...opts, initialCache: scores },
   );
-  scores = mergeCaches(scores, phaseB);
+  // Phase B was seeded with the phase-A cache, so its result already carries
+  // every ring score.
+  scores = phaseB;
 
   let selected = 0;
   let totalComparisons = 0;
@@ -503,14 +498,8 @@ export async function runBenchmark(
     const n = tasks[task].length;
     const w = new Array<number>(n).fill(0);
     const c = new Array<number>(n).fill(0);
-    for (const [a, b] of [...rings[task], ...pivotPairs[task]]) {
-      const [ra, rb] = directed(scores, task, a, b);
-      const preference = bradleyTerry(ra, rb);
-      w[a] += preference;
-      c[a] += 1;
-      w[b] += 1 - preference;
-      c[b] += 1;
-    }
+    accumulate(rings[task], (a, b) => directed(scores, task, a, b), w, c);
+    accumulate(pivotPairs[task], (a, b) => directed(scores, task, a, b), w, c);
     let best = 0;
     for (let index = 1; index < n; index++) {
       const current = c[index] ? w[index] / c[index] : 0;

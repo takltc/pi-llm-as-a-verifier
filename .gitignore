@@ -1,6 +1,7 @@
 node_modules/
 _ref/
 .verifier-cache*.json
+.omp-llm-verifier-cache.json
 e2e_run*.log
 data/e2e/
 .commandcode/
