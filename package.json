@@ -23,6 +23,11 @@
         "max": 8,
         "step": 1,
         "description": "每次普通请求生成的候选数量（2-8，默认 3）"
+      },
+      "verifierModel": {
+        "type": "string",
+        "default": "",
+        "description": "验证器模型的 OMP 选择器（如 deepseek/deepseek-v4-flash:high）；留空则跟随会话默认模型。验证器必须能返回 token logprobs（kimi-code 不支持，需在此指定其他模型）"
       }
     }
   },

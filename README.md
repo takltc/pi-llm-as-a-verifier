@@ -18,7 +18,15 @@ omp plugin config set omp-llm-verifier candidateCount 3
 omp plugin doctor
 ```
 
-`enabled` controls automatic verification. `candidateCount` accepts 2-8 and defaults to 3. Settings take effect in a new OMP session. The verifier inherits the OMP `modelRoles.default` model, thinking level, credentials, headers, and compatibility settings.
+`enabled` controls automatic verification. `candidateCount` accepts 2-8 and defaults to 3. Settings take effect in a new OMP session. By default the verifier inherits the OMP `modelRoles.default` model, thinking level, credentials, headers, and compatibility settings.
+
+Following the paper's agent≠verifier setup (the reference scores GPT/Claude trajectories with Gemini or DeepSeek), a different verifier model can be pinned with an OMP model selector:
+
+```bash
+omp plugin config set omp-llm-verifier verifierModel deepseek/deepseek-v4-flash
+```
+
+Leave `verifierModel` empty to verify with the session default model (self-verification). kimi-code (Kimi for Coding) rejects logprobs requests, so with kimi-code as the session model a `verifierModel` override is required.
 
 Disable automatic verification while keeping the plugin installed:
 
@@ -33,7 +41,9 @@ omp plugin disable omp-llm-verifier
 omp plugin enable omp-llm-verifier
 ```
 
-The active default model must expose OpenAI Chat Completions or Responses token logprobs. Models without token logprobs cannot run the paper's verifier.
+The verifier model must expose OpenAI Chat Completions or Responses token logprobs — the paper's fine-grained reward is read off the score-token distribution, so a model without token logprobs cannot run the paper's verifier. When the resolved verifier model cannot provide logprobs, the plugin refuses to wrap the session model and shows a capability warning instead of degrading every request.
+
+Verified comparisons are cached on disk at `.omp-llm-verifier-cache.json` in the project root, keyed by a fingerprint of the task, both candidates, criteria, model, and prompt version, so repeat verifications of identical content cost no verifier tokens. The file is safe to delete and worth git-ignoring.
 
 ## Local development
 

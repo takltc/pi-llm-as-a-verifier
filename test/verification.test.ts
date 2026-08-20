@@ -20,13 +20,13 @@ import {
 import { CODING_AGENT_CRITERIA, CODING_AGENT_GROUND_TRUTH_NOTE } from "../src/prompt.ts";
 import { SELF_VERIFICATION_DEFAULTS } from "../src/run.ts";
 import {
+  createVerifierClient,
   isVerifierLogprobsUnsupportedError,
   VerifierClient,
   VerifierLogprobsUnsupportedError,
   type VerifierConfig,
 } from "../src/client.ts";
 import type { VerifierReply } from "../src/scale.ts";
-
 const temporaryFiles: string[] = [];
 
 afterEach(() => {
@@ -228,6 +228,95 @@ describe("automatic request-level provider", () => {
       }
       expect(isVerifierLogprobsUnsupportedError(error)).toBe(true);
       expect((error as Error).message).toContain("token logprobs");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("classifies a provider logprobs rejection as unsupported without retrying", async () => {
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      // Kimi for Coding's exact rejection shape for logprobs requests.
+      return new Response(
+        JSON.stringify({ error: { message: "Your request body contains invalid value for param logprobs", type: "invalid_request_error" } }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    try {
+      let error: unknown;
+      try {
+        await new VerifierClient(clientConfig()).scoreReply("Return A.");
+      } catch (caught) {
+        error = caught;
+      }
+      expect(isVerifierLogprobsUnsupportedError(error)).toBe(true);
+      expect((error as VerifierLogprobsUnsupportedError).retryable).toBe(false);
+      expect((error as Error).message).toContain("provider rejects token logprobs");
+      expect(attempts).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("pins the reference verifier request shape: temperature 1, no thinking for generic models", async () => {
+    const originalFetch = globalThis.fetch;
+    const bodies: Array<{ body: Record<string, unknown> }> = [];
+    const okReply = () => new Response(JSON.stringify({
+      choices: [{ message: { content: "A" }, finish_reason: "stop",
+        logprobs: { content: [{ token: "A", logprob: -0.1, top_logprobs: [{ token: "A", logprob: -0.1 }] }] } }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+    globalThis.fetch = (async (_url: unknown, init: unknown) => {
+      bodies.push({ body: JSON.parse(String((init as { body?: string }).body)) });
+      return okReply();
+    }) as unknown as typeof fetch;
+    try {
+      // createVerifierClient mirrors the reference defaults per provider:
+      // the generic OpenAI-compatible path gets 4096 output + no reasoning,
+      // the DeepSeek path gets 32768 + reasoning enabled.
+      const genericModel = { ...model(), provider: "inferx", id: "deepseek-v4-flash-0731" } as unknown as Model;
+      const genericClient = await createVerifierClient({
+        model: genericModel,
+        models: { resolve: () => genericModel },
+        modelRegistry: {
+          resolver: () => () => "test-key",
+          getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "test-key", headers: {} }),
+        },
+        sessionId: "shape-session",
+      } as never);
+      expect(genericClient.effort).toBe("off");
+      expect(genericClient.maxTokens).toBe(4096);
+      await genericClient.scoreReply("Return A.");
+      const generic = bodies[0]!.body;
+      expect(generic.temperature).toBe(1);
+      expect(generic.logprobs).toBe(true);
+      expect(generic.max_tokens).toBe(4096);
+      expect(generic.reasoning_effort).toBeUndefined();
+      expect(generic.thinking).toBeUndefined();
+
+      const deepseekModel = {
+        ...model(),
+        provider: "deepseek",
+        id: "deepseek-v4-flash",
+        thinking: { mode: "effort", efforts: ["low", "high", "max"] },
+      } as unknown as Model;
+      const deepseekClient = await createVerifierClient({
+        model: deepseekModel,
+        models: { resolve: () => deepseekModel },
+        modelRegistry: {
+          resolver: () => () => "test-key",
+          getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "test-key", headers: {} }),
+        },
+        sessionId: "shape-session",
+      } as never);
+      expect(deepseekClient.effort).toBe("high");
+      expect(deepseekClient.maxTokens).toBe(32768);
+      await deepseekClient.scoreReply("Return A.");
+      const deepseek = bodies[1]!.body;
+      expect(deepseek.temperature).toBe(1);
+      expect(deepseek.max_tokens).toBe(32768);
+      expect(deepseek.reasoning_effort).toBe("high");
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -665,6 +754,55 @@ describe("OMP default model inheritance", () => {
     await expect(ensureAutomaticVerification(fakePi, ctx, runtime)).rejects.toThrow("token logprobs");
   });
 
+  test("suggests a logprobs-capable fallback model in the capability warning", async () => {
+    let activeModel: Model = model();
+    const configuredModel = activeModel;
+    const wrappers = new Map<string, Model>();
+    const fakePi = {
+      pi: { settings: { getModelRole: () => "opencode-go/deepseek-v4-flash-0731:high" } },
+      registerProvider: (provider: string) => {
+        wrappers.set(provider + "/default", { ...configuredModel, provider, id: "default" } as unknown as Model);
+      },
+      getThinkingLevel: () => "high",
+      setThinkingLevel: () => undefined,
+      setModel: async (next: Model) => { activeModel = next; return true; },
+    } as never;
+    const ctx = {
+      get model() { return activeModel; },
+      models: {
+        resolve: (spec: string) => spec === "@default" ? configuredModel : wrappers.get(spec),
+        list: () => [
+          configuredModel,
+          { ...model(), provider: "deepseek", id: "deepseek-v4-flash" },
+          { ...model(), provider: "kimi-code", id: "k3-256k", api: "openai-completions" },
+        ],
+      },
+      modelRegistry: {
+        getApiKey: async () => "test-key",
+        resolver: () => () => "test-key",
+        getProviderHeaders: () => undefined,
+        refreshRuntimeProviders: async () => undefined,
+      },
+      sessionManager: { getSessionId: () => "suggestion-session" },
+    } as never;
+    const runtime = createAutomaticVerificationRuntime({
+      probeVerifier: async () => {
+        throw new VerifierLogprobsUnsupportedError("probe returned no token logprobs");
+      },
+    });
+    let message = "";
+    try {
+      await ensureAutomaticVerification(fakePi, ctx, runtime);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain("verifierModel");
+    expect(message).toContain("deepseek/deepseek-v4-flash");
+    // kimi-code is declared openai-completions but rejects logprobs, so the
+    // suggestion must never recommend it.
+    expect(message).not.toContain("kimi-code");
+  });
+
   test("uses modelRoles.default and preserves its explicit thinking selector", async () => {
     const defaultModel = {
       ...model(),
@@ -692,6 +830,84 @@ describe("OMP default model inheritance", () => {
     expect(client.effort).toBe("max");
     expect(client.headers).toEqual({ "X-Auth": "yes" });
     expect(client.apiKeyResolver).toBeDefined();
+  });
+
+
+  test("verifies candidates with the configured verifierModel instead of the session model", async () => {
+    const source = model();
+    const verifier = {
+      ...model(),
+      provider: "deepseek",
+      id: "deepseek-v4-flash",
+      name: "DeepSeek V4 Flash",
+    } as unknown as Model;
+    let activeModel: Model = source;
+    const wrappers = new Map<string, Model>();
+    const fakePi = {
+      pi: { settings: { getModelRole: () => "opencode-go/deepseek-v4-flash-0731:max" } },
+      registerProvider: (provider: string) => {
+        wrappers.set(provider + "/default", { ...source, provider, id: "default" } as unknown as Model);
+      },
+      getThinkingLevel: () => "high",
+      setThinkingLevel: () => undefined,
+      setModel: async (next: Model) => { activeModel = next; return true; },
+    } as never;
+    const ctx = {
+      get model() { return activeModel; },
+      models: {
+        resolve: (spec: string) =>
+          spec === "@default" ? source :
+          spec.startsWith("deepseek/deepseek-v4-flash") ? verifier :
+          wrappers.get(spec),
+      },
+      modelRegistry: {
+        getApiKey: async () => "test-key",
+        resolver: () => () => "test-key",
+        getProviderHeaders: () => undefined,
+        refreshRuntimeProviders: async () => undefined,
+      },
+      sessionManager: { getSessionId: () => "verifier-override-session" },
+      ui: { notify: () => undefined },
+    } as never;
+    let probed: VerifierClient | undefined;
+    const runtime = createAutomaticVerificationRuntime({
+      probeVerifier: async (client) => { probed = client; },
+    });
+
+    const binding = await ensureAutomaticVerification(fakePi, ctx, runtime, 3, "deepseek/deepseek-v4-flash:high");
+    expect(binding.originalModel).toBe(source);
+    expect(probed?.provider).toBe("deepseek");
+    expect(probed?.model).toBe("deepseek-v4-flash");
+    expect(probed?.effort).toBe("high");
+    expect(activeModel.provider).toBe(binding.providerName);
+  });
+
+  test("rejects an unresolvable verifierModel selector with a clear error", async () => {
+    const source = model();
+    let activeModel: Model = source;
+    const fakePi = {
+      pi: { settings: { getModelRole: () => "opencode-go/deepseek-v4-flash-0731:max" } },
+      registerProvider: () => undefined,
+      getThinkingLevel: () => "high",
+      setThinkingLevel: () => undefined,
+      setModel: async (next: Model) => { activeModel = next; return true; },
+    } as never;
+    const ctx = {
+      get model() { return activeModel; },
+      models: { resolve: (spec: string) => spec === "@default" ? source : undefined },
+      modelRegistry: {
+        getApiKey: async () => "test-key",
+        resolver: () => () => "test-key",
+        getProviderHeaders: () => undefined,
+        refreshRuntimeProviders: async () => undefined,
+      },
+      sessionManager: { getSessionId: () => "verifier-missing-session" },
+      ui: { notify: () => undefined },
+    } as never;
+    const runtime = createAutomaticVerificationRuntime();
+    await expect(
+      ensureAutomaticVerification(fakePi, ctx, runtime, 3, "missing/provider-model"),
+    ).rejects.toThrow("verifierModel");
   });
 
   test("rebinds the transparent wrapper after the default model changes", async () => {
@@ -918,5 +1134,15 @@ describe("documentation and plugin surface", () => {
       candidateCount: AUTO_CANDIDATE_COUNT,
     });
     expect(normalizeCandidateCount("4")).toBe(4);
+  });
+
+  test("normalizes the verifierModel selector setting", () => {
+    expect(resolvePluginSettings({ verifierModel: " deepseek/deepseek-v4-flash:high " }).verifierModel)
+      .toBe("deepseek/deepseek-v4-flash:high");
+    expect(resolvePluginSettings({ verifierModel: "   " }).verifierModel).toBeUndefined();
+    expect(resolvePluginSettings({}).verifierModel).toBeUndefined();
+    expect(resolvePluginSettings({ verifierModel: 42 }).verifierModel).toBeUndefined();
+    expect(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
+      .omp.settings.verifierModel.type).toBe("string");
   });
 });

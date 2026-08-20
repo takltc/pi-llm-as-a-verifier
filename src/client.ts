@@ -13,11 +13,13 @@ import type { VerifierReply } from "./scale.ts";
 
 // Terminal-Bench 2.1 self-verification reference defaults for DeepSeek.
 export const DEFAULT_EFFORT = "high";
+/** DeepSeek reasoning shares the output budget with the answer (reference DEEPSEEK_MAX_TOKENS). */
 export const DEFAULT_MAX_TOKENS = 32768;
+/** Generic OpenAI-compatible verifiers cap output like the reference call_openai (4096). */
+export const DEFAULT_OUTPUT_MAX_TOKENS = 4096;
 const VERIFIER_TRANSIENT_RETRIES = 3;
 const VERIFIER_TRANSIENT_STATUSES = new Set([429, 502, 503, 504]);
 type VerifierHttpError = Error & { status?: number; retryAfterMs?: number };
-
 export interface VerifierConfig {
   baseUrl: string;
   apiKey: string;
@@ -162,9 +164,18 @@ export class MissingAPIKeyError extends Error {}
 
 /** The upstream returned a response but omitted the token probabilities required by PPT scoring. */
 export class VerifierLogprobsUnsupportedError extends Error {
-  constructor(message: string) {
+  /**
+   * Whether re-issuing the same request could plausibly return logprobs.
+   * False when the provider rejected the logprobs parameters outright (HTTP
+   * 400 naming logprobs) — retrying a deterministic rejection only bills
+   * tokens without changing the verdict.
+   */
+  readonly retryable: boolean;
+
+  constructor(message: string, options: { retryable?: boolean } = {}) {
     super(message);
     this.name = "VerifierLogprobsUnsupportedError";
+    this.retryable = options.retryable ?? true;
   }
 }
 
@@ -203,6 +214,15 @@ function mergeAbortSignals(
 function isTransientVerifierStatus(status: number): boolean {
   return VERIFIER_TRANSIENT_STATUSES.has(status);
 }
+
+/**
+ * A 400 whose body names the logprobs fields means the provider rejected the
+ * score-token distribution request itself (e.g. Kimi for Coding: "invalid
+ * value for param logprobs"; OpenAI: "Unrecognized request argument
+ * supplied: logprobs"). That is a missing capability, not a transient
+ * failure, so it must surface as VerifierLogprobsUnsupportedError.
+ */
+const LOGPROBS_REJECTION = /logprob/i;
 
 function verifierBackoffMs(attempt: number): number {
   return 250 * (2 ** attempt);
@@ -307,6 +327,7 @@ export class VerifierClient {
             },
           ],
           max_output_tokens: opts.maxTokens ?? this.maxTokens,
+          temperature: 1,
           top_logprobs: 20,
           include: [
             "message.output_text.logprobs",
@@ -319,6 +340,11 @@ export class VerifierClient {
           model: this.model,
           messages: [{ role: "user", content: prompt }],
           max_tokens: opts.maxTokens ?? this.maxTokens,
+          // Sample/expose the natural p_theta distribution: the paper's
+          // reward is sum_g p_theta(v_g | ...) * phi(v_g), and the reference
+          // pins temperature=1.0 on every backend so the returned
+          // logprobs reflect the untempered model distribution.
+          temperature: 1,
           logprobs: true,
           top_logprobs: 20,
         };
@@ -351,6 +377,7 @@ export class VerifierClient {
         return responses ? this.parseResponsesReply(data) : this.parseChatReply(data);
       } catch (error) {
         if (!isVerifierLogprobsUnsupportedError(error)) throw error;
+        if (error instanceof VerifierLogprobsUnsupportedError && !error.retryable) throw error;
         if (attempt >= VERIFIER_TRANSIENT_RETRIES) throw error;
         await waitForRetry(verifierBackoffMs(attempt + 1), requestAbort.signal);
         data = await fetchBody();
@@ -464,6 +491,12 @@ export class VerifierClient {
       });
       if (!res.ok) {
         const detail = redactSecrets((await res.text()).slice(0, 500), secrets);
+        if (res.status === 400 && LOGPROBS_REJECTION.test(detail)) {
+          throw new VerifierLogprobsUnsupportedError(
+            "Verifier API " + res.status + " " + res.statusText + " (provider rejects token logprobs): " + detail,
+            { retryable: false },
+          );
+        }
         const error = new Error(
           "Verifier API " + res.status + " " + res.statusText + ": " + detail,
         ) as VerifierHttpError;
@@ -700,7 +733,7 @@ function resolveOmpEffort(
   return supported.at(-1) ?? "off";
 }
 
-/** Create a verifier from OMP's configured default model and credentials. */
+/** Create a verifier from the given OMP model (or the configured default) and its credentials. */
 export async function createVerifierClient(
   ctx: OmpModelContext,
 ): Promise<VerifierClient> {
@@ -710,7 +743,7 @@ export async function createVerifierClient(
   }
     if (!isVerifierSupportedApi(model.api)) {
       throw new Error(
-        "OMP default model " + model.provider + "/" + model.id + " uses " + model.api +
+        "Verifier model " + model.provider + "/" + model.id + " uses " + model.api +
           "; LLM-as-a-Verifier requires a model with OpenAI token logprobs.",
       );
     }
@@ -718,7 +751,7 @@ export async function createVerifierClient(
   const auth = await resolveOmpAuth(ctx, model);
   if (!auth.ok) {
     throw new MissingAPIKeyError(
-      "OMP default model " + model.provider + "/" + model.id + " has no usable credentials; sign in to this provider in OMP.",
+      "Verifier model " + model.provider + "/" + model.id + " has no usable credentials; sign in to this provider in OMP.",
     );
   }
   const initialKey = auth.apiKey ?? "";
@@ -727,13 +760,26 @@ export async function createVerifierClient(
     : undefined;
   if (!initialKey && !apiKeyResolver) {
     throw new MissingAPIKeyError(
-      "OMP default model " + model.provider + "/" + model.id + " has no usable credentials; sign in to this provider in OMP.",
+      "Verifier model " + model.provider + "/" + model.id + " has no usable credentials; sign in to this provider in OMP.",
     );
   }
+  // DeepSeek mirrors the reference DEEPSEEK_MAX_TOKENS (thinking shares the
+  // output budget); every other OpenAI-compatible verifier mirrors
+  // call_openai's 4096 cap — the score block is short.
+  const deepSeek = model.provider === "deepseek";
+  const referenceCap = deepSeek ? DEFAULT_MAX_TOKENS : DEFAULT_OUTPUT_MAX_TOKENS;
   const maxTokens =
     typeof model.maxTokens === "number" && model.maxTokens > 0
-      ? Math.min(DEFAULT_MAX_TOKENS, model.maxTokens)
-      : DEFAULT_MAX_TOKENS;
+      ? Math.min(referenceCap, model.maxTokens)
+      : referenceCap;
+  // Reference verifier posture: only the DeepSeek backend enables reasoning
+  // (thinking shares the budget there); generic OpenAI-compatible and Gemini
+  // verifiers score WITHOUT thinking (Gemini uses thinking_budget=0). Honor an
+  // explicit thinking selector (e.g. "provider/model:high") on either path.
+  const effort =
+    deepSeek || ctx.defaultThinkingLevel
+      ? resolveOmpEffort(model, ctx.defaultThinkingLevel)
+      : "off";
   return new VerifierClient({
     baseUrl: model.baseUrl,
     apiKey: initialKey,
@@ -744,10 +790,7 @@ export async function createVerifierClient(
     modelId: model.requestModelId ?? model.id,
     headers: { ...model.headers, ...auth.headers },
     compat: normalizeCompat(model.compat),
-    effort: resolveOmpEffort(
-      model,
-      ctx.defaultThinkingLevel,
-    ),
+    effort,
     maxTokens,
   });
 }

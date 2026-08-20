@@ -27,6 +27,8 @@ const MODEL_REBIND_INTERVAL_MS = 500;
 export interface VerifierPluginSettings {
   enabled: boolean;
   candidateCount: number;
+  /** OMP model selector for the verifier (e.g. "deepseek/deepseek-v4-flash:high"); empty follows the session default model. */
+  verifierModel?: string;
 }
 
 export interface VerificationBinding {
@@ -59,6 +61,7 @@ export default function verifierExtension(pi: ExtensionAPI): void {
   });
   let sessionEnabled = false;
   let candidateCount = AUTO_CANDIDATE_COUNT;
+  let verifierModel: string | undefined;
   let lastRebindError = "";
   let lastRebindErrorAt = 0;
   let lastUiWarning = "";
@@ -76,10 +79,11 @@ export default function verifierExtension(pi: ExtensionAPI): void {
       const pluginSettings = resolvePluginSettings(settings);
       sessionEnabled = pluginSettings.enabled || pi.getFlag("llm-verifier") === true;
       candidateCount = pluginSettings.candidateCount;
+      verifierModel = pluginSettings.verifierModel;
       if (!sessionEnabled) return;
       ctx.setInterval(() => {
         if (!sessionEnabled || !ctx.isIdle()) return;
-        void ensureAutomaticVerification(pi, ctx, runtime, candidateCount)
+        void ensureAutomaticVerification(pi, ctx, runtime, candidateCount, verifierModel)
           .then(() => {
             lastRebindError = "";
             lastRebindErrorAt = 0;
@@ -99,7 +103,7 @@ export default function verifierExtension(pi: ExtensionAPI): void {
             notifyWarning(ctx, error);
           });
       }, MODEL_REBIND_INTERVAL_MS);
-      await ensureAutomaticVerification(pi, ctx, runtime, candidateCount);
+      await ensureAutomaticVerification(pi, ctx, runtime, candidateCount, verifierModel);
       ctx.ui.notify("LLM-as-a-Verifier enabled: ordinary requests now generate candidates and replay the verified winner.", "info");
     } catch (error) {
       notifyWarning(ctx, error);
@@ -113,7 +117,7 @@ export default function verifierExtension(pi: ExtensionAPI): void {
     if (!sessionEnabled) return;
     const previousSourceKey = runtime.activeSourceKey;
     try {
-      const binding = await ensureAutomaticVerification(pi, ctx, runtime, candidateCount);
+      const binding = await ensureAutomaticVerification(pi, ctx, runtime, candidateCount, verifierModel);
       if (previousSourceKey && previousSourceKey !== binding.sourceKey) {
         ctx.ui.notify("LLM-as-a-Verifier followed the OMP default model switch and rebound successfully.", "info");
       }
@@ -139,19 +143,32 @@ export async function ensureAutomaticVerification(
   ctx: ExtensionContext,
   runtime: AutomaticVerificationRuntime,
   candidateCount = AUTO_CANDIDATE_COUNT,
+  verifierSelector?: string,
 ): Promise<VerificationBinding> {
   while (true) {
     const originalModel = resolveSourceModel(ctx, runtime);
     if (!originalModel) throw new Error("OMP modelRoles.default did not resolve to an available model.");
-    if (!isVerifierSupportedApi(originalModel.api)) {
+    // The paper scores the agent's candidates with a verifier model of its
+    // own (Gemini/DeepSeek in the reference runs), so the logprobs-capable
+    // API requirement applies to the verifier model, not the agent's model.
+    const verifierModel = verifierSelector ? ctx.models.resolve(verifierSelector) : originalModel;
+    if (verifierSelector && !verifierModel) {
       throw new Error(
-        "OMP default model " + originalModel.provider + "/" + originalModel.id +
-        " uses " + originalModel.api + "; the verifier requires OpenAI token logprobs.",
+        "LLM-as-a-Verifier verifier model " + JSON.stringify(verifierSelector) +
+        " did not resolve to an available OMP model; check the omp-llm-verifier verifierModel setting.",
+      );
+    }
+    if (!verifierModel) throw new Error("OMP modelRoles.default did not resolve to an available model.");
+    if (!isVerifierSupportedApi(verifierModel.api)) {
+      throw new Error(
+        (verifierSelector ? "LLM-as-a-Verifier verifier model " : "OMP default model ") +
+        verifierModel.provider + "/" + verifierModel.id +
+        " uses " + verifierModel.api + "; the verifier requires OpenAI token logprobs.",
       );
     }
 
     const sessionId = ctx.sessionManager.getSessionId();
-    const sourceKey = getSourceKey(pi, ctx, runtime, sessionId);
+    const sourceKey = getSourceKey(pi, ctx, runtime, sessionId, verifierSelector);
     if (!sourceKey) throw new Error("OMP modelRoles.default did not resolve to an available model.");
     const providerName = sourceKey;
     const capabilityError = runtime.capabilityErrors.get(sourceKey);
@@ -172,7 +189,7 @@ export async function ensureAutomaticVerification(
     if (inFlight && runtime.inFlightSourceKey === sourceKey) {
       const waitingGeneration = runtime.generation;
       const binding = await inFlight;
-      if (runtime.generation === waitingGeneration && getSourceKey(pi, ctx, runtime, sessionId) === sourceKey) {
+      if (runtime.generation === waitingGeneration && getSourceKey(pi, ctx, runtime, sessionId, verifierSelector) === sourceKey) {
         return binding;
       }
       continue;
@@ -188,14 +205,19 @@ export async function ensureAutomaticVerification(
             pi,
             ctx,
             originalModel,
+            verifierModel,
             providerName,
             sourceKey,
             candidateCount,
             runtime.probeVerifier,
+            verifierSelector,
           );
         } catch (error) {
           if (isVerifierLogprobsUnsupportedError(error)) {
-            const message = unsupportedModelMessage(originalModel);
+            const message = unsupportedModelMessage(verifierModel, {
+              verifierSelector,
+              available: logprobCapableModels(ctx),
+            });
             runtime.capabilityErrors.set(sourceKey, message);
             throw new VerifierLogprobsUnsupportedError(message);
           }
@@ -207,7 +229,7 @@ export async function ensureAutomaticVerification(
       if (generation !== runtime.generation) {
         return binding;
       }
-      if (getSourceKey(pi, ctx, runtime, sessionId) !== sourceKey) {
+      if (getSourceKey(pi, ctx, runtime, sessionId, verifierSelector) !== sourceKey) {
         return binding;
       }
 
@@ -226,7 +248,7 @@ export async function ensureAutomaticVerification(
         }
         if (thinkingLevel !== undefined) pi.setThinkingLevel(thinkingLevel);
       }
-      if (generation !== runtime.generation || getSourceKey(pi, ctx, runtime, sessionId) !== sourceKey) {
+      if (generation !== runtime.generation || getSourceKey(pi, ctx, runtime, sessionId, verifierSelector) !== sourceKey) {
         return binding;
       }
       runtime.activeSourceKey = sourceKey;
@@ -236,7 +258,7 @@ export async function ensureAutomaticVerification(
     runtime.inFlightSourceKey = sourceKey;
     try {
       const binding = await task;
-      if (generation === runtime.generation && getSourceKey(pi, ctx, runtime, sessionId) === sourceKey) {
+      if (generation === runtime.generation && getSourceKey(pi, ctx, runtime, sessionId, verifierSelector) === sourceKey) {
         return binding;
       }
     } finally {
@@ -252,10 +274,12 @@ async function createVerificationBinding(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   originalModel: Model,
+  verifierModel: Model,
   providerName: string,
   sourceKey: string,
   candidateCount: number,
   probeVerifier?: (client: VerifierClient, model: Model) => Promise<void>,
+  verifierSelector?: string,
 ): Promise<VerificationBinding> {
   const registry = ctx.modelRegistry as ExtensionContext["modelRegistry"] & {
     getProviderHeaders?: (provider: string) => Record<string, string> | undefined;
@@ -269,16 +293,16 @@ async function createVerificationBinding(
     models: ctx.models,
     modelRegistry: ctx.modelRegistry,
     sessionManager: ctx.sessionManager,
-  }, originalModel);
+  }, verifierModel, verifierSelector);
   if (probeVerifier) {
     try {
-      await probeVerifier(verifierClient, originalModel);
+      await probeVerifier(verifierClient, verifierModel);
     } catch (error) {
       if (isVerifierLogprobsUnsupportedError(error)) throw error;
       console.warn(JSON.stringify({
         component: PLUGIN_NAME,
         event: "capability_probe_failed",
-        model: originalModel.provider + "/" + originalModel.id,
+        model: verifierModel.provider + "/" + verifierModel.id,
         error: error instanceof Error ? error.message : String(error),
       }));
     }
@@ -345,6 +369,10 @@ export function resolvePluginSettings(
   return {
     enabled: settings.enabled === true,
     candidateCount: normalizeCandidateCount(settings.candidateCount),
+    verifierModel:
+      typeof settings.verifierModel === "string" && settings.verifierModel.trim()
+        ? settings.verifierModel.trim()
+        : undefined,
   };
 }
 
@@ -354,6 +382,7 @@ export async function createDefaultVerifierClient(
     sessionManager?: ExtensionContext["sessionManager"];
   },
   model?: Model,
+  verifierSelector?: string,
 ) {
   const settings = pi.pi.settings;
   return createVerifierClient({
@@ -361,13 +390,13 @@ export async function createDefaultVerifierClient(
     model,
     sessionId: ctx.sessionManager?.getSessionId(),
     defaultThinkingLevel: extractExplicitThinkingSelector(
-      settings.getModelRole("default"),
+      verifierSelector ?? settings.getModelRole("default"),
       settings,
     ),
   });
 }
 
-function wrapperProviderName(model: Model, sessionId: string, selector?: string): string {
+function wrapperProviderName(model: Model, sessionId: string, selector?: string, verifierSelector?: string): string {
   const identity = JSON.stringify({
     provider: model.provider,
     id: model.id,
@@ -375,6 +404,7 @@ function wrapperProviderName(model: Model, sessionId: string, selector?: string)
     baseUrl: model.baseUrl,
     requestModelId: model.requestModelId,
     selector,
+    verifierSelector,
     sessionId,
   });
   return "omp-llm-verifier-" + createHash("sha256").update(identity).digest("hex").slice(0, 12);
@@ -426,10 +456,11 @@ function getSourceKey(
   ctx: ExtensionContext,
   runtime: AutomaticVerificationRuntime,
   sessionId: string,
+  verifierSelector?: string,
 ): string | undefined {
   const model = resolveSourceModel(ctx, runtime);
   if (!model) return undefined;
-  return wrapperProviderName(model, sessionId, getDefaultModelSelector(pi));
+  return wrapperProviderName(model, sessionId, getDefaultModelSelector(pi), verifierSelector);
 }
 
 function sameModelIdentity(left: Model, right: Model): boolean {
@@ -444,13 +475,50 @@ function getDefaultModelSelector(pi: ExtensionAPI): string | undefined {
   return typeof selector === "string" ? selector : undefined;
 }
 
-function unsupportedModelMessage(model: Model): string {
+/**
+ * Providers whose OpenAI-compatible surface is declared openai-completions
+ * but rejects the logprobs parameters the paper's verifier needs (verified
+ * against Kimi for Coding today). Kept as a small denylist so the startup
+ * warning never suggests a verifier that is guaranteed to fail.
+ */
+const LOGPROBS_HOSTILE_PROVIDERS = new Set(["kimi-code"]);
+
+function logprobCapableModels(ctx: ExtensionContext): string[] {
+  if (!ctx.models || typeof ctx.models.list !== "function") return [];
+  const seen = new Set<string>();
+  const models: string[] = [];
+  for (const candidate of ctx.models.list()) {
+    if (!candidate || !isVerifierSupportedApi(candidate.api)) continue;
+    if (isWrapperModel(candidate)) continue;
+    if (LOGPROBS_HOSTILE_PROVIDERS.has(candidate.provider)) continue;
+    const id = candidate.provider + "/" + candidate.id;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    models.push(id);
+    if (models.length >= 5) break;
+  }
+  return models;
+}
+
+function unsupportedModelMessage(
+  model: Model,
+  options: { verifierSelector?: string; available?: string[] } = {},
+): string {
+  const hint = options.verifierSelector
+    ? "Pick a logprobs-capable verifier model and rerun `omp plugin config set omp-llm-verifier verifierModel <provider/model>`."
+    : "Switch to a model that supports token logprobs, or pin a separate verifier: " +
+      "`omp plugin config set omp-llm-verifier verifierModel <provider/model>`.";
+  const available = options.available && options.available.length > 0
+    ? " Logprobs-capable models available in this session: " + options.available.join(", ") + "."
+    : "";
   return "LLM-as-a-Verifier cannot use " + model.provider + "/" + model.id +
-    ": this model did not return token logprobs. Choose a model that supports token logprobs.";
+    ": this model did not return token logprobs. " + hint + available;
 }
 
 function formatVerifierError(error: unknown, model?: Model): string {
   if (isVerifierLogprobsUnsupportedError(error)) {
+    const detail = error instanceof Error ? error.message : "";
+    if (detail) return detail;
     return model ? unsupportedModelMessage(model) :
       "LLM-as-a-Verifier cannot use the active model because it did not return token logprobs. Choose a model that supports token logprobs.";
   }
