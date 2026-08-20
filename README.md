@@ -22,6 +22,7 @@ omp plugin doctor
 
 之后照常启动 OMP 并发送任务。插件会在每次普通模型请求中并发生成完整候选，使用同一个 OMP 默认模型验证候选，再把胜出响应的文本、推理、图片、工具调用和终止状态回放给 Agent。Agent 继续按原生 OMP 流程执行胜出的工具调用。
 评审上下文包含当前对话、图片数据和完整工具契约；评审服务异常或候选不足时，OMP 会显示 warning 并明确标记本次降级。
+同一 OMP 会话中修改默认模型后，插件会自动重新绑定对应包装模型，后续请求继续经过候选生成与验证。
 
 插件默认关闭；单次会话可用 --llm-verifier 临时开启。验证器需要当前 OMP 默认模型提供 OpenAI Chat Completions 或 Responses API 的 token logprobs。
 

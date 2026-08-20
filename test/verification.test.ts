@@ -11,7 +11,12 @@ import {
   serializeAssistantMessage,
   serializeContext,
 } from "../src/auto.ts";
-import { createDefaultVerifierClient, resolvePluginSettings } from "../src/index.ts";
+import {
+  createAutomaticVerificationRuntime,
+  createDefaultVerifierClient,
+  ensureAutomaticVerification,
+  resolvePluginSettings,
+} from "../src/index.ts";
 import { CODING_AGENT_CRITERIA, CODING_AGENT_GROUND_TRUTH_NOTE } from "../src/prompt.ts";
 import { SELF_VERIFICATION_DEFAULTS } from "../src/run.ts";
 import { VerifierClient, type VerifierConfig } from "../src/client.ts";
@@ -393,6 +398,156 @@ describe("OMP default model inheritance", () => {
     expect(client.effort).toBe("max");
     expect(client.headers).toEqual({ "X-Auth": "yes" });
     expect(client.apiKeyResolver).toBeDefined();
+  });
+
+  test("rebinds the transparent wrapper after the default model changes", async () => {
+    const modelA = model();
+    const modelB = {
+      ...model(),
+      provider: "inferx",
+      id: "deepseek-v4-flash-0731",
+      name: "DeepSeek V4 Flash 0731",
+    } as unknown as Model;
+    let configuredModel = modelA;
+    let activeModel: Model = modelA;
+    let selector = "opencode-go/deepseek-v4-flash-0731:max";
+    const wrappers = new Map<string, Model>();
+    const registrations: string[] = [];
+    const fakePi = {
+      pi: { settings: { getModelRole: () => selector } },
+      registerProvider: (provider: string) => {
+        registrations.push(provider);
+        const wrapper = { ...configuredModel, provider, id: "default", name: "wrapped" } as unknown as Model;
+        wrappers.set(provider + "/default", wrapper);
+      },
+      getThinkingLevel: () => "high",
+      setThinkingLevel: () => undefined,
+      setModel: async (next: Model) => {
+        activeModel = next;
+        return true;
+      },
+    } as never;
+    const registry = {
+      getApiKey: async () => "test-key",
+      resolver: () => () => "test-key",
+      getProviderHeaders: () => undefined,
+      refreshRuntimeProviders: async () => undefined,
+    };
+    const ctx = {
+      get model() { return activeModel; },
+      models: {
+        resolve: (spec: string) => spec === "@default" ? configuredModel : wrappers.get(spec),
+      },
+      modelRegistry: registry,
+      sessionManager: { getSessionId: () => "session-1" },
+      ui: { notify: () => undefined },
+    } as never;
+    const runtime = createAutomaticVerificationRuntime();
+
+    const first = await ensureAutomaticVerification(fakePi, ctx, runtime);
+    expect(first.originalModel).toBe(modelA);
+    expect(activeModel.provider).toBe(first.providerName);
+    expect(registrations).toHaveLength(1);
+    await ensureAutomaticVerification(fakePi, ctx, runtime);
+    expect(registrations).toHaveLength(1);
+
+    configuredModel = modelB;
+    activeModel = modelB;
+    selector = "inferx/deepseek-v4-flash-0731:max";
+    const second = await ensureAutomaticVerification(fakePi, ctx, runtime);
+    expect(second.originalModel).toBe(modelB);
+    expect(second.providerName).not.toBe(first.providerName);
+    expect(activeModel.provider).toBe(second.providerName);
+    expect(registrations).toHaveLength(2);
+  });
+
+  test("does not let a stale rebind overwrite a newer active model", async () => {
+    const modelA = model();
+    const modelB = { ...model(), provider: "inferx", id: "deepseek-v4-flash-0731" } as unknown as Model;
+    let configuredModel = modelA;
+    let activeModel: Model = modelA;
+    const wrappers = new Map<string, Model>();
+    const pendingRegistrations: Array<{ provider: string; resolve: () => void }> = [];
+    const fakePi = {
+      pi: { settings: { getModelRole: () => "default" } },
+      registerProvider: (provider: string) => {
+        const wrapper = { ...configuredModel, provider, id: "default" } as unknown as Model;
+        wrappers.set(provider + "/default", wrapper);
+      },
+      getThinkingLevel: () => "high",
+      setThinkingLevel: () => undefined,
+      setModel: async (next: Model) => { activeModel = next; return true; },
+    } as never;
+    const registry = {
+      getApiKey: async () => "test-key",
+      resolver: () => () => "test-key",
+      getProviderHeaders: () => undefined,
+      refreshRuntimeProviders: async () => {
+        await new Promise<void>((resolve) => pendingRegistrations.push({ provider: "pending", resolve }));
+      },
+    };
+    const ctx = {
+      get model() { return activeModel; },
+      models: { resolve: (spec: string) => spec === "@default" ? configuredModel : wrappers.get(spec) },
+      modelRegistry: registry,
+      sessionManager: { getSessionId: () => "session-2" },
+    } as never;
+    const runtime = createAutomaticVerificationRuntime();
+    const first = ensureAutomaticVerification(fakePi, ctx, runtime);
+    await Promise.resolve();
+    configuredModel = modelB;
+    activeModel = modelB;
+    const second = ensureAutomaticVerification(fakePi, ctx, runtime);
+    while (pendingRegistrations.length > 0) pendingRegistrations.shift()?.resolve();
+    const [firstBinding, secondBinding] = await Promise.all([first, second]);
+    expect(secondBinding.originalModel).toBe(modelB);
+    expect(firstBinding.originalModel).toBe(modelB);
+    expect(activeModel.provider).toBe(secondBinding.providerName);
+  });
+
+  test("keeps the active wrapper source while the persisted default is stale", async () => {
+    const modelA = model();
+    const modelB = { ...model(), provider: "inferx", id: "deepseek-v4-flash-0731" } as unknown as Model;
+    let configuredModel = modelA;
+    let activeModel: Model = modelA;
+    const wrappers = new Map<string, Model>();
+    const fakePi = {
+      pi: { settings: { getModelRole: () => "opencode-go/deepseek-v4-flash:max" } },
+      registerProvider: (provider: string) => {
+        const wrapper = { ...configuredModel, provider, id: "default" } as unknown as Model;
+        wrappers.set(provider + "/default", wrapper);
+      },
+      getThinkingLevel: () => "high",
+      setThinkingLevel: () => undefined,
+      setModel: async (next: Model) => { activeModel = next; return true; },
+    } as never;
+    const registry = {
+      getApiKey: async () => "test-key",
+      resolver: () => () => "test-key",
+      getProviderHeaders: () => undefined,
+      refreshRuntimeProviders: async () => undefined,
+    };
+    const ctx = {
+      get model() { return activeModel; },
+      models: { resolve: (spec: string) => spec === "@default" ? configuredModel : wrappers.get(spec) },
+      modelRegistry: registry,
+      sessionManager: { getSessionId: () => "session-3" },
+    } as never;
+    const runtime = createAutomaticVerificationRuntime();
+
+    const first = await ensureAutomaticVerification(fakePi, ctx, runtime);
+    configuredModel = modelB;
+    activeModel = modelB;
+    const second = await ensureAutomaticVerification(fakePi, ctx, runtime);
+    expect(second.originalModel).toBe(modelB);
+
+    configuredModel = modelA;
+    activeModel = second.wrapperModel;
+    const third = await ensureAutomaticVerification(fakePi, ctx, runtime);
+    expect(third.originalModel).toBe(modelB);
+    expect(third.providerName).toBe(second.providerName);
+    expect(activeModel.provider).toBe(second.providerName);
+    expect(first.providerName).not.toBe(second.providerName);
   });
 });
 

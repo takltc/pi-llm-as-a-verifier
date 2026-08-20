@@ -577,6 +577,7 @@ type OmpModelContext = Pick<
   ExtensionContext,
   "models" | "modelRegistry"
 > & {
+  model?: Model;
   defaultThinkingLevel?: string;
   sessionId?: string;
 };
@@ -606,7 +607,7 @@ function resolveOmpEffort(
 export async function createVerifierClient(
   ctx: OmpModelContext,
 ): Promise<VerifierClient> {
-  const model = ctx.models.resolve("@default");
+  const model = ctx.model ?? ctx.models.resolve("@default");
   if (!model) {
     throw new MissingAPIKeyError("OMP modelRoles.default 没有解析到可用模型。");
   }

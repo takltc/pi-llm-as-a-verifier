@@ -15,10 +15,26 @@ import { createVerifierClient } from "./client.ts";
 const PLUGIN_NAME = "omp-llm-verifier";
 const WRAPPER_KEY = "omp-llm-verifier-internal";
 const WRAPPER_API_PREFIX = "omp-llm-verifier-api-";
+const MODEL_REBIND_INTERVAL_MS = 500;
 
 export interface VerifierPluginSettings {
   enabled: boolean;
   candidateCount: number;
+}
+
+export interface VerificationBinding {
+  sourceKey: string;
+  originalModel: Model;
+  wrapperModel: Model;
+  providerName: string;
+}
+
+export interface AutomaticVerificationRuntime {
+  bindings: Map<string, VerificationBinding>;
+  activeSourceKey?: string;
+  inFlight?: Promise<VerificationBinding>;
+  inFlightSourceKey?: string;
+  generation: number;
 }
 
 export default function verifierExtension(pi: ExtensionAPI): void {
@@ -29,14 +45,58 @@ export default function verifierExtension(pi: ExtensionAPI): void {
     default: false,
   });
 
+  const runtime = createAutomaticVerificationRuntime();
+  let sessionEnabled = false;
+  let candidateCount = AUTO_CANDIDATE_COUNT;
+  let lastRebindError = "";
+  let lastRebindErrorAt = 0;
+
   pi.on("session_start", async (_event, ctx) => {
     try {
       const settings = await getPluginSettings(PLUGIN_NAME, ctx.cwd);
       const pluginSettings = resolvePluginSettings(settings);
-      const enabled = pluginSettings.enabled || pi.getFlag("llm-verifier") === true;
-      if (!enabled) return;
-      await enableAutomaticVerification(pi, ctx, pluginSettings.candidateCount);
+      sessionEnabled = pluginSettings.enabled || pi.getFlag("llm-verifier") === true;
+      candidateCount = pluginSettings.candidateCount;
+      if (!sessionEnabled) return;
+      ctx.setInterval(() => {
+        if (!sessionEnabled || !ctx.isIdle()) return;
+        void ensureAutomaticVerification(pi, ctx, runtime, candidateCount)
+          .then(() => {
+            lastRebindError = "";
+            lastRebindErrorAt = 0;
+          })
+          .catch((error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            const now = Date.now();
+            if (message === lastRebindError && now - lastRebindErrorAt < 5_000) return;
+            lastRebindError = message;
+            lastRebindErrorAt = now;
+            console.warn(JSON.stringify({
+              component: PLUGIN_NAME,
+              event: "model_rebind_failed",
+              error: message,
+            }));
+          });
+      }, MODEL_REBIND_INTERVAL_MS);
+      await ensureAutomaticVerification(pi, ctx, runtime, candidateCount);
       ctx.ui.notify("LLM-as-a-Verifier 已启用：普通请求会自动生成候选并回放验证胜者。", "info");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify("LLM-as-a-Verifier 暂不可用：" + message, "warning");
+    }
+  });
+
+  // OMP has no model-changed extension event. before_agent_start is awaited
+  // before the agent loop builds its provider context, so it is the reliable
+  // seam for rebinding after modelRoles.default changes.
+  pi.on("before_agent_start", async (_event, ctx) => {
+    if (!sessionEnabled) return;
+    const previousSourceKey = runtime.activeSourceKey;
+    try {
+      const binding = await ensureAutomaticVerification(pi, ctx, runtime, candidateCount);
+      if (previousSourceKey && previousSourceKey !== binding.sourceKey) {
+        ctx.ui.notify("LLM-as-a-Verifier 已跟随 OMP 默认模型切换并重新绑定。", "info");
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui.notify("LLM-as-a-Verifier 暂不可用：" + message, "warning");
@@ -44,20 +104,118 @@ export default function verifierExtension(pi: ExtensionAPI): void {
   });
 }
 
-async function enableAutomaticVerification(
+export function createAutomaticVerificationRuntime(): AutomaticVerificationRuntime {
+  return { bindings: new Map(), generation: 0 };
+}
+
+export async function ensureAutomaticVerification(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
+  runtime: AutomaticVerificationRuntime,
   candidateCount = AUTO_CANDIDATE_COUNT,
-): Promise<void> {
-  const originalModel = ctx.models.resolve("@default") ?? ctx.model;
-  if (!originalModel) throw new Error("OMP modelRoles.default 没有解析到可用模型。");
-  if (originalModel.provider.startsWith("omp-llm-verifier-")) return;
-  if (originalModel.api !== "openai-completions" && originalModel.api !== "openai-responses") {
-    throw new Error(
-      "OMP 默认模型 " + originalModel.provider + "/" + originalModel.id +
-      " 使用 " + originalModel.api + "，验证器需要 OpenAI token logprobs。",
-    );
+): Promise<VerificationBinding> {
+  while (true) {
+    const originalModel = resolveSourceModel(ctx, runtime);
+    if (!originalModel) throw new Error("OMP modelRoles.default 没有解析到可用模型。");
+    if (originalModel.api !== "openai-completions" && originalModel.api !== "openai-responses") {
+      throw new Error(
+        "OMP 默认模型 " + originalModel.provider + "/" + originalModel.id +
+        " 使用 " + originalModel.api + "，验证器需要 OpenAI token logprobs。",
+      );
+    }
+
+    const sessionId = ctx.sessionManager.getSessionId();
+    const sourceKey = getSourceKey(pi, ctx, runtime, sessionId);
+    if (!sourceKey) throw new Error("OMP modelRoles.default 没有解析到可用模型。");
+    const providerName = sourceKey;
+    const activeBinding = runtime.bindings.get(sourceKey);
+    if (
+      runtime.activeSourceKey === sourceKey &&
+      activeBinding &&
+      ctx.model &&
+      ctx.model.provider === activeBinding.wrapperModel.provider &&
+      ctx.model.id === activeBinding.wrapperModel.id
+    ) {
+      return activeBinding;
+    }
+    const inFlight = runtime.inFlight;
+    if (inFlight && runtime.inFlightSourceKey === sourceKey) {
+      const waitingGeneration = runtime.generation;
+      const binding = await inFlight;
+      if (runtime.generation === waitingGeneration && getSourceKey(pi, ctx, runtime, sessionId) === sourceKey) {
+        return binding;
+      }
+      continue;
+    }
+
+    const previous = runtime.inFlight;
+    const generation = ++runtime.generation;
+    const task = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(async () => {
+      let binding = runtime.bindings.get(sourceKey);
+      if (!binding) {
+        binding = await createVerificationBinding(
+          pi,
+          ctx,
+          originalModel,
+          providerName,
+          sourceKey,
+          candidateCount,
+        );
+        runtime.bindings.set(sourceKey, binding);
+      }
+
+      if (generation !== runtime.generation) {
+        return binding;
+      }
+      if (getSourceKey(pi, ctx, runtime, sessionId) !== sourceKey) {
+        return binding;
+      }
+
+      const currentModel = ctx.model;
+      if (currentModel && !isWrapperModel(currentModel) && !sameModelIdentity(currentModel, originalModel)) {
+        return binding;
+      }
+      if (
+        !currentModel ||
+        currentModel.provider !== binding.wrapperModel.provider ||
+        currentModel.id !== binding.wrapperModel.id
+      ) {
+        const thinkingLevel = pi.getThinkingLevel();
+        if (!await pi.setModel(binding.wrapperModel)) {
+          throw new Error("OMP 无法切换到自动验证包装模型。");
+        }
+        if (thinkingLevel !== undefined) pi.setThinkingLevel(thinkingLevel);
+      }
+      if (generation !== runtime.generation || getSourceKey(pi, ctx, runtime, sessionId) !== sourceKey) {
+        return binding;
+      }
+      runtime.activeSourceKey = sourceKey;
+      return binding;
+    });
+    runtime.inFlight = task;
+    runtime.inFlightSourceKey = sourceKey;
+    try {
+      const binding = await task;
+      if (generation === runtime.generation && getSourceKey(pi, ctx, runtime, sessionId) === sourceKey) {
+        return binding;
+      }
+    } finally {
+      if (runtime.inFlight === task) {
+        runtime.inFlight = undefined;
+        runtime.inFlightSourceKey = undefined;
+      }
+    }
   }
+}
+
+async function createVerificationBinding(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  originalModel: Model,
+  providerName: string,
+  sourceKey: string,
+  candidateCount: number,
+): Promise<VerificationBinding> {
   const registry = ctx.modelRegistry as ExtensionContext["modelRegistry"] & {
     getProviderHeaders?: (provider: string) => Record<string, string> | undefined;
   };
@@ -65,17 +223,12 @@ async function enableAutomaticVerification(
   const candidateModel = providerHeaders
     ? { ...originalModel, headers: { ...providerHeaders, ...originalModel.headers } }
     : originalModel;
-
-  const resolver = ctx.modelRegistry.resolver(
-    originalModel,
-    ctx.sessionManager.getSessionId(),
-  );
+  const resolver = ctx.modelRegistry.resolver(originalModel, ctx.sessionManager.getSessionId());
   const verifierClient = await createDefaultVerifierClient(pi, {
     models: ctx.models,
     modelRegistry: ctx.modelRegistry,
     sessionManager: ctx.sessionManager,
-  });
-  const providerName = wrapperProviderName(originalModel, ctx.sessionManager.getSessionId());
+  }, originalModel);
   const wrapperApi = wrapperApiName(providerName);
   const modelId = "default";
   const config = {
@@ -89,11 +242,7 @@ async function enableAutomaticVerification(
         verifierClient,
         apiKeyResolver: resolver,
         onDegraded: (event) => {
-          console.warn(JSON.stringify({
-            component: "omp-llm-verifier",
-            event: "degraded",
-            ...event,
-          }));
+          console.warn(JSON.stringify({ component: PLUGIN_NAME, event: "degraded", ...event }));
           ctx.ui.notify(
             event.reason === "verification_error"
               ? "LLM-as-a-Verifier 本次评审失败，已返回首个候选响应。"
@@ -132,12 +281,7 @@ async function enableAutomaticVerification(
     wrapperModel = ctx.models.resolve(providerName + "/" + modelId);
   }
   if (!wrapperModel) throw new Error("无法注册自动验证包装模型。");
-
-  const thinkingLevel = pi.getThinkingLevel();
-  if (!await pi.setModel(wrapperModel)) {
-    throw new Error("OMP 无法切换到自动验证包装模型。");
-  }
-  if (thinkingLevel !== undefined) pi.setThinkingLevel(thinkingLevel);
+  return { sourceKey, originalModel, wrapperModel, providerName };
 }
 
 export function resolvePluginSettings(
@@ -154,10 +298,12 @@ export async function createDefaultVerifierClient(
   ctx: Pick<ExtensionContext, "models" | "modelRegistry"> & {
     sessionManager?: ExtensionContext["sessionManager"];
   },
+  model?: Model,
 ) {
   const settings = pi.pi.settings;
   return createVerifierClient({
     ...ctx,
+    model,
     sessionId: ctx.sessionManager?.getSessionId(),
     defaultThinkingLevel: extractExplicitThinkingSelector(
       settings.getModelRole("default"),
@@ -166,11 +312,79 @@ export async function createDefaultVerifierClient(
   });
 }
 
-function wrapperProviderName(model: Model, sessionId: string): string {
-  const identity = model.provider + "\\0" + model.id + "\\0" + model.baseUrl + "\\0" + sessionId;
+function wrapperProviderName(model: Model, sessionId: string, selector?: string): string {
+  const identity = JSON.stringify({
+    provider: model.provider,
+    id: model.id,
+    api: model.api,
+    baseUrl: model.baseUrl,
+    requestModelId: model.requestModelId,
+    selector,
+    sessionId,
+  });
   return "omp-llm-verifier-" + createHash("sha256").update(identity).digest("hex").slice(0, 12);
 }
 
 function wrapperApiName(providerName: string): string {
   return WRAPPER_API_PREFIX + providerName.slice("omp-llm-verifier-".length);
+}
+
+function isWrapperModel(model: Model): boolean {
+  return model.provider.startsWith("omp-llm-verifier-");
+}
+
+function resolveSourceModel(
+  ctx: ExtensionContext,
+  runtime: AutomaticVerificationRuntime,
+): Model | undefined {
+  const current = ctx.model;
+  if (current && !isWrapperModel(current)) return current;
+
+  if (current && isWrapperModel(current) && runtime.activeSourceKey) {
+    const binding = runtime.bindings.get(runtime.activeSourceKey);
+    if (
+      binding &&
+      binding.wrapperModel.provider === current.provider &&
+      binding.wrapperModel.id === current.id
+    ) {
+      return binding.originalModel;
+    }
+  }
+
+  if (current && isWrapperModel(current)) {
+    for (const binding of runtime.bindings.values()) {
+      if (
+        binding.wrapperModel.provider === current.provider &&
+        binding.wrapperModel.id === current.id
+      ) {
+        return binding.originalModel;
+      }
+    }
+  }
+
+  const configured = ctx.models.resolve("@default");
+  return configured && !isWrapperModel(configured) ? configured : undefined;
+}
+
+function getSourceKey(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runtime: AutomaticVerificationRuntime,
+  sessionId: string,
+): string | undefined {
+  const model = resolveSourceModel(ctx, runtime);
+  if (!model) return undefined;
+  return wrapperProviderName(model, sessionId, getDefaultModelSelector(pi));
+}
+
+function sameModelIdentity(left: Model, right: Model): boolean {
+  return left.provider === right.provider &&
+    left.id === right.id &&
+    left.baseUrl === right.baseUrl &&
+    left.requestModelId === right.requestModelId;
+}
+
+function getDefaultModelSelector(pi: ExtensionAPI): string | undefined {
+  const selector = pi.pi.settings.getModelRole("default");
+  return typeof selector === "string" ? selector : undefined;
 }
