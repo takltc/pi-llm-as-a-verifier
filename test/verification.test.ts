@@ -12,8 +12,11 @@ import type {
 import { cacheKey, loadCache, saveCache, type CacheContext } from "../src/cache.ts";
 import {
   AUTO_CANDIDATE_COUNT,
+  AUTO_SELECTION_DEFAULTS,
   createAutoVerifierStream,
   normalizeCandidateCount,
+  normalizeEvaluations,
+  normalizePivots,
   serializeAssistantMessage,
   serializeContext,
 } from "../src/auto.ts";
@@ -23,8 +26,13 @@ import {
   ensureAutomaticVerification,
   resolvePluginSettings,
 } from "../src/index.ts";
-import { CODING_AGENT_CRITERIA, CODING_AGENT_GROUND_TRUTH_NOTE } from "../src/prompt.ts";
+import {
+  CODING_AGENT_ACTION_CRITERIA,
+  CODING_AGENT_CRITERIA,
+  CODING_AGENT_GROUND_TRUTH_NOTE,
+} from "../src/prompt.ts";
 import { SELF_VERIFICATION_DEFAULTS } from "../src/run.ts";
+import { select } from "../src/select.ts";
 import {
   createVerifierClient,
   isVerifierLogprobsUnsupportedError,
@@ -197,7 +205,7 @@ async function collect(stream: AssistantMessageEventStream) {
   return { events, result };
 }
 
-describe("automatic request-level provider", () => {
+describe("automatic request/action-level provider", () => {
   test("retries a transient 429 before parsing verifier logprobs", async () => {
     const originalFetch = globalThis.fetch;
     let attempts = 0;
@@ -483,7 +491,7 @@ describe("automatic request-level provider", () => {
     }
   });
 
-  test("generates three candidates and replays the verified winner", async () => {
+  test("generates the default three candidates and replays the verified winner", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
     const verifier = new RankingVerifier();
     const stream = createAutoVerifierStream({
@@ -496,8 +504,11 @@ describe("automatic request-level provider", () => {
 
     expect(calls).toHaveLength(3);
     expect(verifier.calls).toBeGreaterThan(0);
-    expect(verifier.calls % 6).toBe(0);
+    expect(verifier.calls).toBeLessThanOrEqual(6);
     expect(calls.every((call) => call.options.statefulResponses === false)).toBe(true);
+    expect(calls.every((call) => call.options.temperature === 1)).toBe(true);
+    expect(calls.every((call) => call.options.anthropicCacheRefresh === false)).toBe(true);
+    expect(calls.every((call) => call.options.anthropicCacheRefreshRequest === false)).toBe(true);
     // The wrapper's credentials are threaded onto candidate calls; OMP's
     // session/cache identity is preserved (asserted in the affinity test below).
     const resolver = calls[0]?.options.apiKey;
@@ -522,7 +533,64 @@ describe("automatic request-level provider", () => {
     expect(textDelta?.partial?.content[1]).toMatchObject({ type: "text", text: "candidate text 2" });
   });
 
-  test("uses the configured candidate count", async () => {
+  test("starts all request/action candidates concurrently", async () => {
+    let started = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: () => {
+        const index = started++;
+        const candidate = new AssistantMessageEventStream();
+        void gate.then(() => {
+          const result = message(index);
+          candidate.push({ type: "start", partial: result });
+          candidate.push({ type: "done", reason: "stop", message: result });
+        });
+        return candidate;
+      },
+    }, context());
+
+    const pending = collect(stream);
+    await Bun.sleep(0);
+    expect(started).toBe(3);
+    release();
+    const { result } = await pending;
+    expect(result.responseId).toBe("response-2");
+  });
+
+  test("rejects provider-native execution before candidate fan-out", async () => {
+    let candidateCalls = 0;
+    const decisions: unknown[] = [];
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: () => {
+        candidateCalls += 1;
+        return new AssistantMessageEventStream();
+      },
+      onDecision: (decision) => decisions.push(decision),
+    }, context(), {
+      execHandlers: {} as NonNullable<SimpleStreamOptions["execHandlers"]>,
+    });
+    const { result } = await collect(stream);
+
+    expect(candidateCalls).toBe(0);
+    expect(result.stopReason).toBe("error");
+    expect(result.errorMessage).toContain("declarative tool calls");
+    expect(decisions[0]).toMatchObject({
+      path: "error",
+      granularity: "request_action",
+      successfulCandidates: 0,
+    });
+  });
+
+  test("uses the configured candidate count through the maximum of eight", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
     const stream = createAutoVerifierStream(
       {
@@ -533,10 +601,35 @@ describe("automatic request-level provider", () => {
       },
       context(),
       {},
-      { candidateCount: 4 },
+      { candidateCount: 8 },
     );
     await collect(stream);
-    expect(calls).toHaveLength(4);
+    expect(calls).toHaveLength(8);
+  });
+
+  test("uses the configured verifier repeats K through PPT", async () => {
+    // Paper §4.2 quality/cost axis: raising K raises the verifier call count by
+    // exactly the same factor from TurboAgent's online K=1 default.
+    const defaultCalls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const defaultVerifier = new RankingVerifier();
+    await collect(createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: defaultVerifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(defaultCalls),
+    }, context(), {}, {}));
+    // This deterministic ranking produces 5 PPT comparisons x C=1 x K=1.
+    expect(defaultVerifier.calls).toBe(5);
+
+    const qualityCalls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const qualityVerifier = new RankingVerifier();
+    await collect(createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: qualityVerifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(qualityCalls),
+    }, context(), {}, { candidateCount: 3, nEvaluations: 3 }));
+    expect(qualityVerifier.calls).toBe(15);
   });
 
   test("isolates mutable message content across candidate contexts", async () => {
@@ -598,7 +691,7 @@ describe("automatic request-level provider", () => {
       .toBe("printf candidate-99");
   });
 
-  test("replays a tool-use turn directly without expanding or verifying", async () => {
+  test("fans out and verifies every tool-use action before replay", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
     const verifier = new RankingVerifier();
     const stream = createAutoVerifierStream({
@@ -606,10 +699,11 @@ describe("automatic request-level provider", () => {
       verifierClient: verifier,
       apiKeyResolver: () => "original-key",
       streamSimpleFn: (_m, _context, _o = {}) => {
+        const index = calls.length;
         calls.push({ context: _context, options: _o });
         const out = new AssistantMessageEventStream();
         queueMicrotask(() => {
-          const result = message(0, true); // stopReason toolUse
+          const result = message(index, true);
           out.push({ type: "start", partial: result });
           out.push({ type: "done", reason: "toolUse", message: result });
         });
@@ -617,12 +711,10 @@ describe("automatic request-level provider", () => {
       },
     }, context());
     const { events, result } = await collect(stream);
-    // terminal gating: an intermediate tool-use turn is the agent's own next
-    // action, so the wrapper replays it and never fans out or verifies.
-    expect(calls).toHaveLength(1);
-    expect(verifier.calls).toBe(0);
+    expect(calls).toHaveLength(3);
+    expect(verifier.calls).toBe(5);
     expect(result.stopReason).toBe("toolUse");
-    expect(result.responseId).toBe("response-0");
+    expect(result.responseId).toBe("response-2");
     expect((events as Array<{ type: string }>).map((event) => event.type)).toEqual([
       "start",
       "thinking_start",
@@ -638,7 +730,7 @@ describe("automatic request-level provider", () => {
     ]);
   });
 
-  test("keeps nonterminal alternatives outside terminal-answer PPT", async () => {
+  test("compares terminal and tool-use actions in one request/action-level PPT", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
     const degraded: unknown[] = [];
     const decisions: unknown[] = [];
@@ -669,23 +761,23 @@ describe("automatic request-level provider", () => {
     const { result } = await collect(stream);
 
     expect(calls).toHaveLength(3);
-    expect(verifier.calls).toBe(0);
-    expect(result.responseId).toBe("response-0");
-    expect(result.stopReason).toBe("stop");
-    expect(degraded[0]).toMatchObject({
-      reason: "insufficient_candidates",
-      successfulCandidates: 1,
-      nonterminalCandidates: 2,
-    });
+    expect(verifier.calls).toBe(5);
+    expect(result.responseId).toBe("response-2");
+    expect(result.stopReason).toBe("toolUse");
+    expect(degraded).toEqual([]);
     expect(decisions[0]).toMatchObject({
-      path: "fallback",
-      winnerIndex: 0,
-      successfulCandidates: 1,
+      path: "verifier",
+      granularity: "request_action",
+      winnerIndex: 2,
+      winnerStopReason: "toolUse",
+      successfulCandidates: 3,
+      terminalCandidates: 1,
+      toolUseCandidates: 2,
       nonterminalCandidates: 2,
     });
   });
 
-  test("runs the paper PPT when an exact-action majority agrees", async () => {
+  test("uses exact-action majority before PPT and ignores tool-call ids", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
     const verifier = new RankingVerifier();
     const decisions: unknown[] = [];
@@ -699,11 +791,59 @@ describe("automatic request-level provider", () => {
         const index = next++;
         const out = new AssistantMessageEventStream();
         queueMicrotask(() => {
-          const text = index === 2 ? "different plan B" : "same plan A";
+          const command = index === 2 ? "printf plan-b" : "printf plan-a";
           const result = {
             ...message(index),
-            content: [{ type: "text" as const, text }],
-            stopReason: "stop" as const,
+            content: [
+              { type: "text" as const, text: index === 2 ? "different plan B" : "same plan A" },
+              {
+                type: "toolCall" as const,
+                id: "provider-call-" + index,
+                name: "bash",
+                arguments: { command },
+              },
+            ],
+            stopReason: "toolUse" as const,
+          };
+          out.push({ type: "start", partial: result });
+          out.push({ type: "done", reason: "toolUse", message: result });
+        });
+        return out;
+      },
+      onDecision: (decision) => decisions.push(decision),
+    }, context());
+    const { result } = await collect(stream);
+    expect(calls).toHaveLength(3);
+    expect(verifier.calls).toBe(0);
+    expect(result.responseId).toBe("response-0");
+    expect(result.stopReason).toBe("toolUse");
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      path: "majority",
+      granularity: "request_action",
+      winnerIndex: 0,
+      winnerStopReason: "toolUse",
+      nComparisons: 0,
+      scores: [1, 1, 0],
+    });
+  });
+
+  test("requires full untruncated action equality for majority", async () => {
+    const sharedPrefix = "shared ".repeat(1_500);
+    const verifier = new RankingVerifier();
+    const decisions: unknown[] = [];
+    let next = 0;
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: () => {
+        const index = next++;
+        const out = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          const result = {
+            ...message(index),
+            content: [{ type: "text" as const, text: sharedPrefix + "candidate text " + index }],
           };
           out.push({ type: "start", partial: result });
           out.push({ type: "done", reason: "stop", message: result });
@@ -712,13 +852,10 @@ describe("automatic request-level provider", () => {
       },
       onDecision: (decision) => decisions.push(decision),
     }, context());
-    const { result } = await collect(stream);
-    expect(calls).toHaveLength(3);
+
+    await collect(stream);
     expect(verifier.calls).toBeGreaterThan(0);
-    expect(result.responseId).toBe("response-0");
-    expect(result.content).toEqual([{ type: "text", text: "same plan A" }]);
-    expect(decisions).toHaveLength(1);
-    expect(decisions[0]).toMatchObject({ path: "verifier", nComparisons: 4 });
+    expect(decisions[0]).toMatchObject({ path: "verifier" });
   });
 
   test("reports the PPT decision: winner, scores, comparison count, usage", async () => {
@@ -750,33 +887,33 @@ describe("automatic request-level provider", () => {
       paperEquivalent?: boolean;
       scoreSources?: unknown;
       scoreDistribution?: unknown;
+      granularity?: string;
+      toolUseCandidates?: number;
+      terminalCandidates?: number;
     };
     expect(decision.path).toBe("verifier");
     expect(decision.winnerIndex).toBe(2);
     expect(decision.candidateCount).toBe(3);
     expect(decision.successfulCandidates).toBe(3);
-    // Algorithm 1 subtracts the one directed ring overlap from the
-    // N + k(N-k) + C(k,2) upper bound for N=3, k=1.
-    expect(decision.nComparisons).toBe(4);
+    expect(decision.granularity).toBe("request_action");
+    expect(decision.toolUseCandidates).toBe(0);
+    expect(decision.terminalCandidates).toBe(3);
+    expect(decision.nComparisons).toBe(5);
     expect(decision.paperEquivalent).toBe(true);
     expect(decision.scoreSources).toEqual({
-      logprobs: 48,
+      logprobs: 10,
       textFallback: 0,
       neutralTie: 0,
       unknown: 0,
     });
     expect(decision.scoreDistribution).toEqual({
-      logprobScores: 48,
+      logprobScores: 10,
       minSupport: 1,
       meanSupport: 1,
       minProbabilityMass: 1,
       meanProbabilityMass: 1,
     });
-    expect(decision.criteria).toEqual([
-      "task_correctness",
-      "evidence_and_verification",
-      "unresolved_error_signals",
-    ]);
+    expect(decision.criteria).toEqual(["task_success"]);
     expect(Array.isArray(decision.scores) && decision.scores.length).toBe(3);
     expect(decision.winnerScore).toBeGreaterThanOrEqual(0);
     expect(decision.winnerScore).toBeLessThanOrEqual(1);
@@ -785,7 +922,7 @@ describe("automatic request-level provider", () => {
     // The decision is self-describing: which verifier model and prompt
     // contract produced it, so drift is traceable per request.
     expect(decision.model).toBe("opencode-go/deepseek-v4-flash-0731");
-    expect(decision.promptVersion).toBe("pairwise-granularity20-v4");
+    expect(decision.promptVersion).toBe("pairwise-granularity20-v5");
   });
 
   test("reports an error decision when every candidate fails", async () => {
@@ -829,6 +966,9 @@ describe("automatic request-level provider", () => {
       sessionId: "session-cache-id",
       promptCacheKey: "prompt-cache-key",
       providerSessionState: sessionState,
+      temperature: 0.35,
+      anthropicCacheRefresh: true,
+      anthropicCacheRefreshRequest: true,
     });
     await collect(stream);
     expect(calls.length).toBeGreaterThan(0);
@@ -840,6 +980,9 @@ describe("automatic request-level provider", () => {
       expect(call.options.sessionId).toBe("session-cache-id");
       expect(call.options.promptCacheKey).toBe("prompt-cache-key");
       expect(call.options.providerSessionState).toBe(sessionState);
+      expect(call.options.temperature).toBe(0.35);
+      expect(call.options.anthropicCacheRefresh).toBe(false);
+      expect(call.options.anthropicCacheRefreshRequest).toBe(false);
     }
   });
 
@@ -863,14 +1006,76 @@ describe("automatic request-level provider", () => {
     expect(degraded).toHaveLength(1);
     expect(degraded[0]).toMatchObject({
       reason: "non_probabilistic_scores",
-      scoreSources: { logprobs: 0, textFallback: 0, neutralTie: 48, unknown: 0 },
+      granularity: "request_action",
+      scoreSources: { logprobs: 0, textFallback: 0, neutralTie: 8, unknown: 0 },
     });
     expect(decisions[0]).toMatchObject({
       path: "verifier",
       paperEquivalent: false,
-      scoreSources: { logprobs: 0, textFallback: 0, neutralTie: 48, unknown: 0 },
+      scoreSources: { logprobs: 0, textFallback: 0, neutralTie: 8, unknown: 0 },
     });
     expect(loadCache(cacheFile)).toEqual({});
+  });
+
+  test("opens a no-logprobs circuit breaker instead of retrying every job", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const decisions: unknown[] = [];
+    let verifierCalls = 0;
+    const cacheFile = "/tmp/omp-verifier-breaker-" + crypto.randomUUID() + ".json";
+    temporaryFiles.push(cacheFile);
+    class Unsupported extends VerifierClient {
+      override async scoreReply(): Promise<VerifierReply> {
+        verifierCalls += 1;
+        // A deterministic provider rejection of the logprobs parameters: every
+        // scoring job sends an identical request shape, so after the first two
+        // confirmations the remaining jobs become ties without a call.
+        throw new VerifierLogprobsUnsupportedError("provider rejects logprobs", { retryable: false });
+      }
+    }
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new Unsupported(clientConfig()),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls),
+      cacheFile,
+      onDecision: (decision) => decisions.push(decision),
+    }, context());
+    const { result } = await collect(stream);
+    expect(result.responseId).toBe("response-0");
+    // The online profile has one criterion and one repetition. The three
+    // concurrent ring jobs begin before the breaker opens; later jobs tie
+    // locally, which bounds provider traffic to three calls.
+    expect(verifierCalls).toBe(3);
+    expect(decisions[0]).toMatchObject({
+      path: "verifier",
+      paperEquivalent: false,
+      nComparisons: 4,
+      scoreSources: { logprobs: 0, textFallback: 0, neutralTie: 8, unknown: 0 },
+    });
+    // Neutral ties never reach the durable cache.
+    expect(loadCache(cacheFile)).toEqual({});
+  });
+
+  test("persists verified scores durably after the throttled checkpoint saves", async () => {
+    const cacheFile = "/tmp/omp-verifier-durable-" + crypto.randomUUID() + ".json";
+    temporaryFiles.push(cacheFile);
+    const verifier = new RankingVerifier();
+    await select("problem", [
+      { name: "a", trace: "trace a" },
+      { name: "b", trace: "trace b" },
+    ], {
+      ...SELF_VERIFICATION_DEFAULTS,
+      criteria: CODING_AGENT_CRITERIA,
+      client: verifier,
+      cacheFile,
+      progress: false,
+    });
+    const persisted = loadCache(cacheFile);
+    expect(Object.keys(persisted).length).toBeGreaterThan(0);
+    for (const entry of Object.values(persisted)) {
+      expect(entry.source_A).toBe("logprobs");
+      expect(entry.source_B).toBe("logprobs");
+    }
   });
 
   test("marks literal score fallback outside the paper-equivalent metric", async () => {
@@ -888,12 +1093,12 @@ describe("automatic request-level provider", () => {
 
     expect(degraded[0]).toMatchObject({
       reason: "non_probabilistic_scores",
-      scoreSources: { logprobs: 0, textFallback: 48, neutralTie: 0, unknown: 0 },
+      scoreSources: { logprobs: 0, textFallback: 10, neutralTie: 0, unknown: 0 },
     });
     expect(decisions[0]).toMatchObject({
       path: "verifier",
       paperEquivalent: false,
-      scoreSources: { logprobs: 0, textFallback: 48, neutralTie: 0, unknown: 0 },
+      scoreSources: { logprobs: 0, textFallback: 10, neutralTie: 0, unknown: 0 },
     });
   });
 
@@ -927,8 +1132,11 @@ describe("automatic request-level provider", () => {
     expect(result.responseId).toBe("response-2");
     expect(degraded).toEqual([{
       reason: "insufficient_candidates",
+      granularity: "request_action",
       candidateCount: 3,
       successfulCandidates: 1,
+      toolUseCandidates: 0,
+      terminalCandidates: 1,
       nonterminalCandidates: 0,
     }]);
   });
@@ -1027,6 +1235,36 @@ describe("automatic request-level provider", () => {
     ];
     expect(positions.every((position) => position >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((a, b) => a - b));
+  });
+
+  test("backfills prior conversation context for request/action verification", () => {
+    const priorAssistant = message(0);
+    priorAssistant.content = [{ type: "text", text: "Earlier repository finding." }];
+    const history: Context = {
+      ...context(),
+      messages: [
+        { role: "user", content: "Keep Java 8 compatibility.", timestamp: 1 },
+        priorAssistant,
+        { role: "user", content: "Implement the current fix.", timestamp: 2 },
+        {
+          role: "toolResult",
+          toolCallId: "current",
+          toolName: "bash",
+          content: [{ type: "text", text: "Current test output." }],
+          isError: false,
+          timestamp: 3,
+        },
+      ],
+    };
+
+    const serialized = serializeContext(history);
+    expect(serialized).toContain("Keep Java 8 compatibility.");
+    expect(serialized).toContain("Earlier repository finding.");
+    expect(serialized).toContain("Implement the current fix.");
+    expect(serialized.indexOf("Keep Java 8 compatibility."))
+      .toBeLessThan(serialized.indexOf("Implement the current fix."));
+    expect(serialized.indexOf("Implement the current fix."))
+      .toBeLessThan(serialized.indexOf("Current test output."));
   });
 
   test("forwards user task images through every PPT verifier comparison", async () => {
@@ -1693,7 +1931,7 @@ describe("cache and fixed self-verification defaults", () => {
       baseUrl: "https://example.test/v1",
       requestIdentity: "identity",
       groundTruthNote: CODING_AGENT_GROUND_TRUTH_NOTE,
-      promptVersion: "pairwise-granularity20-v4",
+      promptVersion: "pairwise-granularity20-v5",
     };
     const key = cacheKey("criterion", "task", 0, 1, 0, base);
     expect(cacheKey("criterion", "task", 0, 1, 0, { ...base, effort: "high" })).not.toBe(key);
@@ -1770,8 +2008,10 @@ describe("documentation and plugin surface", () => {
       min: 2,
       max: 8,
       step: 1,
-      description: "每次普通请求生成的候选数量（2-8，默认 3）",
+      description: "每次模型动作请求并行生成的候选数量（2-8，默认 3）",
     });
+    expect(manifest.omp.settings.nEvaluations.default).toBe(1);
+    expect(manifest.omp.settings.pivots.default).toBe(2);
     expect(readme).not.toContain("/verify");
     expect(readme).not.toContain("verifier_select");
   });
@@ -1780,12 +2020,41 @@ describe("documentation and plugin surface", () => {
     expect(resolvePluginSettings({ enabled: true, candidateCount: 5 })).toEqual({
       enabled: true,
       candidateCount: 5,
+      nEvaluations: 1,
+      pivots: 2,
+      verifierModel: undefined,
     });
     expect(resolvePluginSettings({ enabled: false, candidateCount: 99 })).toEqual({
       enabled: false,
       candidateCount: AUTO_CANDIDATE_COUNT,
+      nEvaluations: 1,
+      pivots: 2,
+      verifierModel: undefined,
     });
     expect(normalizeCandidateCount("4")).toBe(4);
+  });
+
+  test("normalizes the evaluator K and pivots settings with TurboAgent online defaults", () => {
+    const quality = resolvePluginSettings({ nEvaluations: "8", pivots: 3 });
+    expect(quality.nEvaluations).toBe(8);
+    expect(quality.pivots).toBe(3);
+    expect(AUTO_SELECTION_DEFAULTS).toEqual({
+      pivots: 2,
+      nEvaluations: 1,
+      seed: 0,
+      maxWorkers: 8,
+    });
+    expect(resolvePluginSettings({ nEvaluations: 0 }).nEvaluations).toBe(1);
+    expect(resolvePluginSettings({ nEvaluations: 99 }).nEvaluations).toBe(1);
+    expect(resolvePluginSettings({ pivots: 0 }).pivots).toBe(2);
+    expect(resolvePluginSettings({ pivots: 99 }).pivots).toBe(2);
+    expect(resolvePluginSettings({}).nEvaluations).toBe(1);
+    expect(resolvePluginSettings({}).pivots).toBe(2);
+    // String coercion matches the normalizers used by the settings layer.
+    expect(normalizeEvaluations(undefined)).toBe(1);
+    expect(normalizePivots(undefined)).toBe(2);
+    expect(normalizeEvaluations("16")).toBe(16);
+    expect(normalizePivots("8")).toBe(8);
   });
 
   test("normalizes the verifierModel selector setting", () => {

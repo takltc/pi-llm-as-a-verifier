@@ -10,6 +10,7 @@ import {
   VerifierClient,
   USAGE,
   diffUsage,
+  isVerifierLogprobsUnsupportedError,
   type UsageSnapshot,
 } from "./client.ts";
 import {
@@ -54,6 +55,8 @@ export interface VerifyOptions {
   progress?: boolean;
   signal?: AbortSignal;
   client?: VerifierClient;
+  /** Internal plumbing shared across the ring and pivot phases. */
+  unsupportedBreaker?: UnsupportedBreaker;
 }
 
 export interface RunStats {
@@ -112,6 +115,28 @@ export const SELF_VERIFICATION_DEFAULTS = {
 
 export function defaultMaxWorkers(opts: VerifyOptions): number {
   return opts.maxWorkers ?? SELF_VERIFICATION_DEFAULTS.maxWorkers;
+}
+
+/**
+ * After this many distinct jobs confirm the verifier cannot return token
+ * logprobs for the shared request shape (identical scoring parameters across
+ * every job), remaining unstarted jobs become neutral ties without spending
+ * provider calls. Each confirming failure already exhausted the client's
+ * internal retries; the skipped jobs would produce the same tie.
+ */
+const UNSUPPORTED_SKIP_THRESHOLD = 2;
+
+/** Shared no-logprobs circuit breaker: turns unstarted jobs into neutral ties
+ *  once the verifier confirms it cannot return token logprobs. Lives across
+ *  the ring and pivot phases of one selection so a second phase does not burn
+ *  fresh calls on a capability the first phase already established. */
+export interface UnsupportedBreaker {
+  failures: number;
+  skip: boolean;
+}
+
+export function createUnsupportedBreaker(): UnsupportedBreaker {
+  return { failures: 0, skip: false };
 }
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {
@@ -321,6 +346,8 @@ export async function scoreDirectedPairs(
     progress?: boolean;
     signal?: AbortSignal;
     initialCache?: ScoreCache;
+    /** Shared across the ring and pivot phases of one selection. */
+    unsupportedBreaker?: UnsupportedBreaker;
   } = {},
 ): Promise<ScoreCache> {
   validateTasks(tasks);
@@ -426,6 +453,7 @@ export async function scoreDirectedPairs(
   let errors = 0;
   let completed = 0;
   let firstError: unknown;
+  const breaker = opts.unsupportedBreaker ?? createUnsupportedBreaker();
   const executionAbort = new AbortController();
   const externalAbort = opts.signal;
   const abortReason = (error?: unknown): unknown =>
@@ -489,6 +517,10 @@ export async function scoreDirectedPairs(
         abortExecution(firstError);
         throw error;
       }
+      if (isVerifierLogprobsUnsupportedError(error) && !breaker.skip) {
+        breaker.failures += 1;
+        if (breaker.failures >= UNSUPPORTED_SKIP_THRESHOLD) breaker.skip = true;
+      }
       errors += 1;
       results[job.key] = {
         score_A: 0.5,
@@ -539,12 +571,33 @@ export async function scoreDirectedPairs(
     if (phaseJobs.length === 0) return;
     let next = 0;
     const workers = Math.min(workersLimit, phaseJobs.length);
-    const checkpoint = Math.max(1, Math.floor(phaseJobs.length / 20));
+    // Persist at most ~5 checkpoints per phase (plus the final save in the
+    // outer finally). The previous every-job checkpoint turned the wrapper's
+    // 24 scoring jobs into 24 synchronous lock+fsync disk rewrites per final
+    // answer; coarser checkpoints keep crash resilience without the storm.
+    const checkpoint = Math.max(4, Math.floor(phaseJobs.length / 20));
     async function worker(): Promise<void> {
       while (true) {
         if (executionAbort.signal.aborted) return;
         const index = next++;
         if (index >= phaseJobs.length) return;
+        if (breaker.skip) {
+          // The verifier already confirmed it cannot return token logprobs for
+          // the shared request shape (every job sends identical scoring
+          // parameters). Turn this unstarted job into a neutral tie without a
+          // provider call; the tie stays in-memory and never reaches disk.
+          const job = phaseJobs[index]!;
+          if (!results[job.key]) {
+            results[job.key] = {
+              score_A: 0.5,
+              score_B: 0.5,
+              source_A: "neutral_tie",
+              source_B: "neutral_tie",
+            };
+            errors += 1;
+          }
+          continue;
+        }
         try {
           await scoreOne(phaseJobs[index]);
           completed += 1;
@@ -632,6 +685,7 @@ export async function runBenchmark(
   const rng = mulberry32(seed);
   const rings: Record<string, Array<[number, number]>> = {};
   for (const task of swing) rings[task] = ringCycle(tasks[task].length, rng);
+  const unsupportedBreaker = opts.unsupportedBreaker ?? createUnsupportedBreaker();
 
   log("Phase A: ring pass");
   let scores = await scoreDirectedPairs(
@@ -643,7 +697,7 @@ export async function runBenchmark(
     nReps,
     maxWorkers,
     opts.cacheFile,
-    opts,
+    { ...opts, unsupportedBreaker },
   );
 
   const directed = (scoreCache: ScoreCache, taskName: string, a: number, b: number): [number, number] =>
@@ -680,7 +734,7 @@ export async function runBenchmark(
     nReps,
     maxWorkers,
     opts.cacheFile,
-    { ...opts, initialCache: scores },
+    { ...opts, initialCache: scores, unsupportedBreaker },
   );
   // Phase B was seeded with the phase-A cache, so its result already carries
   // every ring score.

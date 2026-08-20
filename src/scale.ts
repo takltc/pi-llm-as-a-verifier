@@ -86,16 +86,16 @@ export interface VerifierReply {
  * differential random test in test/core.test.ts.
  */
 
-/** Unicode characters Python `str.rstrip()` treats as whitespace. */
-const PYTHON_RSTRIP_WHITESPACE =
-  /[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/;
-
-function isPythonWhitespaceOnly(value: string): boolean {
-  if (value.length === 0) return true;
-  for (const character of value) {
-    if (!PYTHON_RSTRIP_WHITESPACE.test(character)) return false;
-  }
-  return true;
+/** True for the code units Python `str.rstrip()` treats as whitespace (the
+ *  same set as the previous char-class regex, matched on code units so no
+ *  per-character RegExp is allocated during the linear scan). */
+function isPythonWhitespaceCode(unit: number): boolean {
+  return (unit >= 0x09 && unit <= 0x0d) ||
+    (unit >= 0x1c && unit <= 0x20) ||
+    unit === 0x85 || unit === 0xa0 || unit === 0x1680 ||
+    (unit >= 0x2000 && unit <= 0x200a) ||
+    unit === 0x2028 || unit === 0x2029 || unit === 0x202f ||
+    unit === 0x205f || unit === 0x3000;
 }
 
 type TagScan = Array<PositionLogprobs | undefined>;
@@ -114,22 +114,31 @@ function scanTagMatches(reply: VerifierReply, tags: string[]): TagScan {
   }
   const n = tokens.length;
 
-  // Cumulative char length after each token.
-  const cumLen = new Array<number>(n);
-  let len = 0;
-  for (let i = 0; i < n; i++) {
-    len += tokens[i]!.length;
-    cumLen[i] = len;
-  }
+  // Single pass over tokens. For every boundary we need the Python
+  // rstrip()-ed length of the accumulated text: the trailing-whitespace run
+  // is carried across tokens (a whitespace-only token extends the previous
+  // run, any other token resets it to its own trailing whitespace), so the
+  // trimmed length of every prefix is O(1) per token. This replaces a
+  // per-CHARACTER whitespace scan of the joined text (plus a full-length
+  // Int32Array) and accumulates the joined text in the same walk; selection
+  // semantics are identical to `_find_tag_logprobs`, verified by the
+  // differential random test in test/core.test.ts.
+  const trimmed = new Array<number>(n);
+  const allWsToken = new Uint8Array(n);
   const joined = tokens.join("");
-
-  // Whitespace run ending just before each joined-text boundary, so the
-  // trimmed length of any prefix is O(1): end - wsRun[end].
-  const wsRun = new Int32Array(joined.length + 1);
+  let len = 0;
   let run = 0;
-  for (let p = 0; p < joined.length; p++) {
-    run = PYTHON_RSTRIP_WHITESPACE.test(joined[p]!) ? run + 1 : 0;
-    wsRun[p + 1] = run;
+  for (let i = 0; i < n; i++) {
+    const tok = tokens[i]!;
+    let trailing = 0;
+    for (let t = tok.length - 1; t >= 0 && isPythonWhitespaceCode(tok.charCodeAt(t)); t--) {
+      trailing += 1;
+    }
+    const allWs = trailing === tok.length;
+    allWsToken[i] = allWs ? 1 : 0;
+    len += tok.length;
+    run = allWs ? run + tok.length : trailing;
+    trimmed[i] = len - run;
   }
 
   const fused = tags.map((tag) => tag.slice(0, -1));
@@ -143,16 +152,15 @@ function scanTagMatches(reply: VerifierReply, tags: string[]): TagScan {
     // Latest reference behavior: a whitespace-only token leaves rstrip() at
     // the same tag boundary and must not shadow the distribution captured at
     // the preceding position.
-    if (isPythonWhitespaceOnly(tokens[i]!)) continue;
-    const end = cumLen[i]!;
-    const trimmed = end - wsRun[end]!;
+    if (allWsToken[i]) continue;
+    const end = trimmed[i]!;
     for (let t = 0; t < tags.length; t++) {
       const el = exactLens[t]!;
-      if (trimmed >= el && joined.slice(trimmed - el, trimmed) === tags[t]) {
+      if (end >= el && joined.slice(end - el, end) === tags[t]) {
         lastExact[t] = i;
       }
       const fl = fusedLens[t]!;
-      if (trimmed >= fl && joined.slice(trimmed - fl, trimmed) === fused[t]) {
+      if (end >= fl && joined.slice(end - fl, end) === fused[t]) {
         lastFused[t] = i;
       }
     }

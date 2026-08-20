@@ -1,4 +1,4 @@
-/** OMP extension entry point for request-level LLM-as-a-Verifier. */
+/** OMP extension entry point for request/action-level LLM-as-a-Verifier. */
 
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getPluginSettings } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/loader";
@@ -8,8 +8,11 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import {
   AUTO_CANDIDATE_COUNT,
+  AUTO_SELECTION_DEFAULTS,
   createWrappedProvider,
   normalizeCandidateCount,
+  normalizeEvaluations,
+  normalizePivots,
 } from "./auto.ts";
 import {
   createVerifierClient,
@@ -27,6 +30,10 @@ const MODEL_REBIND_INTERVAL_MS = 500;
 export interface VerifierPluginSettings {
   enabled: boolean;
   candidateCount: number;
+  /** Repeated verifications per criterion (paper §4.2); online default K=1. */
+  nEvaluations: number;
+  /** PPT pivot count k (paper §3.2); TurboAgent online default k=2. */
+  pivots: number;
   /** OMP model selector for the verifier (e.g. "deepseek/deepseek-v4-flash:high"); empty follows the session default model. */
   verifierModel?: string;
 }
@@ -60,6 +67,8 @@ export default function verifierExtension(pi: ExtensionAPI): void {
     probeVerifier: (client) => client.probeLogprobs(),
   });
   let sessionEnabled = false;
+  let nEvaluations: number = AUTO_SELECTION_DEFAULTS.nEvaluations;
+  let pivots: number = AUTO_SELECTION_DEFAULTS.pivots;
   let candidateCount = AUTO_CANDIDATE_COUNT;
   let verifierModel: string | undefined;
   let lastRebindError = "";
@@ -79,11 +88,13 @@ export default function verifierExtension(pi: ExtensionAPI): void {
       const pluginSettings = resolvePluginSettings(settings);
       sessionEnabled = pluginSettings.enabled || pi.getFlag("llm-verifier") === true;
       candidateCount = pluginSettings.candidateCount;
+      nEvaluations = pluginSettings.nEvaluations;
+      pivots = pluginSettings.pivots;
       verifierModel = pluginSettings.verifierModel;
       if (!sessionEnabled) return;
       ctx.setInterval(() => {
         if (!sessionEnabled || !ctx.isIdle()) return;
-        void ensureAutomaticVerification(pi, ctx, runtime, candidateCount, verifierModel)
+        void ensureAutomaticVerification(pi, ctx, runtime, candidateCount, verifierModel, nEvaluations, pivots)
           .then(() => {
             lastRebindError = "";
             lastRebindErrorAt = 0;
@@ -103,8 +114,8 @@ export default function verifierExtension(pi: ExtensionAPI): void {
             notifyWarning(ctx, error);
           });
       }, MODEL_REBIND_INTERVAL_MS);
-      await ensureAutomaticVerification(pi, ctx, runtime, candidateCount, verifierModel);
-      ctx.ui.notify("LLM-as-a-Verifier enabled: ordinary requests now generate candidates and replay the verified winner.", "info");
+      await ensureAutomaticVerification(pi, ctx, runtime, candidateCount, verifierModel, nEvaluations, pivots);
+      ctx.ui.notify("LLM-as-a-Verifier enabled: every model action now generates candidates and replays the selected winner.", "info");
     } catch (error) {
       notifyWarning(ctx, error);
     }
@@ -117,7 +128,7 @@ export default function verifierExtension(pi: ExtensionAPI): void {
     if (!sessionEnabled) return;
     const previousSourceKey = runtime.activeSourceKey;
     try {
-      const binding = await ensureAutomaticVerification(pi, ctx, runtime, candidateCount, verifierModel);
+      const binding = await ensureAutomaticVerification(pi, ctx, runtime, candidateCount, verifierModel, nEvaluations, pivots);
       if (previousSourceKey && previousSourceKey !== binding.sourceKey) {
         ctx.ui.notify("LLM-as-a-Verifier followed the OMP default model switch and rebound successfully.", "info");
       }
@@ -144,6 +155,8 @@ export async function ensureAutomaticVerification(
   runtime: AutomaticVerificationRuntime,
   candidateCount = AUTO_CANDIDATE_COUNT,
   verifierSelector?: string,
+  nEvaluations: number = AUTO_SELECTION_DEFAULTS.nEvaluations,
+  pivots: number = AUTO_SELECTION_DEFAULTS.pivots,
 ): Promise<VerificationBinding> {
   while (true) {
     const originalModel = resolveSourceModel(ctx, runtime);
@@ -211,6 +224,8 @@ export async function ensureAutomaticVerification(
             candidateCount,
             runtime.probeVerifier,
             verifierSelector,
+            nEvaluations,
+            pivots,
           );
         } catch (error) {
           if (isVerifierLogprobsUnsupportedError(error)) {
@@ -280,6 +295,8 @@ async function createVerificationBinding(
   candidateCount: number,
   probeVerifier?: (client: VerifierClient, model: Model) => Promise<void>,
   verifierSelector?: string,
+  nEvaluations: number = AUTO_SELECTION_DEFAULTS.nEvaluations,
+  pivots: number = AUTO_SELECTION_DEFAULTS.pivots,
 ): Promise<VerificationBinding> {
   const registry = ctx.modelRegistry as ExtensionContext["modelRegistry"] & {
     getProviderHeaders?: (provider: string) => Record<string, string> | undefined;
@@ -339,7 +356,7 @@ async function createVerificationBinding(
           }));
         },
       },
-      { candidateCount },
+      { candidateCount, nEvaluations, pivots },
     ),
     models: [{
       id: modelId,
@@ -378,6 +395,8 @@ export function resolvePluginSettings(
   return {
     enabled: settings.enabled === true,
     candidateCount: normalizeCandidateCount(settings.candidateCount),
+    nEvaluations: normalizeEvaluations(settings.nEvaluations),
+    pivots: normalizePivots(settings.pivots),
     verifierModel:
       typeof settings.verifierModel === "string" && settings.verifierModel.trim()
         ? settings.verifierModel.trim()

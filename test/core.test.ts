@@ -10,8 +10,15 @@ import {
   type VerifierReply,
 } from "../src/scale.ts";
 import { accumulate, bradleyTerry, pivotRoundPairs, ringCycle, selectBest, selectPivots } from "../src/ppt.ts";
-import { cacheKey, directedReward, type ScoreCache } from "../src/cache.ts";
-import { mulberry32 } from "../src/run.ts";
+import {
+  CACHE_VERSION,
+  cacheKey,
+  directedReward,
+  type CacheContext,
+  type ScoreCache,
+} from "../src/cache.ts";
+import { mulberry32, scoreDirectedPairs } from "../src/run.ts";
+import type { VerifierClient } from "../src/client.ts";
 
 
 /**
@@ -494,5 +501,128 @@ describe("classify", () => {
       allPass: ["all_pass"],
       swing: ["swing"],
     });
+  });
+});
+
+describe("theory-gate cache identity and aggregation invariants", () => {
+  function baseContext(): CacheContext {
+    return {
+      criterionId: "c1",
+      criterionName: "C1",
+      criterionDescription: "desc",
+      problem: "p",
+      traceA: "ta",
+      traceB: "tb",
+      imagesFingerprint: "",
+      trajectoryImagesAFingerprint: "",
+      trajectoryImagesBFingerprint: "",
+      provider: "prov",
+      api: "openai-completions",
+      model: "m",
+      effort: "high",
+      maxTokens: 32768,
+      baseUrl: "https://example.test/v1",
+      requestIdentity: "id",
+      groundTruthNote: "note",
+      promptVersion: "pairwise-granularity20-v5",
+    };
+  }
+
+  test("directed (a,b) and (b,a) comparisons are distinct cache identities", () => {
+    const context = baseContext();
+    const ab = cacheKey("c1", "task", 0, 1, 0, context);
+    const ba = cacheKey("c1", "task", 1, 0, 0, context);
+    expect(ab).not.toBe(ba);
+    // Slot swap: the same directed pair with A/B traces exchanged is a
+    // different prompt and therefore a different key.
+    expect(ab).not.toBe(
+      cacheKey("c1", "task", 0, 1, 0, { ...context, traceA: "tb", traceB: "ta" }),
+    );
+  });
+
+  test("repetitions keep distinct cache keys so K observations never collapse", () => {
+    const context = baseContext();
+    const rep0 = cacheKey("c1", "task", 0, 1, 0, context);
+    const rep1 = cacheKey("c1", "task", 0, 1, 1, context);
+    expect(rep0).not.toBe(rep1);
+  });
+
+  test("cache keys embed CACHE_VERSION so a version bump invalidates old scores", () => {
+    const key = cacheKey("c1", "task", 0, 1, 0, baseContext());
+    expect(key.startsWith(`v${CACHE_VERSION}|`)).toBe(true);
+  });
+
+  test("criteria aggregation is order-invariant and equal-weight", () => {
+    const scores: ScoreCache = {
+      [cacheKey("c1", "task", 0, 1, 0)]: { score_A: 1, score_B: 0 },
+      [cacheKey("c1", "task", 0, 1, 1)]: { score_A: 0.5, score_B: 0.5 },
+      [cacheKey("c2", "task", 0, 1, 0)]: { score_A: 0, score_B: 1 },
+      [cacheKey("c2", "task", 0, 1, 1)]: { score_A: 1, score_B: 0 },
+    };
+    const [ra, rb] = directedReward(scores, "task", 0, 1, ["c1", "c2"], 2);
+    const [raSwapped, rbSwapped] = directedReward(scores, "task", 0, 1, ["c2", "c1"], 2);
+    expect([ra, rb]).toEqual([raSwapped, rbSwapped]);
+    // Each criterion contributes exactly 1/(C*K) weight.
+    expect(ra).toBeCloseTo((1 + 0.5 + 0 + 1) / 4, 10);
+    expect(rb).toBeCloseTo((0 + 0.5 + 1 + 0) / 4, 10);
+  });
+
+  test("K repetitions alternate A/B slots and scores stay bound to candidate identity", async () => {
+    const captured: string[] = [];
+    const client = {
+      provider: "prov",
+      api: "openai-completions",
+      model: "m",
+      effort: "off",
+      maxTokens: 4096,
+      baseUrl: "https://example.test/v1",
+      requestIdentity: "id",
+      supportsImages: true,
+      scoreReply: async (prompt: string) => {
+        captured.push(prompt);
+        const slotAIsTrailA = prompt.includes("**Trajectory A:**\ntrace a");
+        const scoreA = slotAIsTrailA ? "A" : "T";
+        const scoreB = slotAIsTrailA ? "T" : "A";
+        return {
+          text: `<score_A> ${scoreA} </score_A>\n<score_B> ${scoreB} </score_B>`,
+          tokens: ["<score_A>", ` ${scoreA}`, " </score_A>\n<score_B>", ` ${scoreB}`, " </score_B>"],
+          positionLogprobs: [
+            [["<score_A>", 0]],
+            [[scoreA, 0]],
+            [[" </score_A>\n<score_B>", 0]],
+            [[scoreB, 0]],
+            [[" </score_B>", 0]],
+          ],
+        };
+      },
+    } as unknown as VerifierClient;
+    const tasks = {
+      task: [
+        { trialName: "a", reward: 0 as const, problem: "p", trace: "trace a" },
+        { trialName: "b", reward: 1 as const, problem: "p", trace: "trace b" },
+      ],
+    };
+    const scores = await scoreDirectedPairs(
+      client,
+      tasks,
+      { task: [[0, 1]] },
+      [{ id: "c1", name: "C1", description: "desc" }],
+      "note",
+      2,
+      1,
+      undefined,
+      { progress: false },
+    );
+    // rep 0 puts (a,b) in the prompt; rep 1 swaps the slots.
+    expect(captured).toHaveLength(2);
+    expect(captured[0]!).toContain("**Trajectory A:**\ntrace a");
+    expect(captured[0]!).toContain("**Trajectory B:**\ntrace b");
+    expect(captured[1]!).toContain("**Trajectory A:**\ntrace b");
+    expect(captured[1]!).toContain("**Trajectory B:**\ntrace a");
+    // After mapping back to candidate identity, score_A is always candidate a.
+    for (const entry of Object.values(scores)) {
+      expect(entry.score_A).toBe(1);
+      expect(entry.score_B).toBe(0);
+    }
   });
 });

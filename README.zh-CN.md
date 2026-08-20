@@ -4,8 +4,9 @@
 
 - [LLM-as-a-Verifier: A General-Purpose Verification Framework](https://arxiv.org/abs/2607.05391)
 - [Self-Verification / Terminal-Bench 2.1 参考实现](https://github.com/llm-as-a-verifier/llm-as-a-verifier#self-verification-terminal-bench-21)
+- [面向 coding agent 的 TurboAgent 扩展](https://github.com/llm-as-a-verifier/TurboAgent/tree/eeb61be9cb618ea9c52262cebf15092e7c185146)
 
-插件采用论文的 20 级 token logprob 评分和 Probabilistic Pivot Tournament。每个 OMP 终局回答默认扩展为 3 个完整候选，使用已配置的验证器模型评分（留空时采用会话默认模型），并回放胜出响应的文本、推理、图片和终止状态。工具调用轮次直接延续当前轨迹。
+插件在 TurboAgent 的 request/action 边界应用论文的 20 级 token logprob 评分和 Probabilistic Pivot Tournament。每次 OMP 模型请求并行生成 `candidateCount` 个候选动作，范围为 2–8、默认值为 3；精确动作多数决可以直接选出结果，其余候选统一进入 PPT，工具调用与终态回复都参与选择。OMP 只接收一个胜出响应，因此 agent loop 只会执行胜出的工具动作。
 
 版本化来源、形式化不变量、产品边界和防漂移门禁记录在 [docs/theory-baseline.md](docs/theory-baseline.md)。
 
@@ -28,6 +29,17 @@ omp plugin config set omp-llm-verifier verifierModel deepseek/deepseek-v4-flash
 
 `verifierModel` 留空时使用会话默认模型做自我验证。kimi-code（Kimi for Coding）会拒绝 logprobs 请求，会话模型是 kimi-code 时必须配置 `verifierModel`。
 
+在线动作配置对齐 TurboAgent（`K=1`、`pivots=2`、一个 Task Success 准则）。TurboAgent 参考配置的 N 为 3；本插件通过 `candidateCount` 暴露 2–8 的 N 范围。论文的质量/成本轴仍可配置：
+
+```bash
+# 每个准则的独立重复验证次数（论文 §4.2）：在线默认 K=1，论文主实验常用 K=8
+omp plugin config set omp-llm-verifier nEvaluations 8
+# PPT 聚合器的 pivot 数量 k（论文 §3.2）；TurboAgent 在线默认 2
+omp plugin config set omp-llm-verifier pivots 2
+```
+
+`nEvaluations` 取值 1-16、`pivots` 取值 1-8，均为整数质量/成本参数，新会话生效。
+
 仅关闭自动验证并保留插件安装状态：
 
 ```bash
@@ -45,19 +57,22 @@ omp plugin enable omp-llm-verifier
 
 已验证的比较结果会缓存在项目根目录的 `.omp-llm-verifier-cache.json`，缓存键覆盖任务、有序共享图片、候选专属图片、两个候选轨迹、评分标准、模型和 prompt 版本的内容指纹，因此相同内容的重复验证不消耗验证器 token。该文件可以直接删除，建议加入 gitignore。
 
-每个被验证的回答都是可观测的：OMP 控制台上，包装器会针对每个最终答案输出一行
-`event:decision` JSON，包含 `path`（获胜者如何被选出——`verifier` 表示走了论文的
-PPT 锦标赛，`fallback` 表示验证未能执行，`aborted` 与 `error` 表示终止状态）、
+每个被选择的动作都是可观测的：OMP 控制台会针对每次模型请求输出一行
+`event:decision` JSON，包含 `granularity=request_action` 与 `path`（`majority`
+表示 TurboAgent 的精确动作多数决，`verifier` 表示论文 PPT，`fallback` 表示可恢复
+降级，`aborted` 与 `error` 表示终止状态）、
 获胜候选的索引与平均得分、有向比较次数、参与打分的验证器模型与 prompt
 契约版本，以及本次请求的验证器 token 用量。`scoreSources` 分别统计 logprob
 期望、文本字母回退、运行期中性平局和旧版/未知缓存项；全部评分标签均来自 token
 logprobs 时，`paperEquivalent` 为 `true`。`scoreDistribution` 记录这些标签的有效
 A–T 支持数与返回概率质量的最小值和平均值。
-扩展程序也可以通过包装 provider 状态上的 `onDecision` 回调读取同样的数据。
+决策还包含 `toolUseCandidates`、`terminalCandidates` 与胜出 stop reason。扩展程序
+也可以通过包装 provider 状态上的 `onDecision` 回调读取同样的数据。
 
-终态选择只要拥有至少两个成功的终态候选，就会执行论文的 PPT 路径，候选文本重复时
-同样执行。工具调用轮次会直接延续当前智能体轨迹；替代采样提出的新工具动作保持在
-终态锦标赛之外，并通过 `nonterminalCandidates` 记录。
+并行候选共享调用方的完整上下文、工具定义、session ID、prompt-cache key 与 provider
+session state，使大段编码上下文保持相同前缀并提高缓存亲和性。插件会在 fan-out 前拒绝
+可能在生成期间直接执行副作用的 provider-native `execHandlers`；声明式工具调用完整参与
+选择，胜出调用才会回放到 agent loop。
 
 ## 本地开发
 

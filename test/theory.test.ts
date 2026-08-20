@@ -10,10 +10,15 @@
 import { describe, expect, test } from "bun:test";
 import { AUTO_SELECTION_DEFAULTS } from "../src/auto.ts";
 import type { VerifierClient } from "../src/client.ts";
-import { buildPrompt, CODING_AGENT_CRITERIA } from "../src/prompt.ts";
+import {
+  buildPrompt,
+  CODING_AGENT_ACTION_CRITERIA,
+  CODING_AGENT_ACTION_GROUND_TRUTH_NOTE,
+  CODING_AGENT_CRITERIA,
+} from "../src/prompt.ts";
 import { GRANULARITY, SCALE } from "../src/scale.ts";
 import { select } from "../src/select.ts";
-import { runBenchmark, validateVerifyOptions } from "../src/run.ts";
+import { runBenchmark, SELF_VERIFICATION_DEFAULTS, validateVerifyOptions } from "../src/run.ts";
 
 /**
  * Verbatim scale text from `_ref/llm_verifier/fine_grained_reward.py`
@@ -105,9 +110,21 @@ describe("paper theory anchors", () => {
     expect(actual).toBe(expected);
   });
 
-  test("wrapper best-of-3 config follows the formal Algorithm 1 edge set", async () => {
-    // Paper self-verification defaults (scripts/run_bo3.py): pivots=1, K=2.
-    expect(AUTO_SELECTION_DEFAULTS).toEqual({ pivots: 1, nEvaluations: 2, seed: 0, maxWorkers: 8 });
+  test("online action profile matches TurboAgent and the formal Algorithm 1 edge set", async () => {
+    expect(AUTO_SELECTION_DEFAULTS).toEqual({ pivots: 2, nEvaluations: 1, seed: 0, maxWorkers: 8 });
+    expect(CODING_AGENT_ACTION_GROUND_TRUTH_NOTE).toBe(
+      "There is no reference solution available. Judge each trajectory purely on " +
+        "how plausibly it solved the task correctly.",
+    );
+    expect(CODING_AGENT_ACTION_CRITERIA).toEqual([{
+      id: "task_success",
+      name: "Task Success",
+      description:
+        "How likely the agent correctly and completely solved the task. The " +
+        "strongest signal is the agent verifying its solution against the task's " +
+        "specific requirements. Trajectory length, number of steps, and apparent " +
+        "confidence do not predict correctness.",
+    }]);
     let calls = 0;
     const client = {
       scoreReply: async () => {
@@ -131,32 +148,30 @@ describe("paper theory anchors", () => {
       { name: "c", trace: "trace c" },
     ], {
       ...AUTO_SELECTION_DEFAULTS,
-      criteria: CODING_AGENT_CRITERIA,
+      criteria: CODING_AGENT_ACTION_CRITERIA,
+      groundTruthNote: CODING_AGENT_ACTION_GROUND_TRUTH_NOTE,
       client,
-      taskName: "current_request",
+      taskName: "current_action",
       progress: false,
     });
-    // For N=3, k=1, the pivot has one incoming ring edge. Algorithm 1 removes
-    // that overlap: 3 ring comparisons + 1 new pivot comparison = 4.
+    // N=3, k=2 still removes directed overlap from Algorithm 1's upper bound.
     expect(result.nComparisons).toBe(4);
-    // One verifier call per unique directed comparison, criterion and repeat.
-    expect(calls).toBe(4 * 3 * 2);
+    expect(calls).toBe(4);
     expect(result.paperEquivalent).toBe(true);
     expect(result.scoreSources).toEqual({
-      logprobs: 4 * 3 * 2 * 2,
+      logprobs: 4 * 2,
       textFallback: 0,
       neutralTie: 0,
       unknown: 0,
     });
     expect(result.scoreDistribution).toEqual({
-      logprobScores: 4 * 3 * 2 * 2,
+      logprobScores: 4 * 2,
       minSupport: 1,
       meanSupport: 1,
       minProbabilityMass: 1,
       meanProbabilityMass: 1,
     });
-    // Every candidate is scored three times (in each PPT comparison round),
-    // so exactly one candidate wins and the rest trail on mean preference.
+    // PPT returns one mean preference per candidate.
     expect(result.scores).toHaveLength(3);
   });
 
@@ -183,7 +198,7 @@ describe("paper theory anchors", () => {
       { trialName: "b", reward: 1, problem: "problem", trace: "trace b" },
       { trialName: "c", reward: 0, problem: "problem", trace: "trace c" },
     ] }, CODING_AGENT_CRITERIA, {
-      ...AUTO_SELECTION_DEFAULTS,
+      ...SELF_VERIFICATION_DEFAULTS,
       client,
       progress: false,
     });

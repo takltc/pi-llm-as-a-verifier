@@ -4,8 +4,9 @@
 
 - [LLM-as-a-Verifier: A General-Purpose Verification Framework](https://arxiv.org/abs/2607.05391)
 - [Self-Verification / Terminal-Bench 2.1 reference implementation](https://github.com/llm-as-a-verifier/llm-as-a-verifier#self-verification-terminal-bench-21)
+- [TurboAgent coding-agent extension](https://github.com/llm-as-a-verifier/TurboAgent/tree/eeb61be9cb618ea9c52262cebf15092e7c185146)
 
-The plugin applies the paper's 20-level token-logprob scoring and Probabilistic Pivot Tournament. Each terminal OMP answer expands to three complete candidates by default, scores them with the configured verifier model (the session default when unset), and replays the winning response with its text, reasoning, images, and stop state. Tool-use turns continue the active trajectory directly.
+The plugin applies the paper's 20-level token-logprob scoring and Probabilistic Pivot Tournament at TurboAgent's request/action boundary. Every OMP model request generates `candidateCount` actions concurrently (2–8, default 3). Exact action majority can select immediately; otherwise PPT scores all successful candidates, including tool calls and terminal responses. OMP receives one winning response, so only the winning tool action reaches the agent loop for execution.
 
 The versioned sources, formal invariants, product boundaries, and drift gates live in [docs/theory-baseline.md](docs/theory-baseline.md).
 
@@ -30,6 +31,21 @@ omp plugin config set omp-llm-verifier verifierModel deepseek/deepseek-v4-flash
 
 Leave `verifierModel` empty to verify with the session default model (self-verification). kimi-code (Kimi for Coding) rejects logprobs requests, so with kimi-code as the session model a `verifierModel` override is required.
 
+The online action profile follows TurboAgent (`K=1`, `pivots=2`, one Task
+Success criterion). TurboAgent's reference N is 3; this plugin exposes N as
+`candidateCount` with a 2–8 range. The paper's quality/cost axes remain configurable:
+
+```bash
+# Independent repeated verifications per criterion (paper §4.2): the paper's
+# main experiments use K=8; the online default is K=1 for latency.
+omp plugin config set omp-llm-verifier nEvaluations 8
+# PPT pivot count k (paper §3.2); TurboAgent's online default is 2.
+omp plugin config set omp-llm-verifier pivots 2
+```
+
+`nEvaluations` accepts 1-16 and `pivots` accepts 1-8; both are integer
+quality/cost knobs and take effect in a new OMP session.
+
 Disable automatic verification while keeping the plugin installed:
 
 ```bash
@@ -47,10 +63,11 @@ The verifier model must expose OpenAI Chat Completions or Responses token logpro
 
 Verified comparisons are cached on disk at `.omp-llm-verifier-cache.json` in the project root, keyed by a fingerprint of the task, ordered shared and candidate-specific images, both candidate traces, criteria, model, and prompt version, so repeat verifications of identical content cost no verifier tokens. The file is safe to delete and worth git-ignoring.
 
-Every verified answer is observable: on the OMP console the wrapper logs one
-`event:decision` JSON line per final answer with `path` (how the winner was
-chosen — `verifier` for the paper's PPT tournament, `fallback` when verification
-could not run, plus `aborted` and `error` terminal states), the
+Every selected action is observable: on the OMP console the wrapper logs one
+`event:decision` JSON line per model request with `granularity=request_action`
+and `path` (`majority` for TurboAgent's exact-action shortcut, `verifier` for
+PPT, `fallback` for a recoverable degraded selection, plus `aborted` and
+`error` terminal states), the
 winner's candidate index and mean score, the directed-comparison count, the
 verifier model and prompt contract that scored it, and the verifier token
 usage for that request. `scoreSources` separately counts logprob expectations,
@@ -58,14 +75,16 @@ literal-text fallbacks, runtime neutral ties, and legacy/unknown cache entries;
 `paperEquivalent` is true only when every score tag came from token logprobs.
 `scoreDistribution` reports the minimum and mean valid A–T support and returned
 probability mass for those logprob-backed tags.
-The same data is exposed to extensions through the
+The decision also reports `toolUseCandidates`, `terminalCandidates`, and the
+winning stop reason. The same data is exposed to extensions through the
 `onDecision` callback on the wrapped provider state.
 
-Every terminal selection with at least two successful terminal candidates runs
-the paper's PPT path, including cases where several candidate texts are identical.
-Tool-use turns continue the active agent trajectory directly. Alternative samples
-that propose another tool action remain outside the terminal-answer tournament and
-are reported through `nonterminalCandidates`.
+Candidate generation preserves the caller's full context, tools, session ID,
+prompt-cache key, and provider session state across all parallel samples. This
+keeps the large coding-context prefix identical and maximizes provider cache
+affinity. Provider-native `execHandlers` are rejected before fan-out because
+they can execute side effects during generation; declarative tool calls remain
+fully supported and only the selected call is replayed.
 
 ## Local development
 

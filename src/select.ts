@@ -16,6 +16,7 @@ import {
 } from "./cache.ts";
 import {
   contextResolver,
+  createUnsupportedBreaker,
   mulberry32,
   scoreDirectedPairs,
   summarizeScoredPairs,
@@ -118,7 +119,10 @@ export async function select(
   const usageBefore = USAGE.snapshot();
   const rng = mulberry32(seed);
   const ring = ringCycle(candidates.length, rng);
-
+  // A no-logprobs rejection is a property of the shared request shape, so the
+  // two phases share one breaker: a ring-pass confirmation skips the pivot
+  // round instead of spending fresh provider calls on the same capability.
+  const unsupportedBreaker = createUnsupportedBreaker();
   if (opts.progress !== false) console.log(`Phase A: ring pass (${ring.length} comparisons)`);
   let scores = await scoreDirectedPairs(
     client,
@@ -133,6 +137,7 @@ export async function select(
       onError: opts.onError,
       progress: opts.progress,
       signal: opts.signal,
+      unsupportedBreaker,
     },
   );
 
@@ -168,6 +173,7 @@ export async function select(
       progress: opts.progress,
       signal: opts.signal,
       initialCache: scores,
+      unsupportedBreaker,
     },
   );
   // Phase B was seeded with the phase-A cache, so its result already carries
