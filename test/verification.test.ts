@@ -19,7 +19,12 @@ import {
 } from "../src/index.ts";
 import { CODING_AGENT_CRITERIA, CODING_AGENT_GROUND_TRUTH_NOTE } from "../src/prompt.ts";
 import { SELF_VERIFICATION_DEFAULTS } from "../src/run.ts";
-import { VerifierClient, type VerifierConfig } from "../src/client.ts";
+import {
+  isVerifierLogprobsUnsupportedError,
+  VerifierClient,
+  VerifierLogprobsUnsupportedError,
+  type VerifierConfig,
+} from "../src/client.ts";
 import type { VerifierReply } from "../src/scale.ts";
 
 const temporaryFiles: string[] = [];
@@ -164,6 +169,70 @@ async function collect(stream: AssistantMessageEventStream) {
 }
 
 describe("automatic request-level provider", () => {
+  test("retries a transient 429 before parsing verifier logprobs", async () => {
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      if (attempts === 1) return new Response("busy", { status: 429, headers: { "retry-after": "0" } });
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { content: "A" },
+          finish_reason: "stop",
+          logprobs: { content: [{ token: "A", logprob: -0.1, top_logprobs: [{ token: "A", logprob: -0.1 }] }] },
+        }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    try {
+      const reply = await new VerifierClient(clientConfig()).scoreReply("Return A.");
+      expect(reply.positionLogprobs).toHaveLength(1);
+      expect(attempts).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("does not retry a non-transient verifier error", async () => {
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      return new Response("bad request", { status: 400 });
+    }) as unknown as typeof fetch;
+    try {
+      await expect(new VerifierClient(clientConfig()).scoreReply("Return A.")).rejects.toThrow("Verifier API 400");
+      expect(attempts).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("treats a persistente no-logprobs response as unsupported after retries", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      choices: [{
+        message: { content: "A" },
+        finish_reason: "stop",
+        logprobs: null,
+      }],
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })) as unknown as typeof fetch;
+    try {
+      let error: unknown;
+      try {
+        await new VerifierClient(clientConfig({ effort: "off" })).scoreReply("Return A.");
+      } catch (caught) {
+        error = caught;
+      }
+      expect(isVerifierLogprobsUnsupportedError(error)).toBe(true);
+      expect((error as Error).message).toContain("token logprobs");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("generates three candidates and replays the verified winner", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
     const verifier = new RankingVerifier();
@@ -371,6 +440,40 @@ describe("automatic request-level provider", () => {
 });
 
 describe("OMP default model inheritance", () => {
+  test("caches an unsupported-model capability warning for startup and later turns", async () => {
+    let activeModel: Model = model();
+    const configuredModel = activeModel;
+    const wrappers = new Map<string, Model>();
+    const fakePi = {
+      pi: { settings: { getModelRole: () => "opencode-go/deepseek-v4-flash-0731:high" } },
+      registerProvider: (provider: string) => {
+        wrappers.set(provider + "/default", { ...configuredModel, provider, id: "default" } as unknown as Model);
+      },
+      getThinkingLevel: () => "high",
+      setThinkingLevel: () => undefined,
+      setModel: async (next: Model) => { activeModel = next; return true; },
+    } as never;
+    const ctx = {
+      get model() { return activeModel; },
+      models: { resolve: (spec: string) => spec === "@default" ? configuredModel : wrappers.get(spec) },
+      modelRegistry: {
+        getApiKey: async () => "test-key",
+        resolver: () => () => "test-key",
+        getProviderHeaders: () => undefined,
+        refreshRuntimeProviders: async () => undefined,
+      },
+      sessionManager: { getSessionId: () => "unsupported-session" },
+    } as never;
+    const runtime = createAutomaticVerificationRuntime({
+      probeVerifier: async () => {
+        throw new VerifierLogprobsUnsupportedError("probe returned no token logprobs");
+      },
+    });
+    await expect(ensureAutomaticVerification(fakePi, ctx, runtime)).rejects.toThrow("opencode-go/deepseek-v4-flash-0731");
+    expect(runtime.capabilityErrors.size).toBe(1);
+    await expect(ensureAutomaticVerification(fakePi, ctx, runtime)).rejects.toThrow("token logprobs");
+  });
+
   test("uses modelRoles.default and preserves its explicit thinking selector", async () => {
     const defaultModel = {
       ...model(),
@@ -594,6 +697,8 @@ describe("documentation and plugin surface", () => {
     const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
     const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
     expect(readme).toContain("omp plugin install");
+    expect(readme).toContain("README.zh-CN.md");
+    expect(readFileSync(new URL("../README.zh-CN.md", import.meta.url), "utf8")).toContain("## OMP 安装与使用");
     expect(readme).toContain("omp plugin config set omp-llm-verifier enabled true");
     expect(readme).toContain("omp plugin config set omp-llm-verifier enabled false");
     expect(readme).toContain("omp plugin disable omp-llm-verifier");

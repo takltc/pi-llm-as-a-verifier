@@ -10,7 +10,13 @@ import {
   createWrappedProvider,
   normalizeCandidateCount,
 } from "./auto.ts";
-import { createVerifierClient } from "./client.ts";
+import {
+  createVerifierClient,
+  isVerifierSupportedApi,
+  isVerifierLogprobsUnsupportedError,
+  VerifierClient,
+  VerifierLogprobsUnsupportedError,
+} from "./client.ts";
 
 const PLUGIN_NAME = "omp-llm-verifier";
 const WRAPPER_KEY = "omp-llm-verifier-internal";
@@ -31,6 +37,8 @@ export interface VerificationBinding {
 
 export interface AutomaticVerificationRuntime {
   bindings: Map<string, VerificationBinding>;
+  capabilityErrors: Map<string, string>;
+  probeVerifier?: (client: VerifierClient, model: Model) => Promise<void>;
   activeSourceKey?: string;
   inFlight?: Promise<VerificationBinding>;
   inFlightSourceKey?: string;
@@ -41,15 +49,25 @@ export default function verifierExtension(pi: ExtensionAPI): void {
   pi.setLabel("LLM-as-a-Verifier");
   pi.registerFlag("llm-verifier", {
     type: "boolean",
-    description: "为当前 OMP 会话启用自动候选验证",
+    description: "Enable automatic candidate verification for the current OMP session",
     default: false,
   });
 
-  const runtime = createAutomaticVerificationRuntime();
+  const runtime = createAutomaticVerificationRuntime({
+    probeVerifier: (client) => client.probeLogprobs(),
+  });
   let sessionEnabled = false;
   let candidateCount = AUTO_CANDIDATE_COUNT;
   let lastRebindError = "";
   let lastRebindErrorAt = 0;
+  let lastUiWarning = "";
+  const notifyWarning = (ctx: ExtensionContext, error: unknown): void => {
+    const message = formatVerifierError(error, resolveSourceModel(ctx, runtime));
+    if (message === lastUiWarning) return;
+    lastUiWarning = message;
+    console.warn("Warning: " + message);
+    ctx.ui.notify(message, "warning");
+  };
 
   pi.on("session_start", async (_event, ctx) => {
     try {
@@ -64,6 +82,7 @@ export default function verifierExtension(pi: ExtensionAPI): void {
           .then(() => {
             lastRebindError = "";
             lastRebindErrorAt = 0;
+            lastUiWarning = "";
           })
           .catch((error) => {
             const message = error instanceof Error ? error.message : String(error);
@@ -76,13 +95,13 @@ export default function verifierExtension(pi: ExtensionAPI): void {
               event: "model_rebind_failed",
               error: message,
             }));
+            notifyWarning(ctx, error);
           });
       }, MODEL_REBIND_INTERVAL_MS);
       await ensureAutomaticVerification(pi, ctx, runtime, candidateCount);
-      ctx.ui.notify("LLM-as-a-Verifier 已启用：普通请求会自动生成候选并回放验证胜者。", "info");
+      ctx.ui.notify("LLM-as-a-Verifier enabled: ordinary requests now generate candidates and replay the verified winner.", "info");
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify("LLM-as-a-Verifier 暂不可用：" + message, "warning");
+      notifyWarning(ctx, error);
     }
   });
 
@@ -95,17 +114,23 @@ export default function verifierExtension(pi: ExtensionAPI): void {
     try {
       const binding = await ensureAutomaticVerification(pi, ctx, runtime, candidateCount);
       if (previousSourceKey && previousSourceKey !== binding.sourceKey) {
-        ctx.ui.notify("LLM-as-a-Verifier 已跟随 OMP 默认模型切换并重新绑定。", "info");
+        ctx.ui.notify("LLM-as-a-Verifier followed the OMP default model switch and rebound successfully.", "info");
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify("LLM-as-a-Verifier 暂不可用：" + message, "warning");
+      notifyWarning(ctx, error);
     }
   });
 }
 
-export function createAutomaticVerificationRuntime(): AutomaticVerificationRuntime {
-  return { bindings: new Map(), generation: 0 };
+export function createAutomaticVerificationRuntime(options: {
+  probeVerifier?: (client: VerifierClient, model: Model) => Promise<void>;
+} = {}): AutomaticVerificationRuntime {
+  return {
+    bindings: new Map(),
+    capabilityErrors: new Map(),
+    probeVerifier: options.probeVerifier,
+    generation: 0,
+  };
 }
 
 export async function ensureAutomaticVerification(
@@ -116,18 +141,22 @@ export async function ensureAutomaticVerification(
 ): Promise<VerificationBinding> {
   while (true) {
     const originalModel = resolveSourceModel(ctx, runtime);
-    if (!originalModel) throw new Error("OMP modelRoles.default 没有解析到可用模型。");
-    if (originalModel.api !== "openai-completions" && originalModel.api !== "openai-responses") {
+    if (!originalModel) throw new Error("OMP modelRoles.default did not resolve to an available model.");
+    if (!isVerifierSupportedApi(originalModel.api)) {
       throw new Error(
-        "OMP 默认模型 " + originalModel.provider + "/" + originalModel.id +
-        " 使用 " + originalModel.api + "，验证器需要 OpenAI token logprobs。",
+        "OMP default model " + originalModel.provider + "/" + originalModel.id +
+        " uses " + originalModel.api + "; the verifier requires OpenAI token logprobs.",
       );
     }
 
     const sessionId = ctx.sessionManager.getSessionId();
     const sourceKey = getSourceKey(pi, ctx, runtime, sessionId);
-    if (!sourceKey) throw new Error("OMP modelRoles.default 没有解析到可用模型。");
+    if (!sourceKey) throw new Error("OMP modelRoles.default did not resolve to an available model.");
     const providerName = sourceKey;
+    const capabilityError = runtime.capabilityErrors.get(sourceKey);
+    if (capabilityError) {
+      throw new VerifierLogprobsUnsupportedError(capabilityError);
+    }
     const activeBinding = runtime.bindings.get(sourceKey);
     if (
       runtime.activeSourceKey === sourceKey &&
@@ -153,14 +182,24 @@ export async function ensureAutomaticVerification(
     const task = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(async () => {
       let binding = runtime.bindings.get(sourceKey);
       if (!binding) {
-        binding = await createVerificationBinding(
-          pi,
-          ctx,
-          originalModel,
-          providerName,
-          sourceKey,
-          candidateCount,
-        );
+        try {
+          binding = await createVerificationBinding(
+            pi,
+            ctx,
+            originalModel,
+            providerName,
+            sourceKey,
+            candidateCount,
+            runtime.probeVerifier,
+          );
+        } catch (error) {
+          if (isVerifierLogprobsUnsupportedError(error)) {
+            const message = unsupportedModelMessage(originalModel);
+            runtime.capabilityErrors.set(sourceKey, message);
+            throw new VerifierLogprobsUnsupportedError(message);
+          }
+          throw error;
+        }
         runtime.bindings.set(sourceKey, binding);
       }
 
@@ -182,7 +221,7 @@ export async function ensureAutomaticVerification(
       ) {
         const thinkingLevel = pi.getThinkingLevel();
         if (!await pi.setModel(binding.wrapperModel)) {
-          throw new Error("OMP 无法切换到自动验证包装模型。");
+          throw new Error("OMP could not switch to the automatic-verification wrapper model.");
         }
         if (thinkingLevel !== undefined) pi.setThinkingLevel(thinkingLevel);
       }
@@ -215,6 +254,7 @@ async function createVerificationBinding(
   providerName: string,
   sourceKey: string,
   candidateCount: number,
+  probeVerifier?: (client: VerifierClient, model: Model) => Promise<void>,
 ): Promise<VerificationBinding> {
   const registry = ctx.modelRegistry as ExtensionContext["modelRegistry"] & {
     getProviderHeaders?: (provider: string) => Record<string, string> | undefined;
@@ -229,6 +269,19 @@ async function createVerificationBinding(
     modelRegistry: ctx.modelRegistry,
     sessionManager: ctx.sessionManager,
   }, originalModel);
+  if (probeVerifier) {
+    try {
+      await probeVerifier(verifierClient, originalModel);
+    } catch (error) {
+      if (isVerifierLogprobsUnsupportedError(error)) throw error;
+      console.warn(JSON.stringify({
+        component: PLUGIN_NAME,
+        event: "capability_probe_failed",
+        model: originalModel.provider + "/" + originalModel.id,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
   const wrapperApi = wrapperApiName(providerName);
   const modelId = "default";
   const config = {
@@ -245,8 +298,8 @@ async function createVerificationBinding(
           console.warn(JSON.stringify({ component: PLUGIN_NAME, event: "degraded", ...event }));
           ctx.ui.notify(
             event.reason === "verification_error"
-              ? "LLM-as-a-Verifier 本次评审失败，已返回首个候选响应。"
-              : "LLM-as-a-Verifier 可用候选不足，已返回唯一成功候选。",
+              ? "LLM-as-a-Verifier verification failed; returned the first candidate response."
+              : "LLM-as-a-Verifier had too few usable candidates; returned the only successful candidate.",
             "warning",
           );
         },
@@ -280,7 +333,7 @@ async function createVerificationBinding(
     await ctx.modelRegistry.refreshRuntimeProviders();
     wrapperModel = ctx.models.resolve(providerName + "/" + modelId);
   }
-  if (!wrapperModel) throw new Error("无法注册自动验证包装模型。");
+  if (!wrapperModel) throw new Error("Could not register the automatic-verification wrapper model.");
   return { sourceKey, originalModel, wrapperModel, providerName };
 }
 
@@ -387,4 +440,18 @@ function sameModelIdentity(left: Model, right: Model): boolean {
 function getDefaultModelSelector(pi: ExtensionAPI): string | undefined {
   const selector = pi.pi.settings.getModelRole("default");
   return typeof selector === "string" ? selector : undefined;
+}
+
+function unsupportedModelMessage(model: Model): string {
+  return "LLM-as-a-Verifier cannot use " + model.provider + "/" + model.id +
+    ": this model did not return token logprobs. Choose a model that supports token logprobs.";
+}
+
+function formatVerifierError(error: unknown, model?: Model): string {
+  if (isVerifierLogprobsUnsupportedError(error)) {
+    return model ? unsupportedModelMessage(model) :
+      "LLM-as-a-Verifier cannot use the active model because it did not return token logprobs. Choose a model that supports token logprobs.";
+  }
+  const detail = error instanceof Error ? error.message : String(error);
+  return "LLM-as-a-Verifier is unavailable: " + detail;
 }

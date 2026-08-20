@@ -14,6 +14,9 @@ import type { VerifierReply } from "./scale.ts";
 // Terminal-Bench 2.1 self-verification reference defaults for DeepSeek.
 export const DEFAULT_EFFORT = "high";
 export const DEFAULT_MAX_TOKENS = 32768;
+const VERIFIER_TRANSIENT_RETRIES = 3;
+const VERIFIER_TRANSIENT_STATUSES = new Set([429, 502, 503, 504]);
+type VerifierHttpError = Error & { status?: number; retryAfterMs?: number };
 
 export interface VerifierConfig {
   baseUrl: string;
@@ -38,6 +41,10 @@ interface VerifierCompat {
   omitReasoningEffort?: boolean;
   thinkingFormat?: string;
   includeEncryptedReasoning?: boolean;
+}
+
+export function isVerifierSupportedApi(api: string): boolean {
+  return api === "openai-completions" || api === "openai-responses" || api === "openrouter";
 }
 
 export interface UsageSnapshot {
@@ -153,6 +160,19 @@ export function formatUsage(usage: UsageSnapshot): string[] {
 
 export class MissingAPIKeyError extends Error {}
 
+/** The upstream returned a response but omitted the token probabilities required by PPT scoring. */
+export class VerifierLogprobsUnsupportedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VerifierLogprobsUnsupportedError";
+  }
+}
+
+export function isVerifierLogprobsUnsupportedError(error: unknown): error is VerifierLogprobsUnsupportedError {
+  return error instanceof VerifierLogprobsUnsupportedError ||
+    (error instanceof Error && error.name === "VerifierLogprobsUnsupportedError");
+}
+
 interface MergedAbortSignal {
   signal: AbortSignal;
   dispose(): void;
@@ -178,6 +198,41 @@ function mergeAbortSignals(
       external?.removeEventListener("abort", onExternalAbort);
     },
   };
+}
+
+function isTransientVerifierStatus(status: number): boolean {
+  return VERIFIER_TRANSIENT_STATUSES.has(status);
+}
+
+function verifierBackoffMs(attempt: number): number {
+  return 250 * (2 ** attempt);
+}
+
+function parseRetryAfter(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value.trim());
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(30_000, seconds * 1000);
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return undefined;
+  return Math.min(30_000, Math.max(0, timestamp - Date.now()));
+}
+
+function waitForRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    timer.unref?.();
+  });
 }
 
 export class VerifierClient {
@@ -232,11 +287,11 @@ export class VerifierClient {
   }
 
   /** Request a verifier response with token-level logprobs. */
-  async scoreReply(prompt: string, opts: { signal?: AbortSignal } = {}): Promise<VerifierReply> {
+  async scoreReply(prompt: string, opts: { signal?: AbortSignal; maxTokens?: number; timeoutMs?: number } = {}): Promise<VerifierReply> {
     if (!prompt.trim()) throw new Error("Verifier prompt must be non-empty");
     if (!this.ready) {
       throw new MissingAPIKeyError(
-        "OMP 当前模型没有可用凭据。",
+        "The active OMP model has no usable credentials.",
       );
     }
     const effort = this.effort;
@@ -251,7 +306,7 @@ export class VerifierClient {
               content: [{ type: "input_text", text: prompt }],
             },
           ],
-          max_output_tokens: this.maxTokens,
+          max_output_tokens: opts.maxTokens ?? this.maxTokens,
           top_logprobs: 20,
           include: [
             "message.output_text.logprobs",
@@ -263,7 +318,7 @@ export class VerifierClient {
       : {
           model: this.model,
           messages: [{ role: "user", content: prompt }],
-          max_tokens: this.maxTokens,
+          max_tokens: opts.maxTokens ?? this.maxTokens,
           logprobs: true,
           top_logprobs: 20,
         };
@@ -274,81 +329,62 @@ export class VerifierClient {
       this.applyChatReasoning(body, effort, reasoningEnabled);
     }
 
-    const requestAbort = mergeAbortSignals(opts.signal, 600_000);
-    try {
-      const credential = this.apiKeyResolver ?? (this.keyless ? "N/A" : this.apiKey);
-      const data = await withAuth(
-        credential,
-        async (apiKey) => {
-          const endpoint = this.baseUrl + "/" + (responses ? "responses" : "chat/completions");
-          const res = await fetch(endpoint, {
-            method: "POST",
-            headers: this.requestHeaders(apiKey),
-            body: JSON.stringify(body),
-            signal: requestAbort.signal,
-          });
-          if (!res.ok) {
-            const detail = redactSecrets(
-              (await res.text()).slice(0, 500),
-              [
-                apiKey,
-                this.apiKey,
-                ...Object.values(this.headers),
-                ...Object.values(this.headers).flatMap(headerSecretParts),
-              ],
-            );
-            const error = new Error(
-              "Verifier API " + res.status + " " + res.statusText + ": " + detail,
-            ) as Error & { status?: number };
-            error.status = res.status;
-            throw error;
-          }
-          try {
-            const parsed: unknown = await res.json();
-            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-              throw new Error("response is not an object");
-            }
-            return parsed as Record<string, unknown>;
-          } catch (error) {
-            const detail = error instanceof Error ? error.message : String(error);
-            throw new Error("Verifier API returned invalid JSON: " + detail);
-          }
-        },
-        {
-          isAuthError: isAuthRetryableError,
-          signal: requestAbort.signal,
-          missingKeyMessage: "OMP 当前模型没有可用凭据。",
-        },
-      );
-      this.recordUsage(data);
-      if (responses) return this.parseResponsesReply(data);
-
-      const choices = Array.isArray(data.choices)
-        ? (data.choices as Array<Record<string, unknown>>)
-        : [];
-      const choice = choices[0];
-      if (!choice) throw new Error("Verifier API returned no choices");
-      const msg = choice.message as Record<string, unknown> | undefined;
-      const text: string =
-        typeof msg?.content === "string" ? msg.content : "";
-      const logprobs = choice.logprobs as
-        | { content?: Array<Record<string, unknown>> }
-        | undefined;
-
-      const parsedLogprobs = parsePositionLogprobs(logprobs?.content);
-      const tokens = parsedLogprobs?.tokens;
-      const positionLogprobs = parsedLogprobs?.positionLogprobs;
-      if (!positionLogprobs || positionLogprobs.length === 0) {
-        throw new Error(
-          `Verifier returned no answer logprobs (finish_reason=${String(
-            choice.finish_reason ?? "?",
-          )}) — 当前 OMP 模型没有返回 token logprobs。`,
-        );
+  const requestAbort = mergeAbortSignals(opts.signal, opts.timeoutMs ?? 600_000);
+ try {
+    const credential = this.apiKeyResolver ?? (this.keyless ? "N/A" : this.apiKey);
+   const fetchBody = () => withAuth(
+      credential,
+      async (apiKey) => {
+        const endpoint = this.baseUrl + "/" + (responses ? "responses" : "chat/completions");
+        return this.requestJsonWithRetry(endpoint, body, apiKey, requestAbort.signal);
+      },
+      {
+        isAuthError: isAuthRetryableError,
+        signal: requestAbort.signal,
+        missingKeyMessage: "The active OMP model has no usable credentials.",
+      },
+    );
+    let data = await fetchBody();
+    this.recordUsage(data);
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return responses ? this.parseResponsesReply(data) : this.parseChatReply(data);
+      } catch (error) {
+        if (!isVerifierLogprobsUnsupportedError(error)) throw error;
+        if (attempt >= VERIFIER_TRANSIENT_RETRIES) throw error;
+        await waitForRetry(verifierBackoffMs(attempt + 1), requestAbort.signal);
+        data = await fetchBody();
+        this.recordUsage(data);
       }
-      return { text, tokens, positionLogprobs };
-    } finally {
-      requestAbort.dispose();
     }
+  } finally {
+    requestAbort.dispose();
+  }
+}
+
+  private parseChatReply(data: Record<string, unknown>): VerifierReply {
+    const choices = Array.isArray(data.choices)
+      ? (data.choices as Array<Record<string, unknown>>)
+      : [];
+    const choice = choices[0];
+    if (!choice) throw new Error("Verifier API returned no choices");
+    const msg = choice.message as Record<string, unknown> | undefined;
+    const text: string =
+      typeof msg?.content === "string" ? msg.content : "";
+    const logprobs = choice.logprobs as
+      | { content?: Array<Record<string, unknown>> }
+      | undefined;
+    const parsedLogprobs = parsePositionLogprobs(logprobs?.content);
+    const tokens = parsedLogprobs?.tokens;
+    const positionLogprobs = parsedLogprobs?.positionLogprobs;
+    if (!positionLogprobs || positionLogprobs.length === 0) {
+      throw new VerifierLogprobsUnsupportedError(
+        `Verifier returned no answer logprobs (finish_reason=${String(
+          choice.finish_reason ?? "?",
+        )}) — the active OMP model did not return token logprobs.`,
+      );
+    }
+    return { text, tokens, positionLogprobs };
   }
 
   private parseResponsesReply(data: Record<string, unknown>): VerifierReply {
@@ -370,8 +406,8 @@ export class VerifierClient {
     const parsedLogprobs = parsePositionLogprobs(positions);
     if (!parsedLogprobs || parsedLogprobs.positionLogprobs.length === 0) {
       const status = typeof data.status === "string" ? data.status : "?";
-      throw new Error(
-        `Verifier returned no answer logprobs (status=${status}) — 当前 OMP 默认模型没有返回 token logprobs。`,
+      throw new VerifierLogprobsUnsupportedError(
+        `Verifier returned no answer logprobs (status=${status}) — the active OMP default model did not return token logprobs.`,
       );
     }
     return {
@@ -383,13 +419,74 @@ export class VerifierClient {
     };
   }
 
+  /**
+   * Perform a small live capability check using the same request shape as PPT scoring.
+   * A successful response without logprobs is classified separately from transport errors.
+   */
+  async probeLogprobs(opts: { signal?: AbortSignal; maxTokens?: number; timeoutMs?: number } = {}): Promise<void> {
+    await this.scoreReply("Respond with exactly the single letter A. Do not explain.", {
+      ...opts,
+      maxTokens: opts.maxTokens ?? 1024,
+      timeoutMs: opts.timeoutMs ?? 30_000,
+    });
+  }
   private requestHeaders(apiKey: string): Record<string, string> {
     const headers = new Headers(this.headers);
     if (!this.keyless && apiKey !== "N/A" && !headers.has("authorization")) {
       headers.set("Authorization", "Bearer " + apiKey);
     }
+    if (this.provider === "openrouter") {
+      if (!headers.has("http-referer")) headers.set("HTTP-Referer", "https://omp.sh/");
+      if (!headers.has("x-openrouter-title")) headers.set("X-OpenRouter-Title", "omp");
+    }
     headers.set("Content-Type", "application/json");
     return Object.fromEntries(headers.entries());
+  }
+
+  private async requestJsonWithRetry(
+    endpoint: string,
+    body: Record<string, unknown>,
+    apiKey: string,
+    signal: AbortSignal,
+  ): Promise<Record<string, unknown>> {
+    const secrets = [
+      apiKey,
+      this.apiKey,
+      ...Object.values(this.headers),
+      ...Object.values(this.headers).flatMap(headerSecretParts),
+    ];
+    for (let attempt = 0; attempt <= VERIFIER_TRANSIENT_RETRIES; attempt += 1) {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: this.requestHeaders(apiKey),
+        body: JSON.stringify(body),
+        signal,
+      });
+      if (!res.ok) {
+        const detail = redactSecrets((await res.text()).slice(0, 500), secrets);
+        const error = new Error(
+          "Verifier API " + res.status + " " + res.statusText + ": " + detail,
+        ) as VerifierHttpError;
+        error.status = res.status;
+        error.retryAfterMs = parseRetryAfter(res.headers.get("retry-after"));
+        if (isTransientVerifierStatus(res.status) && attempt < VERIFIER_TRANSIENT_RETRIES) {
+          await waitForRetry(error.retryAfterMs ?? verifierBackoffMs(attempt), signal);
+          continue;
+        }
+        throw error;
+      }
+      try {
+        const parsed: unknown = await res.json();
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("response is not an object");
+        }
+        return parsed as Record<string, unknown>;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error("Verifier API returned invalid JSON: " + detail);
+      }
+    }
+    throw new Error("Verifier API retry loop ended unexpectedly.");
   }
 
   private applyChatReasoning(
@@ -609,19 +706,19 @@ export async function createVerifierClient(
 ): Promise<VerifierClient> {
   const model = ctx.model ?? ctx.models.resolve("@default");
   if (!model) {
-    throw new MissingAPIKeyError("OMP modelRoles.default 没有解析到可用模型。");
+    throw new MissingAPIKeyError("OMP modelRoles.default did not resolve to an available model.");
   }
-  if (model.api !== "openai-completions" && model.api !== "openai-responses") {
-    throw new Error(
-      "OMP 默认模型 " + model.provider + "/" + model.id + " 使用 " + model.api +
-        "，LLM-as-a-Verifier 需要支持 OpenAI token logprobs 的模型。",
-    );
-  }
+    if (!isVerifierSupportedApi(model.api)) {
+      throw new Error(
+        "OMP default model " + model.provider + "/" + model.id + " uses " + model.api +
+          "; LLM-as-a-Verifier requires a model with OpenAI token logprobs.",
+      );
+    }
   const resolver = ctx.modelRegistry.resolver(model, ctx.sessionId);
   const auth = await resolveOmpAuth(ctx, model);
   if (!auth.ok) {
     throw new MissingAPIKeyError(
-      "OMP 默认模型 " + model.provider + "/" + model.id + " 没有可用凭据，请先在 OMP 登录对应 provider。",
+      "OMP default model " + model.provider + "/" + model.id + " has no usable credentials; sign in to this provider in OMP.",
     );
   }
   const initialKey = auth.apiKey ?? "";
@@ -630,7 +727,7 @@ export async function createVerifierClient(
     : undefined;
   if (!initialKey && !apiKeyResolver) {
     throw new MissingAPIKeyError(
-      "OMP 默认模型 " + model.provider + "/" + model.id + " 没有可用凭据，请先在 OMP 登录对应 provider。",
+      "OMP default model " + model.provider + "/" + model.id + " has no usable credentials; sign in to this provider in OMP.",
     );
   }
   const maxTokens =
