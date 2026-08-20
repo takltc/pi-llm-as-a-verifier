@@ -1,8 +1,203 @@
 import { describe, expect, test } from "bun:test";
-import { extractScore, GRANULARITY, SCALE, type VerifierReply } from "../src/scale.ts";
-import { bradleyTerry, pivotRoundPairs, ringCycle, selectBest, selectPivots } from "../src/ppt.ts";
+import {
+  extractScore,
+  extractScorePair,
+  findTagLogprobs,
+  GRANULARITY,
+  hasExtractableScore,
+  SCALE,
+  type PositionLogprobs,
+  type VerifierReply,
+} from "../src/scale.ts";
+import { accumulate, bradleyTerry, pivotRoundPairs, ringCycle, selectBest, selectPivots } from "../src/ppt.ts";
 import { cacheKey, directedReward, type ScoreCache } from "../src/cache.ts";
 import { mulberry32 } from "../src/run.ts";
+
+
+/**
+ * Naive reference: accumulate the joined text token-by-token and, after each
+ * token, suffix-match the trimmed accumulated text (the reference
+ * `_find_tag_logprobs` loop, exact tag first, then the fused `>`-less form).
+ */
+function referenceFindTagLogprobs(
+  reply: VerifierReply,
+  tag: string,
+): PositionLogprobs | undefined {
+  const { tokens, positionLogprobs } = reply;
+  if (!tokens || !positionLogprobs || tokens.length === 0) return undefined;
+  for (const suffix of [tag, tag.slice(0, -1)]) {
+    let found: PositionLogprobs | undefined;
+    let textSoFar = "";
+    for (let i = 0; i < tokens.length; i++) {
+      textSoFar += tokens[i];
+      if (pythonRstrip(tokens[i]!).length === 0) continue;
+      if (pythonRstrip(textSoFar).endsWith(suffix)) {
+        if (i + 1 < positionLogprobs.length) {
+          found = positionLogprobs[i + 1];
+        }
+      }
+    }
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function pythonRstrip(value: string): string {
+  const whitespace =
+    /[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/;
+  let end = value.length;
+  while (end > 0 && whitespace.test(value[end - 1]!)) end -= 1;
+  return value.slice(0, end);
+}
+
+function randomTokenStream(seed: number): { tokens: string[]; positions: PositionLogprobs[] } {
+  const rng = mulberry32(seed);
+  const tokenPool = [
+    "analysis", " ", "\n", "<score_A>", "<score_A", "A", ">A", ">T", "B",
+    "</score_A>", "<score_B>", "<score_B", "C", "</score_B>", " ", "  ", "\n\n",
+    'Format: "<score_A>', "LETTER_A_TO_T", '">\n<score_A>',
+  ];
+  const letters = "ABCDEFGHIJKLMNOPQRST";
+  const n = Math.floor(rng() * 14);
+  const tokens: string[] = [];
+  const positions: PositionLogprobs[] = [];
+  for (let i = 0; i < n; i++) {
+    tokens.push(tokenPool[Math.floor(rng() * tokenPool.length)]!);
+    // 20% chance the position has a real letter distribution; else generic.
+    if (rng() < 0.2) {
+      const chosen = letters[Math.floor(rng() * letters.length)]!;
+      positions.push([
+        [chosen, -Math.log(1 + rng() * 10)],
+        [letters[(letters.indexOf(chosen) + 1) % letters.length]!, -Math.log(1 + rng() * 10)],
+      ]);
+    } else {
+      positions.push([[tokenPool[Math.floor(rng() * tokenPool.length)]!, -Math.log(1 + rng())]]);
+    }
+  }
+  return { tokens, positions };
+}
+
+describe("linear tag scanner matches the reference semantics", () => {
+  test("findTagLogprobs agrees with the naive reference over random streams", () => {
+    for (let seed = 0; seed < 400; seed++) {
+      const { tokens, positions } = randomTokenStream(seed);
+      const reply: VerifierReply = { text: tokens.join(""), tokens, positionLogprobs: positions };
+      for (const tag of ["<score_A>", "<score_B>"]) {
+        const reference = referenceFindTagLogprobs(reply, tag);
+        const linear = findTagLogprobs(reply, tag);
+        expect(linear, `seed=${seed} tag=${tag}`).toEqual(reference);
+      }
+    }
+  });
+
+  test("extractScorePair agrees with per-tag extractScore + hasExtractableScore", () => {
+    for (let seed = 0; seed < 300; seed++) {
+      const { tokens, positions } = randomTokenStream(seed);
+      const reply: VerifierReply = { text: tokens.join(""), tokens, positionLogprobs: positions };
+      const pair = extractScorePair(reply);
+      expect(pair.scoreA, `seed=${seed}`).toBe(extractScore(reply, "<score_A>"));
+      expect(pair.scoreB, `seed=${seed}`).toBe(extractScore(reply, "<score_B>"));
+      expect(pair.extractableA, `seed=${seed}`).toBe(hasExtractableScore(reply, "<score_A>"));
+      expect(pair.extractableB, `seed=${seed}`).toBe(hasExtractableScore(reply, "<score_B>"));
+    }
+  });
+
+  test("last-match wins with trailing whitespace and mid-quoted tags", () => {
+    // Exact-tag trailing match wins over an earlier exact match; whitespace
+    // after the closing tag must not break the match (trimEnd semantics).
+    const reply: VerifierReply = {
+      text: '<score_A> A </score_A>\n<score_A> B </score_A>   ',
+      tokens: ["<score_A>", " ", "A", " </score_A>\n<score_A>", " ", "B", " </score_A>", "   "],
+      positionLogprobs: [
+        [["<score_A>", 0]],
+        [[" ", 0]],
+        [["A", Math.log(0.5)], ["B", Math.log(0.5)]],
+        [[" </score_A>\n<score_A>", 0]],
+        [[" ", 0]],
+        [["B", Math.log(1.0)], ["A", -50]],
+        [[" </score_A>", 0]],
+        [["   ", 0]],
+      ],
+    };
+    const reference = referenceFindTagLogprobs(reply, "<score_A>");
+    const linear = findTagLogprobs(reply, "<score_A>");
+    expect(linear).toEqual(reference);
+    // B has all mass -> (19-1)/19
+    expect(extractScore(reply, "<score_A>")).toBeCloseTo((19 - 1) / 19, 9);
+  });
+
+  test("fused '>A' token and empty position arrays", () => {
+    const reply: VerifierReply = {
+      text: "<score_A> A </score_A>",
+      tokens: ["<score_A>", ">A", " </score_A>"],
+      positionLogprobs: [
+        [["<score_A>", 0]],
+        [[" >A", Math.log(0.8)], [" >T", Math.log(0.2)]],
+        [[" </score_A>", 0]],
+      ],
+    };
+    expect(findTagLogprobs(reply, "<score_A>")).toEqual(referenceFindTagLogprobs(reply, "<score_A>"));
+    expect(extractScore(reply, "<score_A>")).toBeCloseTo((0.8 * 20 + 0.2 * 1 - 1) / 19, 9);
+    // No tags at all: every position is a non-letter generic token.
+    const empty: VerifierReply = {
+      text: "no tags here",
+      tokens: ["no", "tags", "here"],
+      positionLogprobs: [[["no", 0]], [["tags", 0]], [["here", 0]]],
+    };
+    expect(findTagLogprobs(empty, "<score_A>")).toBeUndefined();
+    expect(hasExtractableScore(empty, "<score_A>")).toBe(false);
+    expect(extractScore(empty, "<score_A>")).toBe(0.5);
+  });
+
+  test("uses Python rstrip whitespace semantics at tag boundaries", () => {
+    const nel: VerifierReply = {
+      text: "<score_A>\u0085A",
+      tokens: ["<score_A>\u0085", "A"],
+      positionLogprobs: [
+        [["<score_A>\u0085", 0]],
+        [["A", 0]],
+      ],
+    };
+    expect(findTagLogprobs(nel, "<score_A>")).toEqual([["A", 0]]);
+    expect(findTagLogprobs(nel, "<score_A>")).toEqual(
+      referenceFindTagLogprobs(nel, "<score_A>"),
+    );
+
+    const bom: VerifierReply = {
+      text: "<score_A>\ufeffA",
+      tokens: ["<score_A>\ufeff", "A"],
+      positionLogprobs: [
+        [["<score_A>\ufeff", 0]],
+        [["A", 0]],
+      ],
+    };
+    expect(findTagLogprobs(bom, "<score_A>")).toBeUndefined();
+    expect(findTagLogprobs(bom, "<score_A>")).toEqual(
+      referenceFindTagLogprobs(bom, "<score_A>"),
+    );
+  });
+
+  test("whitespace tokens do not shadow the first post-tag distribution", () => {
+    const firstDistribution: PositionLogprobs = [
+      [" A", Math.log(0.8)],
+      [" T", Math.log(0.2)],
+    ];
+    const reply: VerifierReply = {
+      text: "<score_A> A",
+      tokens: ["<score_A>", " ", "A"],
+      positionLogprobs: [
+        [["<score_A>", 0]],
+        firstDistribution,
+        [["A", 0]],
+      ],
+    };
+    expect(findTagLogprobs(reply, "<score_A>")).toEqual(firstDistribution);
+    expect(findTagLogprobs(reply, "<score_A>")).toEqual(
+      referenceFindTagLogprobs(reply, "<score_A>"),
+    );
+    expect(extractScore(reply, "<score_A>")).toBeCloseTo((0.8 * 20 + 0.2 - 1) / 19, 10);
+  });
+});
 
 describe("extractScore", () => {
   test("scale has 20 letters A-T mapping to 20..1", () => {
@@ -32,11 +227,18 @@ describe("extractScore", () => {
     };
     const ra = extractScore(reply, "<score_A>");
     const rb = extractScore(reply, "<score_B>");
+    const pair = extractScorePair(reply);
     const expectedA = (0.9 * 20 + 0.1 * 1 - 1) / (20 - 1); // (18.1-1)/19
     const expectedB = (0.95 * 1 + 0.05 * 20 - 1) / (19); // (1.95-1)/19
     expect(ra).toBeCloseTo(expectedA, 10);
     expect(rb).toBeCloseTo(expectedB, 10);
     expect(ra).toBeGreaterThan(rb);
+    expect(pair.sourceA).toBe("logprobs");
+    expect(pair.sourceB).toBe("logprobs");
+    expect(pair.supportA).toBe(2);
+    expect(pair.supportB).toBe(2);
+    expect(pair.probabilityMassA).toBeCloseTo(1, 10);
+    expect(pair.probabilityMassB).toBeCloseTo(1, 10);
   });
 
   test("fused '>A' token (DeepSeek tokenizer)", () => {
@@ -62,6 +264,11 @@ describe("extractScore", () => {
     // E = raw 16, Q = raw 4
     expect(extractScore(reply, "<score_A>")).toBeCloseTo((16 - 1) / 19, 10);
     expect(extractScore(reply, "<score_B>")).toBeCloseTo((4 - 1) / 19, 10);
+    const pair = extractScorePair(reply);
+    expect(pair.sourceA).toBe("text_fallback");
+    expect(pair.sourceB).toBe("text_fallback");
+    expect(pair.supportA).toBe(0);
+    expect(pair.probabilityMassA).toBe(0);
   });
 
   test("last match wins when the model quotes the format mid-analysis", () => {
@@ -127,7 +334,7 @@ describe("PPT", () => {
     expect(bradleyTerry(0.99, 0.01)).toBeCloseTo(1 / (1 + Math.exp(-0.98)), 10);
   });
 
-  test("pivotRoundPairs: k(N-k) + C(k,2) pairs", () => {
+  test("pivotRoundPairs reaches the k(N-k) + C(k,2) upper bound without a ring", () => {
     const pairs = pivotRoundPairs(5, [2, 3]);
     expect(pairs.length).toBe(2 * 3 + 1);
     // non-pivots take slot A, pivots slot B
@@ -135,6 +342,49 @@ describe("PPT", () => {
       expect([0, 1, 4]).toContain(a);
       expect([2, 3]).toContain(b);
     }
+  });
+
+  test("pivotRoundPairs implements Algorithm 1 E_piv minus E_ring", () => {
+    const ring: Array<[number, number]> = [[0, 2], [2, 1], [1, 0]];
+    const pairs = pivotRoundPairs(3, [0], ring);
+    expect(pairs).toEqual([[2, 0]]);
+
+    const ringSet = new Set(ring.map(([a, b]) => `${a},${b}`));
+    expect(pairs.every(([a, b]) => !ringSet.has(`${a},${b}`))).toBe(true);
+  });
+
+  test("Algorithm 1 pivot edge sets stay unique and within the O(Nk) bound", () => {
+    for (let n = 2; n <= 8; n += 1) {
+      for (let seed = 0; seed < 20; seed += 1) {
+        const ring = ringCycle(n, mulberry32(seed));
+        const ringSet = new Set(ring.map(([a, b]) => `${a},${b}`));
+        for (let k = 1; k <= n; k += 1) {
+          const pivots = Array.from({ length: k }, (_, index) => index);
+          const unfiltered = pivotRoundPairs(n, pivots);
+          const filtered = pivotRoundPairs(n, pivots, ring);
+          const filteredKeys = filtered.map(([a, b]) => `${a},${b}`);
+          expect(new Set(filteredKeys).size).toBe(filtered.length);
+          expect(filteredKeys.every((key) => !ringSet.has(key))).toBe(true);
+          expect(filtered).toEqual(
+            unfiltered.filter(([a, b]) => !ringSet.has(`${a},${b}`)),
+          );
+          expect(ring.length + filtered.length).toBeLessThanOrEqual(
+            n + k * (n - k) + (k * (k - 1)) / 2,
+          );
+        }
+      }
+    }
+  });
+
+  test("pins the paper/reference Bo3 edge-count divergence", () => {
+    const ring: Array<[number, number]> = [[0, 2], [2, 1], [1, 0]];
+    const w = [0, 0, 0];
+    const c = [0, 0, 0];
+    accumulate(ring, () => [0.5, 0.5], w, c);
+    const pivots = selectPivots(w, c, 1);
+    expect(pivots).toEqual([0]);
+    expect(ring.length + pivotRoundPairs(3, pivots, ring).length).toBe(4);
+    expect(ring.length + pivotRoundPairs(3, pivots).length).toBe(5);
   });
 
   test("selectBest picks the ground-truth winner with perfect scoring", () => {
@@ -148,9 +398,9 @@ describe("PPT", () => {
     const ring = ringCycle(5, rng);
     const { bestIndex, nComparisons } = selectBest(5, ring, 2, score);
     expect(bestIndex).toBe(2);
-    // Paper's O(Nk) budget: N ring + k(N-k) non-pivot-vs-pivot + C(k,2)
-    // pivot-vs-pivot directed comparisons.
-    expect(nComparisons).toBe(5 + 2 * 3 + 1);
+    // Algorithm 1 removes directed edges already observed in the ring, while
+    // the paper's N + k(N-k) + C(k,2) expression remains an upper bound.
+    expect(nComparisons).toBeLessThanOrEqual(5 + 2 * 3 + 1);
   });
 
   test("selectPivots picks ring leaders", () => {
@@ -198,6 +448,9 @@ describe("directedReward", () => {
       problem: "p",
       traceA: "ta",
       traceB: "tb",
+      imagesFingerprint: "",
+      trajectoryImagesAFingerprint: "",
+      trajectoryImagesBFingerprint: "",
       provider: "prov",
       api: "openai-completions",
       model: "m",

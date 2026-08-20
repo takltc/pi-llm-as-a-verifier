@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { afterEach } from "bun:test";
 import { readFileSync } from "node:fs";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
-import type { AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import type {
+  AssistantMessage,
+  Context,
+  ImageContent,
+  Model,
+  SimpleStreamOptions,
+} from "@oh-my-pi/pi-ai";
 import { cacheKey, loadCache, saveCache, type CacheContext } from "../src/cache.ts";
 import {
   AUTO_CANDIDATE_COUNT,
@@ -26,7 +32,7 @@ import {
   VerifierLogprobsUnsupportedError,
   type VerifierConfig,
 } from "../src/client.ts";
-import type { VerifierReply } from "../src/scale.ts";
+import { extractScorePair, type VerifierReply } from "../src/scale.ts";
 const temporaryFiles: string[] = [];
 
 afterEach(() => {
@@ -101,7 +107,7 @@ function fakeCandidateStreamFactory(
         stream.fail(new Error("candidate " + index + " failed"));
         return;
       }
-      const result = message(index, index === 2);
+      const result = message(index);
       stream.push({ type: "start", partial: result });
       stream.push({
         type: "done",
@@ -115,13 +121,24 @@ function fakeCandidateStreamFactory(
 
 class RankingVerifier extends VerifierClient {
   calls = 0;
+  readonly prompts: string[] = [];
+  readonly imageBatches: Array<readonly ImageContent[]> = [];
 
-  constructor(private readonly fail = false) {
-    super(clientConfig());
+  constructor(
+    private readonly fail = false,
+    supportsImages = false,
+    private readonly scoreMode: "logprobs" | "text_fallback" = "logprobs",
+  ) {
+    super(clientConfig({ supportsImages }));
   }
 
-  override async scoreReply(prompt: string): Promise<VerifierReply> {
+  override async scoreReply(
+    prompt: string,
+    opts: Parameters<VerifierClient["scoreReply"]>[1] = {},
+  ): Promise<VerifierReply> {
     this.calls += 1;
+    this.prompts.push(prompt);
+    this.imageBatches.push(opts.images ?? []);
     if (this.fail) throw new Error("verifier unavailable");
     const a = /candidate text (\d+)/.exec(prompt)?.[1];
     const b = /candidate text (\d+)/.exec(prompt.slice(prompt.indexOf("Trajectory B")))?.[1];
@@ -129,7 +146,19 @@ class RankingVerifier extends VerifierClient {
     const bWins = b === "2" && a !== "2";
     const scoreA = aWins ? "A" : bWins ? "T" : "A";
     const scoreB = bWins ? "A" : aWins ? "T" : "A";
-    return { text: "<score_A> " + scoreA + " </score_A>\n<score_B> " + scoreB + " </score_B>" };
+    const text = "<score_A> " + scoreA + " </score_A>\n<score_B> " + scoreB + " </score_B>";
+    if (this.scoreMode === "text_fallback") return { text };
+    return {
+      text,
+      tokens: ["<score_A>", " " + scoreA, " </score_A>\n<score_B>", " " + scoreB, " </score_B>"],
+      positionLogprobs: [
+        [["<score_A>", 0]],
+        [[scoreA, 0]],
+        [[" </score_A>\n<score_B>", 0]],
+        [[scoreB, 0]],
+        [[" </score_B>", 0]],
+      ],
+    };
   }
 }
 
@@ -207,7 +236,7 @@ describe("automatic request-level provider", () => {
     }
   });
 
-  test("treats a persistente no-logprobs response as unsupported after retries", async () => {
+  test("treats a persistent no-logprobs response as unsupported after retries", async () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async () => new Response(JSON.stringify({
       choices: [{
@@ -322,6 +351,138 @@ describe("automatic request-level provider", () => {
     }
   });
 
+  test("encodes task images for Chat Completions and Responses verifier requests", async () => {
+    const originalFetch = globalThis.fetch;
+    const bodies: Record<string, unknown>[] = [];
+    globalThis.fetch = (async (url: unknown, init: unknown) => {
+      bodies.push(JSON.parse(String((init as { body?: string }).body)));
+      const response = String(url).endsWith("/responses")
+        ? {
+            status: "completed",
+            output: [{
+              type: "message",
+              content: [{
+                type: "output_text",
+                text: "A",
+                logprobs: [{
+                  token: "A",
+                  logprob: -0.1,
+                  top_logprobs: [{ token: "A", logprob: -0.1 }],
+                }],
+              }],
+            }],
+          }
+        : {
+            choices: [{
+              message: { content: "A" },
+              finish_reason: "stop",
+              logprobs: {
+                content: [{
+                  token: "A",
+                  logprob: -0.1,
+                  top_logprobs: [{ token: "A", logprob: -0.1 }],
+                }],
+              },
+            }],
+          };
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    const image: ImageContent = {
+      type: "image",
+      data: "aGVsbG8=",
+      mimeType: "image/png",
+      detail: "high",
+    };
+    try {
+      const chat = new VerifierClient(clientConfig({ supportsImages: true, effort: "off" }));
+      await chat.scoreReply("Inspect the image.", { images: [image] });
+      const chatMessage = (bodies[0]!.messages as Array<{ content: unknown }>)[0]!;
+      expect(chatMessage.content).toEqual([
+        { type: "text", text: "Inspect the image." },
+        {
+          type: "image_url",
+          image_url: { url: "data:image/png;base64,aGVsbG8=", detail: "high" },
+        },
+      ]);
+
+      const responses = new VerifierClient(clientConfig({
+        api: "openai-responses",
+        supportsImages: true,
+        effort: "off",
+      }));
+      await responses.scoreReply("Inspect the image.", { images: [image] });
+      const responseInput = (bodies[1]!.input as Array<{ content: unknown }>)[0]!;
+      expect(responseInput.content).toEqual([
+        { type: "input_text", text: "Inspect the image." },
+        {
+          type: "input_image",
+          image_url: "data:image/png;base64,aGVsbG8=",
+          detail: "high",
+        },
+      ]);
+
+      const textOnly = new VerifierClient(clientConfig({ effort: "off" }));
+      await expect(textOnly.scoreReply("Inspect.", { images: [image] })).rejects.toThrow(
+        "cannot inspect the context images",
+      );
+      expect(bodies).toHaveLength(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("parses only Responses output_text logprobs", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          content: [{
+            type: "output_text",
+            text: "<score_A> A </score_A>\n<score_B> T </score_B>",
+            logprobs: [
+              { token: "<score_A>", logprob: 0, top_logprobs: [{ token: "<score_A>", logprob: 0 }] },
+              { token: " A", logprob: 0, top_logprobs: [{ token: "A", logprob: 0 }] },
+              { token: " </score_A>\n<score_B>", logprob: 0, top_logprobs: [{ token: " </score_A>\n<score_B>", logprob: 0 }] },
+              { token: " T", logprob: 0, top_logprobs: [{ token: "T", logprob: 0 }] },
+              { token: " </score_B>", logprob: 0, top_logprobs: [{ token: " </score_B>", logprob: 0 }] },
+            ],
+          }],
+        },
+        {
+          type: "reasoning",
+          content: [{
+            type: "reasoning_text",
+            text: "<score_A> T </score_A>\n<score_B> A </score_B>",
+            logprobs: [
+              { token: "<score_A>", logprob: 0, top_logprobs: [{ token: "<score_A>", logprob: 0 }] },
+              { token: " T", logprob: 0, top_logprobs: [{ token: "T", logprob: 0 }] },
+              { token: " </score_A>\n<score_B>", logprob: 0, top_logprobs: [{ token: " </score_A>\n<score_B>", logprob: 0 }] },
+              { token: " A", logprob: 0, top_logprobs: [{ token: "A", logprob: 0 }] },
+              { token: " </score_B>", logprob: 0, top_logprobs: [{ token: " </score_B>", logprob: 0 }] },
+            ],
+          }],
+        },
+      ],
+    }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+    try {
+      const reply = await new VerifierClient(clientConfig({ api: "openai-responses" }))
+        .scoreReply("Compare.");
+      const pair = extractScorePair(reply);
+      expect(reply.text).toBe("<score_A> A </score_A>\n<score_B> T </score_B>");
+      expect(pair.scoreA).toBe(1);
+      expect(pair.scoreB).toBe(0);
+      expect(pair.sourceA).toBe("logprobs");
+      expect(pair.sourceB).toBe("logprobs");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("generates three candidates and replays the verified winner", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
     const verifier = new RankingVerifier();
@@ -342,8 +503,8 @@ describe("automatic request-level provider", () => {
     const resolver = calls[0]?.options.apiKey;
     expect(typeof resolver).toBe("function");
     expect(result.responseId).toBe("response-2");
-    expect(result.stopReason).toBe("toolUse");
-    expect(result.content.some((block) => block.type === "toolCall")).toBe(true);
+    expect(result.stopReason).toBe("stop");
+    expect(result.content.some((block) => block.type === "toolCall")).toBe(false);
     expect((events as Array<{ type: string }>).map((event) => event.type)).toEqual([
       "start",
       "thinking_start",
@@ -352,28 +513,13 @@ describe("automatic request-level provider", () => {
       "text_start",
       "text_delta",
       "text_end",
-      "toolcall_start",
-      "toolcall_delta",
-      "toolcall_end",
       "done",
     ]);
     const replayEvents = events as Array<{ type: string; partial?: AssistantMessage }>;
     const textStart = replayEvents.find((event) => event.type === "text_start");
     const textDelta = replayEvents.find((event) => event.type === "text_delta");
-    const toolStart = replayEvents.find((event) => event.type === "toolcall_start");
-    const toolDelta = replayEvents.find((event) => event.type === "toolcall_delta");
     expect(textStart?.partial?.content[1]).toEqual({ type: "text", text: "" });
     expect(textDelta?.partial?.content[1]).toMatchObject({ type: "text", text: "candidate text 2" });
-    expect(toolStart?.partial?.content[2]).toMatchObject({
-      type: "toolCall",
-      id: "call-2",
-      name: "bash",
-      arguments: {},
-    });
-    expect(toolDelta?.partial?.content[2]).toMatchObject({
-      type: "toolCall",
-      arguments: { command: "printf candidate-2" },
-    });
   });
 
   test("uses the configured candidate count", async () => {
@@ -391,6 +537,65 @@ describe("automatic request-level provider", () => {
     );
     await collect(stream);
     expect(calls).toHaveLength(4);
+  });
+
+  test("isolates mutable message content across candidate contexts", async () => {
+    const rich: Context = {
+      ...context(),
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "Original task evidence." }],
+          timestamp: 1,
+        },
+        message(99, true),
+      ],
+    };
+    const observed: Array<{ text: string; command: string }> = [];
+    let nextIndex = 0;
+
+    await collect(createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: (_model, candidateContext) => {
+        const index = nextIndex++;
+        const userContent = candidateContext.messages[0]!.content as Array<{
+          type: string;
+          text?: string;
+        }>;
+        const priorAssistant = candidateContext.messages[1] as AssistantMessage;
+        const toolCall = priorAssistant.content.find((block) => block.type === "toolCall");
+        if (!toolCall) throw new Error("Expected prior tool call");
+        observed.push({
+          text: userContent[0]?.text ?? "",
+          command: String(toolCall.arguments.command),
+        });
+
+        userContent[0]!.text = "mutated task " + index;
+        toolCall.arguments.command = "mutated command " + index;
+
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          const result = message(index);
+          candidate.push({ type: "start", partial: result });
+          candidate.push({ type: "done", reason: "stop", message: result });
+        });
+        return candidate;
+      },
+    }, rich));
+
+    expect(observed).toEqual(Array.from({ length: 3 }, () => ({
+      text: "Original task evidence.",
+      command: "printf candidate-99",
+    })));
+    const sourceUserContent = rich.messages[0]!.content as Array<{ text?: string }>;
+    const sourceToolCall = (rich.messages[1] as AssistantMessage).content.find(
+      (block) => block.type === "toolCall",
+    );
+    expect(sourceUserContent[0]?.text).toBe("Original task evidence.");
+    expect(sourceToolCall?.type === "toolCall" && sourceToolCall.arguments.command)
+      .toBe("printf candidate-99");
   });
 
   test("replays a tool-use turn directly without expanding or verifying", async () => {
@@ -433,9 +638,57 @@ describe("automatic request-level provider", () => {
     ]);
   });
 
-  test("skips the verifier when an exact-action majority agrees", async () => {
+  test("keeps nonterminal alternatives outside terminal-answer PPT", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const degraded: unknown[] = [];
+    const decisions: unknown[] = [];
+    const verifier = new RankingVerifier();
+    let nextIndex = 0;
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: (_model, candidateContext, options = {}) => {
+        const index = nextIndex++;
+        calls.push({ context: candidateContext, options });
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          const result = message(index, index > 0);
+          candidate.push({ type: "start", partial: result });
+          candidate.push({
+            type: "done",
+            reason: result.stopReason === "toolUse" ? "toolUse" : "stop",
+            message: result,
+          });
+        });
+        return candidate;
+      },
+      onDegraded: (event) => degraded.push(event),
+      onDecision: (decision) => decisions.push(decision),
+    }, context());
+    const { result } = await collect(stream);
+
+    expect(calls).toHaveLength(3);
+    expect(verifier.calls).toBe(0);
+    expect(result.responseId).toBe("response-0");
+    expect(result.stopReason).toBe("stop");
+    expect(degraded[0]).toMatchObject({
+      reason: "insufficient_candidates",
+      successfulCandidates: 1,
+      nonterminalCandidates: 2,
+    });
+    expect(decisions[0]).toMatchObject({
+      path: "fallback",
+      winnerIndex: 0,
+      successfulCandidates: 1,
+      nonterminalCandidates: 2,
+    });
+  });
+
+  test("runs the paper PPT when an exact-action majority agrees", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
     const verifier = new RankingVerifier();
+    const decisions: unknown[] = [];
     let next = 0;
     const stream = createAutoVerifierStream({
       originalModel: model(),
@@ -457,15 +710,109 @@ describe("automatic request-level provider", () => {
         });
         return out;
       },
+      onDecision: (decision) => decisions.push(decision),
     }, context());
     const { result } = await collect(stream);
-    // TurboAgent-style shortcut: 2 of 3 candidates share the same normalized
-    // action (> N/2), so selecting among them cannot change the answer and the
-    // whole verifier tournament is skipped.
     expect(calls).toHaveLength(3);
-    expect(verifier.calls).toBe(0);
+    expect(verifier.calls).toBeGreaterThan(0);
     expect(result.responseId).toBe("response-0");
     expect(result.content).toEqual([{ type: "text", text: "same plan A" }]);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({ path: "verifier", nComparisons: 4 });
+  });
+
+  test("reports the PPT decision: winner, scores, comparison count, usage", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const verifier = new RankingVerifier();
+    const decisions: unknown[] = [];
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls),
+      onDecision: (decision) => decisions.push(decision),
+    }, context());
+    await collect(stream);
+    expect(decisions).toHaveLength(1);
+    const decision = decisions[0] as {
+      path: string;
+      winnerIndex?: number;
+      candidateCount?: number;
+      successfulCandidates?: number;
+      nComparisons?: number;
+      criteria?: string[];
+      scores?: number[];
+      winnerScore?: number;
+      usage?: unknown;
+      durationMs?: number;
+      model?: string;
+      promptVersion?: string;
+      paperEquivalent?: boolean;
+      scoreSources?: unknown;
+      scoreDistribution?: unknown;
+    };
+    expect(decision.path).toBe("verifier");
+    expect(decision.winnerIndex).toBe(2);
+    expect(decision.candidateCount).toBe(3);
+    expect(decision.successfulCandidates).toBe(3);
+    // Algorithm 1 subtracts the one directed ring overlap from the
+    // N + k(N-k) + C(k,2) upper bound for N=3, k=1.
+    expect(decision.nComparisons).toBe(4);
+    expect(decision.paperEquivalent).toBe(true);
+    expect(decision.scoreSources).toEqual({
+      logprobs: 48,
+      textFallback: 0,
+      neutralTie: 0,
+      unknown: 0,
+    });
+    expect(decision.scoreDistribution).toEqual({
+      logprobScores: 48,
+      minSupport: 1,
+      meanSupport: 1,
+      minProbabilityMass: 1,
+      meanProbabilityMass: 1,
+    });
+    expect(decision.criteria).toEqual([
+      "task_correctness",
+      "evidence_and_verification",
+      "unresolved_error_signals",
+    ]);
+    expect(Array.isArray(decision.scores) && decision.scores.length).toBe(3);
+    expect(decision.winnerScore).toBeGreaterThanOrEqual(0);
+    expect(decision.winnerScore).toBeLessThanOrEqual(1);
+    expect(decision.durationMs).toBeGreaterThanOrEqual(0);
+    expect(decision.usage).toBeTruthy();
+    // The decision is self-describing: which verifier model and prompt
+    // contract produced it, so drift is traceable per request.
+    expect(decision.model).toBe("opencode-go/deepseek-v4-flash-0731");
+    expect(decision.promptVersion).toBe("pairwise-granularity20-v4");
+  });
+
+  test("reports an error decision when every candidate fails", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const decisions: unknown[] = [];
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls, new Set([0, 1, 2])),
+      onDecision: (decision) => decisions.push(decision),
+    }, context());
+    const { result } = await collect(stream);
+    expect(result.stopReason).toBe("error");
+    expect(decisions).toHaveLength(1);
+    const decision = decisions[0] as {
+      path: string;
+      candidateCount?: number;
+      successfulCandidates?: number;
+      error?: string;
+      durationMs?: number;
+    };
+    expect(decision.path).toBe("error");
+    expect(decision.candidateCount).toBe(3);
+    expect(decision.successfulCandidates).toBe(0);
+    expect(typeof decision.error).toBe("string");
+    expect(decision.durationMs).toBeGreaterThanOrEqual(0);
   });
 
   test("preserves the OMP cache/session identity on candidate calls", async () => {
@@ -496,21 +843,58 @@ describe("automatic request-level provider", () => {
     }
   });
 
-  test("falls back to the first successful candidate when verification fails", async () => {
+  test("reports neutral runtime ties when verification calls fail", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
     const degraded: unknown[] = [];
+    const decisions: unknown[] = [];
+    const cacheFile = "/tmp/omp-verifier-ties-" + crypto.randomUUID() + ".json";
+    temporaryFiles.push(cacheFile);
     const stream = createAutoVerifierStream({
       originalModel: model(),
       verifierClient: new RankingVerifier(true),
       apiKeyResolver: () => "original-key",
       streamSimpleFn: fakeCandidateStreamFactory(calls),
+      cacheFile,
       onDegraded: (event) => degraded.push(event),
+      onDecision: (decision) => decisions.push(decision),
     }, context());
     const { result } = await collect(stream);
     expect(result.responseId).toBe("response-0");
-    // reference on_error="tie": a failed verifier call scores 0.5/0.5
-    // instead of aborting the tournament or degrading the response.
-    expect(degraded).toEqual([]);
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toMatchObject({
+      reason: "non_probabilistic_scores",
+      scoreSources: { logprobs: 0, textFallback: 0, neutralTie: 48, unknown: 0 },
+    });
+    expect(decisions[0]).toMatchObject({
+      path: "verifier",
+      paperEquivalent: false,
+      scoreSources: { logprobs: 0, textFallback: 0, neutralTie: 48, unknown: 0 },
+    });
+    expect(loadCache(cacheFile)).toEqual({});
+  });
+
+  test("marks literal score fallback outside the paper-equivalent metric", async () => {
+    const degraded: unknown[] = [];
+    const decisions: unknown[] = [];
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    await collect(createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(false, false, "text_fallback"),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls),
+      onDegraded: (event) => degraded.push(event),
+      onDecision: (decision) => decisions.push(decision),
+    }, context()));
+
+    expect(degraded[0]).toMatchObject({
+      reason: "non_probabilistic_scores",
+      scoreSources: { logprobs: 0, textFallback: 48, neutralTie: 0, unknown: 0 },
+    });
+    expect(decisions[0]).toMatchObject({
+      path: "verifier",
+      paperEquivalent: false,
+      scoreSources: { logprobs: 0, textFallback: 48, neutralTie: 0, unknown: 0 },
+    });
   });
 
   test("keeps successful candidates when one candidate request fails", async () => {
@@ -545,6 +929,7 @@ describe("automatic request-level provider", () => {
       reason: "insufficient_candidates",
       candidateCount: 3,
       successfulCandidates: 1,
+      nonterminalCandidates: 0,
     }]);
   });
 
@@ -564,6 +949,7 @@ describe("automatic request-level provider", () => {
 
   test("returns an OMP aborted event when the request is cancelled", async () => {
     const controller = new AbortController();
+    const decisions: unknown[] = [];
     const stream = createAutoVerifierStream({
       originalModel: model(),
       verifierClient: new RankingVerifier(),
@@ -579,11 +965,14 @@ describe("automatic request-level provider", () => {
         else options.signal?.addEventListener("abort", abort, { once: true });
         return candidate;
       },
+      onDecision: (decision) => decisions.push(decision),
     }, context(), { signal: controller.signal });
     controller.abort();
     const { events, result } = await collect(stream);
     expect(result.stopReason).toBe("aborted");
     expect((events as Array<{ type: string }>).map((event) => event.type)).toEqual(["error"]);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({ path: "aborted" });
   });
 
   test("serializes the task and a compact candidate trace", () => {
@@ -591,16 +980,56 @@ describe("automatic request-level provider", () => {
     const contextText = serializeContext(current);
     const candidateText = serializeAssistantMessage(message(2, true));
     expect(contextText).toContain("Fix the failing test and verify it.");
-   expect(contextText).not.toContain("Message 1 (user)");
-   expect(candidateText).toContain("candidate text 2");
-   expect(candidateText).toContain("[proposed tool call] bash");
-   expect(candidateText).not.toContain("response-2");
+    expect(contextText).not.toContain("Message 1 (user)");
+    expect(candidateText).toContain("candidate text 2");
+    expect(candidateText).toContain("[proposed tool call] bash");
+    expect(candidateText).not.toContain("response-2");
     // Reasoning is not part of the reference trace; only visible text and
     // tool calls are scored, so thinking must not leak into the prompt.
     expect(candidateText).not.toContain("candidate thinking 2");
- });
+  });
 
-  test("reduces user context to the task and counts images", () => {
+  test("keeps selected trajectory evidence in chronological order", () => {
+    const first = message(0);
+    first.content = [{ type: "text", text: "first assistant action" }];
+    const second = message(1);
+    second.content = [{ type: "text", text: "second assistant action" }];
+    const history: Context = {
+      ...context(),
+      messages: [
+        { role: "user", content: "Complete the task.", timestamp: 1 },
+        first,
+        {
+          role: "toolResult",
+          toolCallId: "first",
+          toolName: "bash",
+          content: [{ type: "text", text: "first tool output" }],
+          isError: false,
+          timestamp: 2,
+        },
+        second,
+        {
+          role: "toolResult",
+          toolCallId: "second",
+          toolName: "bash",
+          content: [{ type: "text", text: "second tool output" }],
+          isError: false,
+          timestamp: 3,
+        },
+      ],
+    };
+    const serialized = serializeContext(history);
+    const positions = [
+      serialized.indexOf("first assistant action"),
+      serialized.indexOf("first tool output"),
+      serialized.indexOf("second assistant action"),
+      serialized.indexOf("second tool output"),
+    ];
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect(positions).toEqual([...positions].sort((a, b) => a - b));
+  });
+
+  test("forwards user task images through every PPT verifier comparison", async () => {
     const rich: Context = {
       systemPrompt: ["You are an OMP coding agent."],
       messages: [{
@@ -623,11 +1052,194 @@ describe("automatic request-level provider", () => {
         customWireName: "bash",
       }],
     };
+    const verifier = new RankingVerifier(false, true);
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls),
+    }, rich);
+    await collect(stream);
     const serialized = serializeContext(rich);
     expect(serialized).toContain("Inspect this screenshot.");
-    expect(serialized).toContain("1 image(s)");
     expect(serialized).not.toContain("Available tools");
     expect(serialized).not.toContain("aGVsbG8=");
+    expect(verifier.calls).toBeGreaterThan(0);
+    expect(verifier.prompts.every((prompt) => prompt.includes(
+      "**Attached images:** 1 image(s) are attached to this message, in order;",
+    ))).toBe(true);
+    for (const images of verifier.imageBatches) {
+      expect(images).toEqual([
+        { type: "image", data: "aGVsbG8=", mimeType: "image/png", detail: "high" },
+      ]);
+    }
+  });
+
+  test("forwards shared trajectory images in chronological order", async () => {
+    const taskImage: ImageContent = {
+      type: "image",
+      data: "dGFzaw==",
+      mimeType: "image/png",
+    };
+    const assistantImage: ImageContent = {
+      type: "image",
+      data: "YXNzaXN0YW50",
+      mimeType: "image/webp",
+      detail: "high",
+    };
+    const followupImage: ImageContent = {
+      type: "image",
+      data: "Zm9sbG93dXA=",
+      mimeType: "image/png",
+    };
+    const toolImage: ImageContent = {
+      type: "image",
+      data: "dG9vbA==",
+      mimeType: "image/jpeg",
+    };
+    const priorAssistant = message(9, true);
+    priorAssistant.content.push(assistantImage);
+    const rich: Context = {
+      ...context(),
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "Inspect the visual evidence." }, taskImage],
+          timestamp: 1,
+        },
+        priorAssistant,
+        {
+          role: "user",
+          content: [followupImage],
+          timestamp: 2,
+        },
+        {
+          role: "toolResult",
+          toolCallId: "call-9",
+          toolName: "view_image",
+          content: [
+            { type: "text", text: "Rendered the current UI." },
+            toolImage,
+          ],
+          isError: false,
+          timestamp: 3,
+        },
+      ],
+    };
+    const verifier = new RankingVerifier(false, true);
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    await collect(createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls),
+    }, rich));
+
+    expect(verifier.calls).toBeGreaterThan(0);
+    expect(verifier.prompts.every((prompt) => prompt.includes(
+      "**Attached images:** 4 image(s) are attached to this message, in order;",
+    ))).toBe(true);
+    expect(verifier.imageBatches.every((images) =>
+      JSON.stringify(images) === JSON.stringify([
+        taskImage,
+        assistantImage,
+        followupImage,
+        toolImage,
+      ])
+    )).toBe(true);
+    const serialized = serializeContext(rich);
+    expect(serialized).toContain("Rendered the current UI.");
+    expect(serialized).toContain("[image attached]");
+    expect(serialized).not.toContain(toolImage.data);
+  });
+
+  test("labels and aligns candidate-specific images with trajectory slots", async () => {
+    const sharedImage: ImageContent = {
+      type: "image",
+      data: "c2hhcmVk",
+      mimeType: "image/png",
+    };
+    const candidateImages: ImageContent[] = [0, 1, 2].map((index) => ({
+      type: "image",
+      data: Buffer.from("candidate-" + index).toString("base64"),
+      mimeType: "image/png",
+    }));
+    const imageContext: Context = {
+      ...context(),
+      messages: [{
+        role: "user",
+        content: [{ type: "text", text: "Compare the rendered candidates." }, sharedImage],
+        timestamp: 1,
+      }],
+    };
+    const verifier = new RankingVerifier(false, true);
+    let nextIndex = 0;
+    await collect(createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: () => {
+        const index = nextIndex++;
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          const result = message(index);
+          result.content.push(candidateImages[index]!);
+          candidate.push({ type: "start", partial: result });
+          candidate.push({ type: "done", reason: "stop", message: result });
+        });
+        return candidate;
+      },
+    }, imageContext));
+
+    expect(verifier.prompts.length).toBeGreaterThan(0);
+    for (let index = 0; index < verifier.prompts.length; index += 1) {
+      const prompt = verifier.prompts[index]!;
+      const trajectoryA = Number(/\*\*Trajectory A:\*\*[\s\S]*?candidate text (\d+)/.exec(prompt)?.[1]);
+      const trajectoryB = Number(/\*\*Trajectory B:\*\*[\s\S]*?candidate text (\d+)/.exec(prompt)?.[1]);
+      expect(prompt).toContain(
+        "Order: 1 shared task-context image(s), then 1 Trajectory A image(s), " +
+        "then 1 Trajectory B image(s).",
+      );
+      expect(verifier.imageBatches[index]).toEqual([
+        sharedImage,
+        candidateImages[trajectoryA],
+        candidateImages[trajectoryB],
+      ]);
+    }
+  });
+
+  test("reports a visible fallback when the verifier cannot inspect task images", async () => {
+    const verifier = new RankingVerifier();
+    const degraded: unknown[] = [];
+    const decisions: unknown[] = [];
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const imageContext: Context = {
+      ...context(),
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "Inspect this screenshot." },
+          { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+        ],
+        timestamp: 1,
+      }],
+    };
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: fakeCandidateStreamFactory(calls),
+      onDegraded: (event) => degraded.push(event),
+      onDecision: (decision) => decisions.push(decision),
+    }, imageContext);
+    const { result } = await collect(stream);
+    expect(result.responseId).toBe("response-0");
+    expect(verifier.calls).toBe(0);
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toMatchObject({ reason: "verification_error" });
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({ path: "fallback" });
   });
 
   test("bounds a many-block candidate trace to the total budget", () => {
@@ -1061,7 +1673,7 @@ describe("OMP default model inheritance", () => {
   });
 });
 
-describe("cache and fixed paper defaults", () => {
+describe("cache and fixed self-verification defaults", () => {
   test("cache identity includes model, effort, prompt and request lineage", () => {
     const base: CacheContext = {
       criterionId: "criterion",
@@ -1070,6 +1682,9 @@ describe("cache and fixed paper defaults", () => {
       problem: "problem",
       traceA: "a",
       traceB: "b",
+      imagesFingerprint: "",
+      trajectoryImagesAFingerprint: "",
+      trajectoryImagesBFingerprint: "",
       provider: "inferx",
       api: "openai-responses",
       model: "deepseek-v4-flash-0731",
@@ -1078,22 +1693,59 @@ describe("cache and fixed paper defaults", () => {
       baseUrl: "https://example.test/v1",
       requestIdentity: "identity",
       groundTruthNote: CODING_AGENT_GROUND_TRUTH_NOTE,
-      promptVersion: "pairwise-granularity20-v2",
+      promptVersion: "pairwise-granularity20-v4",
     };
     const key = cacheKey("criterion", "task", 0, 1, 0, base);
     expect(cacheKey("criterion", "task", 0, 1, 0, { ...base, effort: "high" })).not.toBe(key);
     expect(cacheKey("criterion", "task", 0, 1, 0, { ...base, traceA: "changed" })).not.toBe(key);
+    expect(cacheKey("criterion", "task", 0, 1, 0, {
+      ...base,
+      imagesFingerprint: "different-image",
+    })).not.toBe(key);
+    expect(cacheKey("criterion", "task", 0, 1, 0, {
+      ...base,
+      trajectoryImagesAFingerprint: "different-candidate-image",
+    })).not.toBe(key);
   });
 
   test("saveCache merges entries durably", () => {
     const path = "/tmp/omp-verifier-" + crypto.randomUUID() + ".json";
     temporaryFiles.push(path);
-    saveCache(path, { first: { score_A: 0.2, score_B: 0.8 } });
+    saveCache(path, {
+      first: {
+        score_A: 0.2,
+        score_B: 0.8,
+        source_A: "logprobs",
+        source_B: "logprobs",
+        support_A: 3,
+        support_B: 2,
+        probability_mass_A: 0.9,
+        probability_mass_B: 0.8,
+      },
+    });
     saveCache(path, { second: { score_A: 0.7, score_B: 0.3 } });
-    expect(Object.keys(loadCache(path)).sort()).toEqual(["first", "second"]);
+    const loaded = loadCache(path);
+    expect(Object.keys(loaded).sort()).toEqual(["first", "second"]);
+    expect(loaded.first).toMatchObject({
+      source_A: "logprobs",
+      support_A: 3,
+      probability_mass_A: 0.9,
+    });
   });
 
-  test("uses the paper's small self-verification defaults", () => {
+  test("keeps neutral failure ties outside the durable cache", () => {
+    const path = "/tmp/omp-verifier-neutral-" + crypto.randomUUID() + ".json";
+    temporaryFiles.push(path);
+    saveCache(path, {
+      durable: { score_A: 0.8, score_B: 0.2, source_A: "text_fallback", source_B: "text_fallback" },
+      retryable: { score_A: 0.5, score_B: 0.5, source_A: "neutral_tie", source_B: "neutral_tie" },
+    });
+    expect(loadCache(path)).toEqual({
+      durable: { score_A: 0.8, score_B: 0.2, source_A: "text_fallback", source_B: "text_fallback" },
+    });
+  });
+
+  test("uses the author's small Bo3 self-verification defaults", () => {
     expect(SELF_VERIFICATION_DEFAULTS).toEqual({ pivots: 1, nEvaluations: 2, seed: 0, maxWorkers: 8 });
     expect(CODING_AGENT_CRITERIA).toHaveLength(3);
   });

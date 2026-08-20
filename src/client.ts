@@ -7,7 +7,7 @@ import {
   withAuth,
   type ApiKeyResolver,
 } from "@oh-my-pi/pi-ai/auth-retry";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { createHash } from "node:crypto";
 import type { VerifierReply } from "./scale.ts";
 
@@ -30,6 +30,7 @@ export interface VerifierConfig {
   headers?: Record<string, string>;
   compat?: VerifierCompat;
   keyless?: boolean;
+  supportsImages?: boolean;
   effort: string;
   maxTokens: number;
 }
@@ -267,11 +268,13 @@ export class VerifierClient {
   readonly headers: Record<string, string>;
   readonly compat: VerifierCompat;
   readonly keyless: boolean;
+  readonly supportsImages: boolean;
   readonly requestIdentity: string;
 
   constructor(cfg: VerifierConfig) {
     this.baseUrl = cfg.baseUrl.replace(/\/+$/, "");
     this.keyless = cfg.keyless === true || cfg.apiKey.trim() === "N/A";
+    this.supportsImages = cfg.supportsImages === true;
     this.apiKey = this.keyless ? "" : cfg.apiKey.trim();
     this.apiKeyResolver = cfg.apiKeyResolver;
     this.provider = cfg.provider;
@@ -307,7 +310,15 @@ export class VerifierClient {
   }
 
   /** Request a verifier response with token-level logprobs. */
-  async scoreReply(prompt: string, opts: { signal?: AbortSignal; maxTokens?: number; timeoutMs?: number } = {}): Promise<VerifierReply> {
+  async scoreReply(
+    prompt: string,
+    opts: {
+      signal?: AbortSignal;
+      maxTokens?: number;
+      timeoutMs?: number;
+      images?: readonly ImageContent[];
+    } = {},
+  ): Promise<VerifierReply> {
     if (!prompt.trim()) throw new Error("Verifier prompt must be non-empty");
     if (!this.ready) {
       throw new MissingAPIKeyError(
@@ -317,13 +328,40 @@ export class VerifierClient {
     const effort = this.effort;
     const reasoningEnabled = effort !== "off" && effort !== "disabled" && effort !== "none";
     const responses = this.api === "openai-responses";
+    const images = opts.images ?? [];
+    if (images.length > 0 && !this.supportsImages) {
+      throw new Error(
+        `Verifier model ${this.provider}/${this.model} cannot inspect the context images required for this comparison.`,
+      );
+    }
+    const imageUrls = images.map(verifierImageDataUrl);
+    const responseContent: Array<Record<string, unknown>> = [
+      { type: "input_text", text: prompt },
+      ...images.map((image, index) => ({
+        type: "input_image",
+        image_url: imageUrls[index],
+        ...(image.detail ? { detail: image.detail } : {}),
+      })),
+    ];
+    const chatContent: string | Array<Record<string, unknown>> = images.length === 0
+      ? prompt
+      : [
+          { type: "text", text: prompt },
+          ...images.map((image, index) => ({
+            type: "image_url",
+            image_url: {
+              url: imageUrls[index],
+              ...(image.detail && image.detail !== "original" ? { detail: image.detail } : {}),
+            },
+          })),
+        ];
     const body: Record<string, unknown> = responses
       ? {
           model: this.model,
           input: [
             {
               role: "user",
-              content: [{ type: "input_text", text: prompt }],
+              content: responseContent,
             },
           ],
           max_output_tokens: opts.maxTokens ?? this.maxTokens,
@@ -338,7 +376,7 @@ export class VerifierClient {
         }
       : {
           model: this.model,
-          messages: [{ role: "user", content: prompt }],
+          messages: [{ role: "user", content: chatContent }],
           max_tokens: opts.maxTokens ?? this.maxTokens,
           // Sample/expose the natural p_theta distribution: the paper's
           // reward is sum_g p_theta(v_g | ...) * phi(v_g), and the reference
@@ -355,39 +393,39 @@ export class VerifierClient {
       this.applyChatReasoning(body, effort, reasoningEnabled);
     }
 
-  const requestAbort = mergeAbortSignals(opts.signal, opts.timeoutMs ?? 600_000);
- try {
-    const credential = this.apiKeyResolver ?? (this.keyless ? "N/A" : this.apiKey);
-   const fetchBody = () => withAuth(
-      credential,
-      async (apiKey) => {
-        const endpoint = this.baseUrl + "/" + (responses ? "responses" : "chat/completions");
-        return this.requestJsonWithRetry(endpoint, body, apiKey, requestAbort.signal);
-      },
-      {
-        isAuthError: isAuthRetryableError,
-        signal: requestAbort.signal,
-        missingKeyMessage: "The active OMP model has no usable credentials.",
-      },
-    );
-    let data = await fetchBody();
-    this.recordUsage(data);
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        return responses ? this.parseResponsesReply(data) : this.parseChatReply(data);
-      } catch (error) {
-        if (!isVerifierLogprobsUnsupportedError(error)) throw error;
-        if (error instanceof VerifierLogprobsUnsupportedError && !error.retryable) throw error;
-        if (attempt >= VERIFIER_TRANSIENT_RETRIES) throw error;
-        await waitForRetry(verifierBackoffMs(attempt + 1), requestAbort.signal);
-        data = await fetchBody();
-        this.recordUsage(data);
+    const requestAbort = mergeAbortSignals(opts.signal, opts.timeoutMs ?? 600_000);
+    try {
+      const credential = this.apiKeyResolver ?? (this.keyless ? "N/A" : this.apiKey);
+      const fetchBody = () => withAuth(
+        credential,
+        async (apiKey) => {
+          const endpoint = this.baseUrl + "/" + (responses ? "responses" : "chat/completions");
+          return this.requestJsonWithRetry(endpoint, body, apiKey, requestAbort.signal);
+        },
+        {
+          isAuthError: isAuthRetryableError,
+          signal: requestAbort.signal,
+          missingKeyMessage: "The active OMP model has no usable credentials.",
+        },
+      );
+      let data = await fetchBody();
+      this.recordUsage(data);
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return responses ? this.parseResponsesReply(data) : this.parseChatReply(data);
+        } catch (error) {
+          if (!isVerifierLogprobsUnsupportedError(error)) throw error;
+          if (error instanceof VerifierLogprobsUnsupportedError && !error.retryable) throw error;
+          if (attempt >= VERIFIER_TRANSIENT_RETRIES) throw error;
+          await waitForRetry(verifierBackoffMs(attempt + 1), requestAbort.signal);
+          data = await fetchBody();
+          this.recordUsage(data);
+        }
       }
+    } finally {
+      requestAbort.dispose();
     }
-  } finally {
-    requestAbort.dispose();
   }
-}
 
   private parseChatReply(data: Record<string, unknown>): VerifierReply {
     const choices = Array.isArray(data.choices)
@@ -425,7 +463,7 @@ export class VerifierClient {
       for (const rawPart of content) {
         if (!rawPart || typeof rawPart !== "object" || Array.isArray(rawPart)) continue;
         const part = rawPart as Record<string, unknown>;
-        if (part.type !== "output_text" && typeof part.text !== "string") continue;
+        if (part.type !== "output_text") continue;
         if (typeof part.text === "string") textParts.push(part.text);
         if (Array.isArray(part.logprobs)) positions.push(...part.logprobs);
       }
@@ -627,6 +665,17 @@ function mapReasoningEffort(compat: VerifierCompat, effort: string): string {
   return compat.reasoningEffortMap?.[effort] ?? effort;
 }
 
+function verifierImageDataUrl(image: ImageContent): string {
+  const mimeType = image.mimeType.trim().toLowerCase();
+  if (!/^image\/[a-z0-9][a-z0-9.+-]*$/i.test(mimeType)) {
+    throw new Error(`Verifier image has an invalid MIME type: ${image.mimeType}`);
+  }
+  if (typeof image.data !== "string" || image.data.trim().length === 0) {
+    throw new Error("Verifier image data must be non-empty base64 text.");
+  }
+  return `data:${mimeType};base64,${image.data}`;
+}
+
 function normalizeCompat(raw: unknown): VerifierCompat {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const value = raw as Record<string, unknown>;
@@ -741,12 +790,12 @@ export async function createVerifierClient(
   if (!model) {
     throw new MissingAPIKeyError("OMP modelRoles.default did not resolve to an available model.");
   }
-    if (!isVerifierSupportedApi(model.api)) {
-      throw new Error(
-        "Verifier model " + model.provider + "/" + model.id + " uses " + model.api +
-          "; LLM-as-a-Verifier requires a model with OpenAI token logprobs.",
-      );
-    }
+  if (!isVerifierSupportedApi(model.api)) {
+    throw new Error(
+      "Verifier model " + model.provider + "/" + model.id + " uses " + model.api +
+        "; LLM-as-a-Verifier requires a model with OpenAI token logprobs.",
+    );
+  }
   const resolver = ctx.modelRegistry.resolver(model, ctx.sessionId);
   const auth = await resolveOmpAuth(ctx, model);
   if (!auth.ok) {
@@ -785,6 +834,7 @@ export async function createVerifierClient(
     apiKey: initialKey,
     apiKeyResolver,
     keyless: initialKey === "N/A",
+    supportsImages: Array.isArray(model.input) && model.input.includes("image"),
     provider: model.provider,
     api: model.api,
     modelId: model.requestModelId ?? model.id,

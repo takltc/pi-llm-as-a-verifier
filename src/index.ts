@@ -329,6 +329,15 @@ async function createVerificationBinding(
             "warning",
           );
         },
+        onDecision: (decision) => {
+          console.info(JSON.stringify({
+            component: PLUGIN_NAME,
+            event: "decision",
+            ...decision,
+            winnerScore: decision.winnerScore === undefined ? undefined : Number(decision.winnerScore.toFixed(4)),
+            scores: decision.scores?.map((score) => Number(score.toFixed(4))),
+          }));
+        },
       },
       { candidateCount },
     ),

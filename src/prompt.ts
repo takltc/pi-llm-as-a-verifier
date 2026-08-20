@@ -10,12 +10,18 @@
 import { SCALE } from "./scale.ts";
 
 /** Bump whenever the prompt contract changes; it invalidates persisted scores. */
-export const PROMPT_VERSION = "pairwise-granularity20-v2";
+export const PROMPT_VERSION = "pairwise-granularity20-v4";
 
 export interface Criterion {
   id: string;
   name: string;
   description: string;
+}
+
+export interface PromptImageLayout {
+  shared: number;
+  trajectoryA: number;
+  trajectoryB: number;
 }
 
 export const GROUND_TRUTH_NOTE =
@@ -185,13 +191,43 @@ export function buildPrompt(
   traceB: string,
   criterion: Criterion,
   groundTruthNote = GROUND_TRUTH_NOTE,
+  imageLayout: number | PromptImageLayout = 0,
 ): string {
+  if (
+    typeof imageLayout !== "number" &&
+    (!imageLayout || typeof imageLayout !== "object" || Array.isArray(imageLayout))
+  ) {
+    throw new Error("buildPrompt: image layout must be a count or layout object");
+  }
+  const layout = typeof imageLayout === "number"
+    ? { shared: imageLayout, trajectoryA: 0, trajectoryB: 0 }
+    : imageLayout;
+  for (const [name, count] of Object.entries(layout)) {
+    if (!Number.isInteger(count) || count < 0) {
+      throw new Error(`buildPrompt: image count ${name} must be a non-negative integer`);
+    }
+  }
+  const nImages = layout.shared + layout.trajectoryA + layout.trajectoryB;
+  const imagesNote = (() => {
+    if (nImages === 0) return "";
+    if (layout.trajectoryA === 0 && layout.trajectoryB === 0) {
+      return `**Attached images:** ${nImages} image(s) are attached to this message, in order; ` +
+        "they are part of the task context.\n\n";
+    }
+    const groups: string[] = [];
+    if (layout.shared > 0) groups.push(`${layout.shared} shared task-context image(s)`);
+    if (layout.trajectoryA > 0) groups.push(`${layout.trajectoryA} Trajectory A image(s)`);
+    if (layout.trajectoryB > 0) groups.push(`${layout.trajectoryB} Trajectory B image(s)`);
+    return `**Attached images:** ${nImages} image(s) are attached to this message. ` +
+      `Order: ${groups.join(", then ")}.\n\n`;
+  })();
   return (
     "You are an expert evaluator of AI coding agents. " +
     "You will see a task description and two agent trajectories, then " +
     "evaluate them on ONE specific criterion, stated at the end.\n\n" +
     `${groundTruthNote}\n\n` +
     `**Task:**\n${problem}\n\n` +
+    imagesNote +
     `**Trajectory A:**\n${traceA}\n\n` +
     `**Trajectory B:**\n${traceB}\n\n` +
     `**Rating Scale:**\n${SCALE.scaleDescription}\n\n` +

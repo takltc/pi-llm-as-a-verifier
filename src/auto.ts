@@ -4,6 +4,7 @@ import {
   streamSimple,
   type AssistantMessage,
   type Context,
+  type ImageContent,
   type Message,
   type Model,
   type SimpleStreamOptions,
@@ -18,7 +19,9 @@ import {
   CODING_AGENT_CRITERIA,
   CODING_AGENT_GROUND_TRUTH_NOTE,
 } from "./prompt.ts";
-import type { VerifierClient } from "./client.ts";
+import type { UsageSnapshot, VerifierClient } from "./client.ts";
+import { PROMPT_VERSION } from "./prompt.ts";
+import type { ScoreDistributionQuality, ScoreSourceCounts } from "./cache.ts";
 
 export const AUTO_CANDIDATE_COUNT = 3;
 export const AUTO_CANDIDATE_COUNT_MIN = 2;
@@ -43,8 +46,8 @@ const THINKING_MAX_CHARS = 800;
 const PROBLEM_MAX_CHARS = 16000;
 // The paper's best-of-3 self-verification config (scripts/run_bo3.py):
 // pivots=1, K=2 repeated verifications per criterion. The wrapper keeps these
-// paper defaults; cost control lives in terminal gating and the majority
-// shortcut, not in weakening the verifier's evaluation.
+// Bo3 compatibility defaults. Cost control lives in terminal-answer gating;
+// every eligible best-of-N selection still runs the paper's PPT evaluator.
 export const AUTO_SELECTION_DEFAULTS = {
   pivots: 1,
   nEvaluations: 2,
@@ -60,6 +63,8 @@ export interface AutoVerifierState {
   /** Optional JSON score cache reused across requests in the same working tree. */
   cacheFile?: string;
   onDegraded?: (event: AutoVerifierDegradedEvent) => void;
+  /** Diagnose what decided each verified answer (PPT, fallback, abort, or error). */
+  onDecision?: (decision: AutoVerifierDecision) => void;
 }
 
 export interface AutoVerifierOptions {
@@ -83,13 +88,67 @@ export function normalizeCandidateCount(value: unknown): number {
 
 export type AutoVerifierDegradedReason =
   | "insufficient_candidates"
-  | "verification_error";
+  | "verification_error"
+  | "non_probabilistic_scores";
 
 export interface AutoVerifierDegradedEvent {
   reason: AutoVerifierDegradedReason;
   candidateCount: number;
   successfulCandidates: number;
+  nonterminalCandidates?: number;
   error?: string;
+  scoreSources?: ScoreSourceCounts;
+  scoreDistribution?: ScoreDistributionQuality;
+}
+
+export interface AutoVerifierDecision {
+  /** How the winner was chosen for this final answer.
+   *
+   *  - "verifier": the paper's PPT tournament selected the winner
+   *  - "fallback": PPT failed or too few candidates succeeded; the earliest
+   *    successful terminal candidate was replayed
+   *  - "aborted": the caller cancelled the request
+   *  - "error": no usable candidate; the request errored
+   */
+  path: "verifier" | "fallback" | "aborted" | "error";
+  candidateCount: number;
+  successfulCandidates: number;
+  /** Generated alternatives that proposed another tool action. */
+  nonterminalCandidates?: number;
+  /** Raw candidate index (0..candidateCount-1) whose response was replayed. */
+  winnerIndex?: number;
+  /** Wall-clock time the whole selection took, in milliseconds. */
+  durationMs: number;
+  /** Verifier token usage for this request (verifier path only). */
+  usage?: UsageSnapshot;
+  /** Mean preference w/c per candidate, index-aligned with the candidate array
+   *  PPT scored (successful candidates in index order). */
+  scores?: number[];
+  /** Mean preference of the selected winner (verifier path only). */
+  winnerScore?: number;
+  /** Unique directed comparisons PPT aggregated after removing ring/pivot overlap. */
+  nComparisons?: number;
+  /** Criterion ids the verifier averaged over. */
+  criteria?: string[];
+  /** Score-tag provenance across all candidate observations. */
+  scoreSources?: ScoreSourceCounts;
+  /** Effective returned A-T support and probability mass. */
+  scoreDistribution?: ScoreDistributionQuality;
+  /** True when every score came from the Eq. (3.1) token distribution. */
+  paperEquivalent?: boolean;
+  /** Verifier model id (provider/model) that produced the scores. */
+  model?: string;
+  /** Prompt contract version whose criteria scored the candidates. */
+  promptVersion?: string;
+  error?: string;
+}
+
+/** Verifier model + prompt contract that produced a PPT decision. */
+function decisionIdentity(state: AutoVerifierState): { model: string; promptVersion: string } {
+  return {
+    model: state.verifierClient.provider + "/" + state.verifierClient.model,
+    promptVersion: PROMPT_VERSION,
+  };
 }
 
 interface CandidateResult {
@@ -149,6 +208,9 @@ async function runAutomaticVerification(
   const onAbort = () => controller.abort(streamOptions.signal?.reason ?? abortReason());
   if (streamOptions.signal?.aborted) onAbort();
   else streamOptions.signal?.addEventListener("abort", onAbort, { once: true });
+  const startedAt = Date.now();
+  let successfulCandidates = 0;
+  let nonterminalCandidates = 0;
   try {
     // The wrapper is invoked for every model call the agent loop makes,
     // including each intermediate tool-call turn. Candidate 0 is the natural
@@ -181,39 +243,43 @@ async function runAutomaticVerification(
     const successful: CandidateResult[] = [];
     if (first) successful.push(first);
     for (const result of settled) {
-      if (result.status === "fulfilled") successful.push(result.value);
-      else firstError ??= result.reason;
+      if (result.status === "fulfilled") {
+        if (isToolUseMessage(result.value.message)) nonterminalCandidates += 1;
+        else successful.push(result.value);
+      } else firstError ??= result.reason;
     }
     successful.sort((a, b) => a.index - b.index);
+    successfulCandidates = successful.length;
     if (successful.length === 0) {
       throw firstError instanceof Error
         ? firstError
         : new Error(String(firstError ?? "All automatic verifier candidates failed"));
     }
-
     let winner = successful[0];
-    const majority = successful.length >= 2 ? exactActionMajority(successful) : undefined;
-    if (majority !== undefined) {
-      // Self-consistency gate (cost optimization, not part of the paper's
-      // tournament): when a strict majority (> N/2) of candidates produced
-      // the same normalized action, majority voting already decides the
-      // answer, so the verifier is never called. Every request without a
-      // majority runs the paper's full PPT selection below unchanged. Normal
-      // success path, no degradation signal.
-      winner = majority;
-    } else if (successful.length < 2) {
+    let decision: AutoVerifierDecision = {
+      path: "fallback",
+      candidateCount,
+      successfulCandidates,
+      nonterminalCandidates,
+      winnerIndex: winner.index,
+      durationMs: Date.now() - startedAt,
+    };
+    if (successful.length < 2) {
       reportDegraded(state, {
         reason: "insufficient_candidates",
         candidateCount,
-        successfulCandidates: successful.length,
+        successfulCandidates,
+        nonterminalCandidates,
       });
     } else {
       try {
+        const verificationContext = serializeVerificationContext(context);
         const selection = await select(
-          serializeContext(context),
+          verificationContext.problem,
           successful.map((candidate) => ({
             name: "candidate_" + candidate.index,
             trace: serializeAssistantMessage(candidate.message),
+            images: imagesFromContent(candidate.message.content),
           })),
           {
             ...AUTO_SELECTION_DEFAULTS,
@@ -225,22 +291,65 @@ async function runAutomaticVerification(
             signal: controller.signal,
             client: state.verifierClient,
             taskName: "current_request",
+            images: verificationContext.images,
           },
         );
+        if (!selection.paperEquivalent) {
+          reportDegraded(state, {
+            reason: "non_probabilistic_scores",
+            candidateCount,
+            successfulCandidates,
+            nonterminalCandidates,
+            scoreSources: selection.scoreSources,
+            scoreDistribution: selection.scoreDistribution,
+          });
+        }
         winner = successful[selection.index] ?? winner;
+        decision = {
+          ...decision,
+          path: "verifier",
+          winnerIndex: winner.index,
+          scores: selection.scores,
+          winnerScore: selection.scores[selection.index],
+          nComparisons: selection.nComparisons,
+          criteria: selection.criteria,
+          scoreSources: selection.scoreSources,
+          scoreDistribution: selection.scoreDistribution,
+          paperEquivalent: selection.paperEquivalent,
+          usage: selection.usage,
+          ...decisionIdentity(state),
+        };
       } catch (error) {
         if (controller.signal.aborted || isAbortError(error)) throw error;
         reportDegraded(state, {
           reason: "verification_error",
           candidateCount,
-          successfulCandidates: successful.length,
+          successfulCandidates,
+          nonterminalCandidates,
           error: errorMessage(error),
         });
+        decision = {
+          ...decision,
+          path: "fallback",
+          error: errorMessage(error),
+        };
       }
     }
+    reportDecision(state, {
+      ...decision,
+      durationMs: Date.now() - startedAt,
+    });
     replayAssistantMessage(output, winner.message);
   } catch (error) {
     const reason = controller.signal.aborted || isAbortError(error) ? "aborted" : "error";
+    reportDecision(state, {
+      path: reason,
+      candidateCount,
+      successfulCandidates,
+      nonterminalCandidates,
+      durationMs: Date.now() - startedAt,
+      error: errorMessage(error),
+    });
     output.push({
       type: "error",
       reason,
@@ -264,43 +373,6 @@ function isToolUseMessage(message: AssistantMessage): boolean {
           !!block && typeof block === "object" &&
           (block as unknown as Record<string, unknown>).type === "toolCall",
       ));
-}
-
-/**
- * A normalized fingerprint of the candidate's observable action: visible text,
- * tool name, and tool arguments. Call id and transport metadata are excluded
- * so identical actions agree even when ids/usage differ.
- */
-function actionFingerprint(message: AssistantMessage): string {
-  const parts: string[] = [];
-  for (const block of message.content ?? []) {
-    if (!block || typeof block !== "object") continue;
-    const value = block as unknown as Record<string, unknown>;
-    if (value.type === "text" && typeof value.text === "string") {
-      const text = value.text.trim();
-      if (text) parts.push(text.replace(/\s+/g, " "));
-    } else if (value.type === "toolCall") {
-      const toolCall = value as unknown as ToolCall;
-      parts.push("[tool] " + toolCall.name + " " + compactJson(toolCall.arguments));
-    }
-  }
-  return parts.join("\n");
-}
-
-/** First candidate among the strict > N/2 exact-action majority, if any. */
-function exactActionMajority(candidates: CandidateResult[]): CandidateResult | undefined {
-  const counts = new Map<string, number>();
-  const first = new Map<string, CandidateResult>();
-  for (const candidate of candidates) {
-    const fingerprint = actionFingerprint(candidate.message);
-    counts.set(fingerprint, (counts.get(fingerprint) ?? 0) + 1);
-    if (!first.has(fingerprint)) first.set(fingerprint, candidate);
-  }
-  const threshold = candidates.length / 2;
-  for (const [fingerprint, count] of counts) {
-    if (fingerprint && count > threshold) return first.get(fingerprint);
-  }
-  return undefined;
 }
 
 async function generateCandidate(
@@ -336,9 +408,28 @@ async function generateCandidate(
 function cloneContext(context: Context): Context {
   return {
     systemPrompt: context.systemPrompt ? [...context.systemPrompt] : undefined,
-    messages: context.messages.map((message) => ({ ...message })),
+    messages: context.messages.map((message) => {
+      const source = message as unknown as Record<string, unknown>;
+      const cloned = { ...source };
+      const content = source.content;
+      if (content !== undefined) cloned.content = cloneMessageData(content);
+      return cloned as unknown as Message;
+    }),
     tools: context.tools ? [...context.tools] : undefined,
   };
+}
+
+/** Clone mutable message content while preserving provider payload identity. */
+function cloneMessageData(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(cloneMessageData);
+  if (!value || typeof value !== "object") return value;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(
+      ([key, item]) => [key, cloneMessageData(item)],
+    ),
+  );
 }
 
 /**
@@ -347,22 +438,24 @@ function cloneContext(context: Context): Context {
  * Mirrors the reference loaders: `_tb_extract_problem` and `_sb_extract_problem`
  * both derive `problem` from the USER's request, never from the system prompt,
  * tool schemas, or transport metadata. For the transparent wrapper the task is
- * the most recent user message (the request being answered); images are reduced
- * to a count and very long requests are capped so the prompt prefix stays
- * stable and cheap across the tournament's repeated comparisons.
+ * the most recent user message (the request being answered); shared images are
+ * carried separately to the multimodal verifier and very long requests are
+ * capped so the prompt prefix stays stable across repeated comparisons.
  *
  * The verifier's criteria instruct it to treat OBSERVED tool results as ground
- * truth, so the problem also carries a bounded, latest-first slice of the
- * trajectory since that request: visible assistant actions and tool outputs
+ * truth, so the problem also carries a recency-bounded chronological slice of
+ * the trajectory since that request: visible assistant actions and tool outputs
  * (per-block truncated), still excluding system/developer prompts, reasoning,
- * tool schemas, and image payloads. The task, separator, and evidence share
- * the 16k problem budget — the hard cap on every pairwise prompt.
+ * tool schemas, and image payloads. Task images and shared trajectory images
+ * travel separately in chronological order. The task, separator, and evidence
+ * share the 16k problem budget — the hard cap on every pairwise prompt.
  */
-export function serializeContext(context: Context): string {
+function serializeVerificationContext(
+  context: Context,
+): { problem: string; images: ImageContent[] } {
   const messages = context.messages ?? [];
   let task = "";
   let taskIndex = -1;
-  let imageCount = 0;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (!message || message.role !== "user") continue;
@@ -375,7 +468,6 @@ export function serializeContext(context: Context): string {
         if (!block || typeof block !== "object") continue;
         const value = block as unknown as Record<string, unknown>;
         if (value.type === "text" && typeof value.text === "string") parts.push(value.text);
-        if (value.type === "image") imageCount += 1;
       }
     }
     if (parts.length) {
@@ -384,11 +476,9 @@ export function serializeContext(context: Context): string {
       break;
     }
   }
-  if (!task) return "(no user request captured)";
-  const imageNote = imageCount > 0
-    ? `\n\n[Note: the user attached ${imageCount} image(s) as part of the request.]`
-    : "";
-  let problem = truncateWithMarker(task + imageNote, PROBLEM_MAX_CHARS, "\n... [task truncated]");
+  const images = sharedContextImages(messages, taskIndex);
+  if (!task) return { problem: "(no user request captured)", images };
+  let problem = truncateWithMarker(task, PROBLEM_MAX_CHARS, "\n... [task truncated]");
 
   const separator = "\n\n";
   const evidenceBudget = PROBLEM_MAX_CHARS - problem.length - separator.length;
@@ -396,7 +486,38 @@ export function serializeContext(context: Context): string {
     const evidence = recentTrajectoryEvidence(messages, taskIndex, evidenceBudget);
     if (evidence) problem += separator + evidence;
   }
-  return problem;
+  return { problem, images };
+}
+
+function imagesFromContent(content: unknown): ImageContent[] {
+  if (!Array.isArray(content)) return [];
+  const images: ImageContent[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const value = block as Record<string, unknown>;
+    if (
+      value.type === "image" && typeof value.data === "string" &&
+      typeof value.mimeType === "string"
+    ) {
+      images.push(block as ImageContent);
+    }
+  }
+  return images;
+}
+
+/** Images observed by every candidate, preserving message and block chronology. */
+function sharedContextImages(messages: Message[], taskIndex: number): ImageContent[] {
+  const images: ImageContent[] = [];
+  for (let index = Math.max(0, taskIndex); index < messages.length; index += 1) {
+    const message = messages[index];
+    if (!message) continue;
+    images.push(...imagesFromContent((message as { content?: unknown }).content));
+  }
+  return images;
+}
+
+export function serializeContext(context: Context): string {
+  return serializeVerificationContext(context).problem;
 }
 
 /** Truncate `text` to at most `max` chars, folding in `marker` when cut. */
@@ -410,10 +531,11 @@ function truncateWithMarker(text: string, max: number, marker: string): string {
 const TRACE_SEPARATOR_LEN = "\n\n".length;
 
 /**
- * Latest-first slice of observable agent actions and tool outputs after the
- * current request (the verifier's ground-truth signal), accumulated strictly
- * within `budget` chars and stopping the moment the budget is spent. Reasoning,
- * system/developer messages, tool schemas, and image payloads never enter.
+ * Recency-bounded slice of observable agent actions and tool outputs after the
+ * current request (the verifier's ground-truth signal). Selection walks from
+ * newest to oldest, then restores chronological order for the verifier.
+ * Reasoning, system/developer messages, tool schemas, and image payloads stay outside
+ * the text budget; image markers remain here while payloads travel separately.
  */
 function recentTrajectoryEvidence(
   messages: Message[],
@@ -436,20 +558,37 @@ function recentTrajectoryEvidence(
     const message = messages[index];
     if (!message || typeof message !== "object") continue;
     if (message.role === "assistant") {
+      const messageParts: string[] = [];
+      const messageBudget = Math.max(
+        0,
+        budget - used - (parts.length ? TRACE_SEPARATOR_LEN : 0),
+      );
+      let messageUsed = 0;
+      const appendMessagePart = (piece: string): void => {
+        const separatorCost = messageParts.length ? 1 : 0;
+        const room = messageBudget - messageUsed - separatorCost;
+        if (room <= 0) return;
+        const bounded = truncateWithMarker(piece, room, "\n... [truncated]");
+        messageParts.push(bounded);
+        messageUsed += separatorCost + bounded.length;
+      };
       for (const block of (message as unknown as AssistantMessage).content ?? []) {
-        if (used >= budget) break;
+        if (messageUsed >= messageBudget) break;
         if (!block) continue;
         const value = block as unknown as Record<string, unknown>;
         if (value.type === "text" && typeof value.text === "string") {
           const text = String(value.text).trim();
-          if (text) append(truncateBlock(text));
+          if (text) appendMessagePart(truncateBlock(text));
         } else if (value.type === "toolCall") {
           const toolCall = value as unknown as ToolCall;
-          append(
+          appendMessagePart(
             "[tool call] " + toolCall.name + " " + truncateBlock(compactJson(toolCall.arguments)),
           );
+        } else if (value.type === "image") {
+          appendMessagePart("[image attached]");
         }
       }
+      if (messageParts.length) append(messageParts.join("\n"));
     } else if (message.role === "toolResult") {
       const toolName = (message as unknown as { toolName?: string }).toolName;
       const isError = (message as unknown as { isError?: boolean }).isError === true;
@@ -480,7 +619,7 @@ function recentTrajectoryEvidence(
     }
     if (used >= budget) break;
   }
-  return parts.join("\n\n");
+  return parts.reverse().join("\n\n");
 }
 
 export function serializeAssistantMessage(message: AssistantMessage): string {
@@ -656,6 +795,14 @@ function errorMessage(error: unknown): string {
 function reportDegraded(state: AutoVerifierState, event: AutoVerifierDegradedEvent): void {
   try {
     state.onDegraded?.(event);
+  } catch {
+    // A diagnostic callback cannot change the provider result.
+  }
+}
+
+function reportDecision(state: AutoVerifierState, decision: AutoVerifierDecision): void {
+  try {
+    state.onDecision?.(decision);
   } catch {
     // A diagnostic callback cannot change the provider result.
   }

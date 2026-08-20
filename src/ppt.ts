@@ -2,7 +2,7 @@
  * Probabilistic Pivot Tournament (PPT): O(Nk) best-of-N selection.
  *
  * Instead of a full O(N^2) round-robin, PPT selects the best candidate in
- * three steps (paper §4.4, and `llm_verifier/pivot_tournament.py`):
+ * three steps (paper §3.2 and Appendix B.2):
  *
  *   1) Ring pass: score the N adjacent directed pairs of a random
  *      Hamiltonian cycle. Every candidate appears once in each prompt slot,
@@ -10,10 +10,12 @@
  *   2) Pivot selection: the top-k candidates by ring-pass mean preference
  *      w_i / c_i become the pivot set P.
  *   3) Pivot rounds: score every non-pivot-vs-pivot and pivot-vs-pivot
- *      pair; aggregate all comparisons into w_i, c_i and return
- *      argmax_i w_i / c_i.
+ *      pair that is absent from the directed ring; aggregate all unique
+ *      comparisons into w_i, c_i and return argmax_i w_i / c_i.
  *
- * Total comparisons: N + k(N - k) + C(k, 2) — linear in N for fixed k.
+ * N + k(N - k) + C(k, 2) is the paper's O(Nk) upper bound. Algorithm 1
+ * removes directed ring overlaps from the pivot edge set, so the exact count
+ * can be lower by |E_ring ∩ E_piv|.
  * Each comparison's rewards (R_a, R_b) become a soft win via Bradley-Terry,
  * p(a beats b) = sigmoid(R_a - R_b).
  */
@@ -65,6 +67,7 @@ export function selectPivots(w: number[], c: number[], k: number): number[] {
 export function pivotRoundPairs(
   n: number,
   pivots: number[],
+  ring: Array<[number, number]> = [],
 ): Array<[number, number]> {
   const pivotSet = new Set(pivots);
   const nonPivots = Array.from({ length: n }, (_, i) => i).filter(
@@ -80,7 +83,8 @@ export function pivotRoundPairs(
       pairs.push([sorted[i], sorted[j]]);
     }
   }
-  return pairs;
+  const ringPairs = new Set(ring.map(([a, b]) => `${a},${b}`));
+  return pairs.filter(([a, b]) => !ringPairs.has(`${a},${b}`));
 }
 
 export interface PPTResult {
@@ -104,7 +108,7 @@ export function selectBest(
 
   const pivots = selectPivots(w, c, k);
 
-  const prPairs = pivotRoundPairs(n, pivots);
+  const prPairs = pivotRoundPairs(n, pivots, ring);
   accumulate(prPairs, score, w, c);
 
   let best = 0;

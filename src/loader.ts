@@ -9,12 +9,17 @@
 
 import { readdirSync, readFileSync, statSync, type Dirent } from "node:fs";
 import { basename, join } from "node:path";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 
 export interface Trial {
   trialName: string;
   reward: 0 | 1;
   problem: string;
   trace: string;
+  /** Images shared by every candidate for this task. */
+  images?: readonly ImageContent[];
+  /** Images produced inside this candidate trajectory. */
+  trajectoryImages?: readonly ImageContent[];
 }
 
 export type Tasks = Record<string, Trial[]>;

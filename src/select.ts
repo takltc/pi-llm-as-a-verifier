@@ -1,5 +1,6 @@
 /** Single-task public API for Probabilistic Pivot Tournament selection. */
 
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { VerifierClient, USAGE, diffUsage, type UsageSnapshot } from "./client.ts";
 import {
   GROUND_TRUTH_NOTE,
@@ -7,17 +8,25 @@ import {
   type Criterion,
 } from "./prompt.ts";
 import { accumulate, pivotRoundPairs, ringCycle, selectPivots } from "./ppt.ts";
-import { directedReward, type ScoreCache } from "./cache.ts";
+import {
+  directedReward,
+  type ScoreCache,
+  type ScoreDistributionQuality,
+  type ScoreSourceCounts,
+} from "./cache.ts";
 import {
   contextResolver,
   mulberry32,
   scoreDirectedPairs,
+  summarizeScoredPairs,
   validateVerifyOptions,
 } from "./run.ts";
 
 export interface Candidate {
   name?: string;
   trace: string;
+  /** Images produced inside this candidate trajectory. */
+  images?: readonly ImageContent[];
 }
 
 export interface SelectOptions {
@@ -33,6 +42,7 @@ export interface SelectOptions {
   signal?: AbortSignal;
   client?: VerifierClient;
   taskName?: string;
+  images?: readonly ImageContent[];
 }
 
 export interface SelectResult {
@@ -42,6 +52,9 @@ export interface SelectResult {
   ranking: number[];
   nComparisons: number;
   criteria: string[];
+  scoreSources: ScoreSourceCounts;
+  scoreDistribution: ScoreDistributionQuality;
+  paperEquivalent: boolean;
   usage: UsageSnapshot;
 }
 
@@ -64,6 +77,9 @@ export async function select(
       throw new Error(`select: candidate ${index} name must be a string`);
     }
     if (!candidate.trace.trim()) throw new Error(`select: candidate ${index} has an empty trace`);
+    if (candidate.images !== undefined && !Array.isArray(candidate.images)) {
+      throw new Error(`select: candidate ${index} images must be an array`);
+    }
   }
 
   const criteria = normalizeCriteria(opts.criteria ?? "terminal_bench");
@@ -72,6 +88,16 @@ export async function select(
   if (!client) {
     throw new Error("select requires a verifier client for the OMP default model.");
   }
+  const images = opts.images ?? [];
+  const nImages = images.length + candidates.reduce(
+    (total, candidate) => total + (candidate.images?.length ?? 0),
+    0,
+  );
+  if (nImages > 0 && !client.supportsImages) {
+    throw new Error(
+      `select: verifier model ${client.provider}/${client.model} cannot inspect ${nImages} context image(s)`,
+    );
+  }
   const note = opts.groundTruthNote === undefined ? GROUND_TRUTH_NOTE : opts.groundTruthNote;
   const tasks = {
     [taskName]: candidates.map((candidate, index) => ({
@@ -79,6 +105,8 @@ export async function select(
       reward: 0 as const,
       problem,
       trace: candidate.trace,
+      images,
+      trajectoryImages: candidate.images,
     })),
   };
   const { k, nReps, seed, maxWorkers } = validateVerifyOptions(tasks, criteria, {
@@ -124,7 +152,7 @@ export async function select(
   const c = new Array<number>(n).fill(0);
   accumulate(ring, (a, b) => directed(scores, a, b), w, c);
   const pivots = selectPivots(w, c, Math.min(k, n));
-  const pivotPairs = pivotRoundPairs(n, pivots);
+  const pivotPairs = pivotRoundPairs(n, pivots, ring);
   if (opts.progress !== false) console.log(`Phase B: pivot rounds (${pivotPairs.length} comparisons)`);
   const phaseB = await scoreDirectedPairs(
     client,
@@ -156,6 +184,15 @@ export async function select(
   const ranking = Array.from({ length: n }, (_, index) => index).sort(
     (a, b) => scoresPerCandidate[b] - scoresPerCandidate[a] || a - b,
   );
+  const { scoreSources, scoreDistribution, paperEquivalent } = summarizeScoredPairs(
+    client,
+    tasks,
+    { [taskName]: [...ring, ...pivotPairs] },
+    criteria,
+    note,
+    nReps,
+    scores,
+  );
   return {
     index: best,
     best: candidates[best].name?.trim() || `candidate_${best}`,
@@ -163,6 +200,9 @@ export async function select(
     ranking,
     nComparisons: ring.length + pivotPairs.length,
     criteria: criteria.map((criterion) => criterion.id),
+    scoreSources,
+    scoreDistribution,
+    paperEquivalent,
     usage: diffUsage(USAGE.snapshot(), usageBefore),
   };
 }

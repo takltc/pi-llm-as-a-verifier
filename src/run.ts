@@ -18,8 +18,9 @@ import {
   buildPrompt,
   validateCriteria,
   type Criterion,
+  type PromptImageLayout,
 } from "./prompt.ts";
-import { extractScore, hasExtractableScore, type VerifierReply } from "./scale.ts";
+import { extractScorePair, type VerifierReply } from "./scale.ts";
 import { accumulate, pivotRoundPairs, ringCycle, selectPivots } from "./ppt.ts";
 import {
   cacheKey,
@@ -28,11 +29,18 @@ import {
   mergeCaches,
   saveCache,
   stableFingerprint,
+  summarizeScoreDistribution,
+  summarizeScoreSources,
   type CacheContext,
+  type CachedEntry,
+  type CachedScoreSource,
   type ScoreCache,
+  type ScoreDistributionQuality,
+  type ScoreSourceCounts,
 } from "./cache.ts";
 import type { Tasks, Trial } from "./loader.ts";
 import { classify } from "./loader.ts";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 
 export interface VerifyOptions {
   pivots?: number;
@@ -63,6 +71,9 @@ export interface RunStats {
   oracle: number;
   avgComparisons: number;
   totalComparisons: number;
+  scoreSources: ScoreSourceCounts;
+  scoreDistribution: ScoreDistributionQuality;
+  paperEquivalent: boolean;
   usage: UsageSnapshot;
   bestPerTask: Record<string, { index: number; reward: 0 | 1; w: number; c: number }>;
 }
@@ -72,10 +83,24 @@ interface Job {
   problem: string;
   traceA: string;
   traceB: string;
+  images: readonly ImageContent[];
+  imageLayout: PromptImageLayout;
   criterion: Criterion;
   swap: boolean;
   prefix: string;
   context: CacheContext;
+}
+
+function imagesFingerprint(images: readonly ImageContent[] | undefined): string {
+  if (!images || images.length === 0) return "";
+  return stableFingerprint(
+    images.map((image) => ({
+      type: image.type,
+      mimeType: image.mimeType,
+      detail: image.detail,
+      data: image.data,
+    })),
+  );
 }
 
 export const SELF_VERIFICATION_DEFAULTS = {
@@ -119,6 +144,47 @@ function validateTasks(tasks: Tasks): void {
       if (!trial.problem.trim() || !trial.trace.trim()) {
         throw new Error(`Task ${taskName} trial ${index} has empty problem or trace`);
       }
+      if (trial.images !== undefined && !Array.isArray(trial.images)) {
+        throw new Error(`Task ${taskName} trial ${index} images must be an array`);
+      }
+      for (const [imageIndex, image] of (trial.images ?? []).entries()) {
+        if (
+          !image || image.type !== "image" ||
+          typeof image.data !== "string" || !image.data.trim() ||
+          typeof image.mimeType !== "string" || !image.mimeType.trim()
+        ) {
+          throw new Error(`Task ${taskName} trial ${index} image ${imageIndex} is invalid`);
+        }
+      }
+      if (trial.trajectoryImages !== undefined && !Array.isArray(trial.trajectoryImages)) {
+        throw new Error(`Task ${taskName} trial ${index} trajectoryImages must be an array`);
+      }
+      for (const [imageIndex, image] of (trial.trajectoryImages ?? []).entries()) {
+        if (
+          !image || image.type !== "image" ||
+          typeof image.data !== "string" || !image.data.trim() ||
+          typeof image.mimeType !== "string" || !image.mimeType.trim()
+        ) {
+          throw new Error(
+            `Task ${taskName} trial ${index} trajectory image ${imageIndex} is invalid`,
+          );
+        }
+      }
+    }
+    const referenceProblem = trials[0]!.problem;
+    const referenceImages = imagesFingerprint(trials[0]!.images);
+    for (let index = 1; index < trials.length; index += 1) {
+      const trial = trials[index]!;
+      if (trial.problem !== referenceProblem) {
+        throw new Error(
+          `Task ${taskName} trials must share one identical problem; trial ${index} differs`,
+        );
+      }
+      if (imagesFingerprint(trial.images) !== referenceImages) {
+        throw new Error(
+          `Task ${taskName} trials must share one identical ordered image set; trial ${index} differs`,
+        );
+      }
     }
   }
 }
@@ -142,6 +208,9 @@ export function cacheContext(
     problem: trials[a].problem,
     traceA: trials[slotA].trace,
     traceB: trials[slotB].trace,
+    imagesFingerprint: imagesFingerprint(trials[a].images),
+    trajectoryImagesAFingerprint: imagesFingerprint(trials[slotA].trajectoryImages),
+    trajectoryImagesBFingerprint: imagesFingerprint(trials[slotB].trajectoryImages),
     provider: String(client.provider ?? ""),
     api: String(client.api ?? ""),
     model: String(client.model ?? ""),
@@ -168,6 +237,62 @@ export function contextResolver(
     const criterion = byId.get(criterionId);
     if (!criterion) throw new Error(`Unknown criterion: ${criterionId}`);
     return cacheContext(client, trials, a, b, rep, groundTruthNote, criterion);
+  };
+}
+
+export interface ScoreEvidenceSummary {
+  scoreSources: ScoreSourceCounts;
+  scoreDistribution: ScoreDistributionQuality;
+  paperEquivalent: boolean;
+}
+
+/** Summarize exactly the score tags consumed by a set of directed PPT edges. */
+export function summarizeScoredPairs(
+  client: VerifierClient,
+  tasks: Tasks,
+  neededPairs: Record<string, Array<[number, number]>>,
+  criteria: Criterion[],
+  groundTruthNote: string,
+  nReps: number,
+  scores: ScoreCache,
+): ScoreEvidenceSummary {
+  const entries: Array<CachedEntry | undefined> = [];
+  for (const [taskName, pairs] of Object.entries(neededPairs)) {
+    const trials = tasks[taskName];
+    if (!trials) throw new Error(`Unknown task in comparison summary: ${taskName}`);
+    for (const [a, b] of pairs) {
+      const resolveContext = contextResolver(
+        client,
+        trials,
+        taskName,
+        a,
+        b,
+        groundTruthNote,
+        criteria,
+      );
+      for (const criterion of criteria) {
+        for (let rep = 0; rep < nReps; rep += 1) {
+          entries.push(scores[cacheKey(
+            criterion.id,
+            taskName,
+            a,
+            b,
+            rep,
+            resolveContext(criterion.id, rep),
+          )]);
+        }
+      }
+    }
+  }
+  const scoreSources = summarizeScoreSources(entries);
+  const scoreDistribution = summarizeScoreDistribution(entries);
+  return {
+    scoreSources,
+    scoreDistribution,
+    paperEquivalent: scoreSources.logprobs > 0 &&
+      scoreSources.textFallback === 0 &&
+      scoreSources.neutralTie === 0 &&
+      scoreSources.unknown === 0,
   };
 }
 
@@ -211,7 +336,14 @@ export async function scoreDirectedPairs(
     "maxWorkers",
   );
   const note = groundTruthNote ?? GROUND_TRUTH_NOTE;
-  const cached = mergeCaches(loadCache(cacheFile), opts.initialCache ?? {});
+  const initialCache = opts.initialCache ?? {};
+  const reusableInitialCache = Object.fromEntries(
+    Object.entries(initialCache).filter(
+      ([, entry]) => entry.source_A !== "neutral_tie" && entry.source_B !== "neutral_tie",
+    ),
+  ) as ScoreCache;
+  const cached = mergeCaches(loadCache(cacheFile), reusableInitialCache);
+  const available = mergeCaches(cached, initialCache);
   const jobs: Job[] = [];
   const requested = new Set<string>();
 
@@ -224,16 +356,26 @@ export async function scoreDirectedPairs(
         for (let rep = 0; rep < repetitions; rep++) {
           const context = cacheContext(client, trials, a, b, rep, note, criterion);
           const key = cacheKey(criterion.id, taskName, a, b, rep, context);
-          if (requested.has(key) || cached[key]) continue;
+          if (requested.has(key) || available[key]) continue;
           requested.add(key);
           const swap = rep % 2 === 1;
           const slotA = swap ? b : a;
           const slotB = swap ? a : b;
+          const sharedImages = trials[a].images ?? [];
+          const trajectoryImagesA = trials[slotA].trajectoryImages ?? [];
+          const trajectoryImagesB = trials[slotB].trajectoryImages ?? [];
+          const imageLayout: PromptImageLayout = {
+            shared: sharedImages.length,
+            trajectoryA: trajectoryImagesA.length,
+            trajectoryB: trajectoryImagesB.length,
+          };
           jobs.push({
             key,
             problem: trials[a].problem,
             traceA: trials[slotA].trace,
             traceB: trials[slotB].trace,
+            images: [...sharedImages, ...trajectoryImagesA, ...trajectoryImagesB],
+            imageLayout,
             criterion,
             swap,
             context,
@@ -241,6 +383,9 @@ export async function scoreDirectedPairs(
               problem: trials[a].problem,
               traceA: trials[slotA].trace,
               traceB: trials[slotB].trace,
+              imagesFingerprint: context.imagesFingerprint,
+              trajectoryImagesAFingerprint: context.trajectoryImagesAFingerprint,
+              trajectoryImagesBFingerprint: context.trajectoryImagesBFingerprint,
               provider: context.provider,
               api: context.api,
               model: context.model,
@@ -259,8 +404,8 @@ export async function scoreDirectedPairs(
 
   const log = opts.progress === false ? (_message: string) => {} : console.log;
   if (jobs.length === 0) {
-    log(`  All scores cached (${Object.keys(cached).length} entries)`);
-    return cached;
+    log(`  All scores cached (${Object.keys(available).length} entries)`);
+    return available;
   }
 
   const seenPrefixes = new Set<string>();
@@ -274,10 +419,10 @@ export async function scoreDirectedPairs(
     }
   }
   log(
-    `  ${jobs.length} scoring jobs (${Object.keys(cached).length} cached); warming ${warm.length} prefixes`,
+    `  ${jobs.length} scoring jobs (${Object.keys(available).length} available); warming ${warm.length} prefixes`,
   );
 
-  const results: ScoreCache = mergeCaches(cached);
+  const results: ScoreCache = mergeCaches(available);
   let errors = 0;
   let completed = 0;
   let firstError: unknown;
@@ -305,13 +450,36 @@ export async function scoreDirectedPairs(
       job.traceB,
       job.criterion,
       note,
+      job.imageLayout,
     );
     let reply: VerifierReply;
+    let scoreA: number;
+    let scoreB: number;
+    let sourceA: CachedScoreSource;
+    let sourceB: CachedScoreSource;
+    let supportA: number;
+    let supportB: number;
+    let probabilityMassA: number;
+    let probabilityMassB: number;
     try {
-      reply = await client.scoreReply(prompt, { signal: executionAbort.signal });
-      if (!hasExtractableScore(reply, "<score_A>") || !hasExtractableScore(reply, "<score_B>")) {
+      reply = await client.scoreReply(prompt, {
+        signal: executionAbort.signal,
+        images: job.images,
+      });
+      // One linear scan locates both score-tag distributions (the reference
+      // reads <score_A> and <score_B> from the same reply).
+      const pair = extractScorePair(reply);
+      if (pair.sourceA === "missing" || pair.sourceB === "missing") {
         throw new Error("Verifier response did not contain usable score tags");
       }
+      scoreA = pair.scoreA;
+      scoreB = pair.scoreB;
+      sourceA = pair.sourceA;
+      sourceB = pair.sourceB;
+      supportA = pair.supportA;
+      supportB = pair.supportB;
+      probabilityMassA = pair.probabilityMassA;
+      probabilityMassB = pair.probabilityMassB;
     } catch (error) {
       if (executionAbort.signal.aborted) {
         throw abortReason(firstError ?? error);
@@ -322,12 +490,15 @@ export async function scoreDirectedPairs(
         throw error;
       }
       errors += 1;
-      results[job.key] = { score_A: 0.5, score_B: 0.5 };
+      results[job.key] = {
+        score_A: 0.5,
+        score_B: 0.5,
+        source_A: "neutral_tie",
+        source_B: "neutral_tie",
+      };
       if (errors <= 3) log(`\n  Error: ${String(error)}`);
       return;
     }
-    let scoreA = extractScore(reply, "<score_A>");
-    let scoreB = extractScore(reply, "<score_B>");
     if (!Number.isFinite(scoreA) || !Number.isFinite(scoreB)) {
       if (opts.onError === "raise") {
         const error = new Error("Verifier returned non-finite scores");
@@ -336,11 +507,30 @@ export async function scoreDirectedPairs(
         throw error;
       }
       errors += 1;
-      results[job.key] = { score_A: 0.5, score_B: 0.5 };
+      results[job.key] = {
+        score_A: 0.5,
+        score_B: 0.5,
+        source_A: "neutral_tie",
+        source_B: "neutral_tie",
+      };
       return;
     }
-    if (job.swap) [scoreA, scoreB] = [scoreB, scoreA];
-    const entry = { score_A: scoreA, score_B: scoreB };
+    if (job.swap) {
+      [scoreA, scoreB] = [scoreB, scoreA];
+      [sourceA, sourceB] = [sourceB, sourceA];
+      [supportA, supportB] = [supportB, supportA];
+      [probabilityMassA, probabilityMassB] = [probabilityMassB, probabilityMassA];
+    }
+    const entry = {
+      score_A: scoreA,
+      score_B: scoreB,
+      source_A: sourceA,
+      source_B: sourceB,
+      support_A: supportA,
+      support_B: supportB,
+      probability_mass_A: probabilityMassA,
+      probability_mass_B: probabilityMassB,
+    };
     cached[job.key] = entry;
     results[job.key] = entry;
   }
@@ -430,11 +620,12 @@ export async function runBenchmark(
   const { allPass, swing } = classify(tasks);
   const nTasks = Object.keys(tasks).length;
   const nRuns = Math.max(...Object.values(tasks).map((trials) => trials.length));
+  const log = opts.progress === false ? (_message: string) => {} : console.log;
 
-  console.log(
+  log(
     `  tasks=${nTasks}  all-pass=${allPass.length}  swing=${swing.length}  N(trials)=${nRuns}`,
   );
-  console.log(
+  log(
     `  criteria=${criteriaIds.join(",")}  K=${nReps}  pivots=${k}  seed=${seed}  max_workers=${maxWorkers}`,
   );
 
@@ -442,7 +633,7 @@ export async function runBenchmark(
   const rings: Record<string, Array<[number, number]>> = {};
   for (const task of swing) rings[task] = ringCycle(tasks[task].length, rng);
 
-  console.log("Phase A: ring pass");
+  log("Phase A: ring pass");
   let scores = await scoreDirectedPairs(
     client,
     tasks,
@@ -472,10 +663,14 @@ export async function runBenchmark(
     const w = new Array<number>(n).fill(0);
     const c = new Array<number>(n).fill(0);
     accumulate(rings[task], (a, b) => directed(scores, task, a, b), w, c);
-    pivotPairs[task] = pivotRoundPairs(n, selectPivots(w, c, Math.min(k, n)));
+    pivotPairs[task] = pivotRoundPairs(
+      n,
+      selectPivots(w, c, Math.min(k, n)),
+      rings[task],
+    );
   }
 
-  console.log("Phase B: pivot rounds");
+  log("Phase B: pivot rounds");
   const phaseB = await scoreDirectedPairs(
     client,
     tasks,
@@ -523,6 +718,18 @@ export async function runBenchmark(
   );
   const verifier = allPass.length + selected;
   const oracle = allPass.length + swing.length;
+  const comparedPairs = Object.fromEntries(
+    swing.map((task) => [task, [...rings[task], ...pivotPairs[task]]]),
+  );
+  const scoreEvidence = summarizeScoredPairs(
+    client,
+    tasks,
+    comparedPairs,
+    criteria,
+    note,
+    nReps,
+    scores,
+  );
   return {
     tasks,
     criteriaIds,
@@ -538,6 +745,7 @@ export async function runBenchmark(
     oracle,
     avgComparisons: totalComparisons / Math.max(1, swing.length),
     totalComparisons,
+    ...scoreEvidence,
     usage: diffUsage(USAGE.snapshot(), usageBefore),
     bestPerTask,
   };
@@ -552,6 +760,7 @@ export function renderReport(stats: RunStats): string {
     "SELF-VERIFICATION  (LLM-as-a-Verifier)",
     `  g20  criteria=${criteriaIds.join(",")}  K=${nReps}  pivots=${k}  seed=${seed}`,
     `  tasks=${nTasks}  swing=${swing.length}  N(trials)=${nRuns}  comparisons/task=${stats.avgComparisons.toFixed(1)}`,
+    `  paper-equivalent=${stats.paperEquivalent}  logprob-scores=${stats.scoreSources.logprobs}  fallback/tie/unknown=${stats.scoreSources.textFallback}/${stats.scoreSources.neutralTie}/${stats.scoreSources.unknown}`,
     "=".repeat(72),
     `${"Method".padEnd(26)}  ${"Score".padStart(14)}  ${"Rate".padStart(7)}`,
     "-".repeat(72),

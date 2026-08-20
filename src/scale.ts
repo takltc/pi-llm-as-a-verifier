@@ -77,27 +77,102 @@ export interface VerifierReply {
  * Locate the token distribution immediately after `<score_X>` (or its
  * fused `>`-less form). The LAST match wins: the verdict is the score block
  * at the end of the reply, not the model quoting the format mid-analysis.
+ *
+ * Implemented as one linear scan per request rather than an O(n^2) rebuild of
+ * the accumulated text: the joined token stream is walked once, cumulative
+ * char lengths and trailing-whitespace runs are precomputed, and each tag
+ * boundary is a constant-length slice comparison. Identical selection
+ * semantics to the reference `_find_tag_logprobs`; verified by the
+ * differential random test in test/core.test.ts.
  */
+
+/** Unicode characters Python `str.rstrip()` treats as whitespace. */
+const PYTHON_RSTRIP_WHITESPACE =
+  /[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/;
+
+function isPythonWhitespaceOnly(value: string): boolean {
+  if (value.length === 0) return true;
+  for (const character of value) {
+    if (!PYTHON_RSTRIP_WHITESPACE.test(character)) return false;
+  }
+  return true;
+}
+
+type TagScan = Array<PositionLogprobs | undefined>;
+
+/**
+ * For each requested tag, the token distribution immediately after the LAST
+ * matching token, preferring the exact `>` form and falling back to the
+ * fused `>`-less form — mirroring the reference loop order (exact suffix
+ * scanned to its last match first, fused only if exact never matched).
+ */
+function scanTagMatches(reply: VerifierReply, tags: string[]): TagScan {
+  const out: TagScan = tags.map(() => undefined);
+  const { tokens, positionLogprobs } = reply;
+  if (!tokens || !positionLogprobs || tokens.length === 0 || tags.length === 0) {
+    return out;
+  }
+  const n = tokens.length;
+
+  // Cumulative char length after each token.
+  const cumLen = new Array<number>(n);
+  let len = 0;
+  for (let i = 0; i < n; i++) {
+    len += tokens[i]!.length;
+    cumLen[i] = len;
+  }
+  const joined = tokens.join("");
+
+  // Whitespace run ending just before each joined-text boundary, so the
+  // trimmed length of any prefix is O(1): end - wsRun[end].
+  const wsRun = new Int32Array(joined.length + 1);
+  let run = 0;
+  for (let p = 0; p < joined.length; p++) {
+    run = PYTHON_RSTRIP_WHITESPACE.test(joined[p]!) ? run + 1 : 0;
+    wsRun[p + 1] = run;
+  }
+
+  const fused = tags.map((tag) => tag.slice(0, -1));
+  const exactLens = tags.map((tag) => tag.length);
+  const fusedLens = fused.map((s) => s.length);
+  const lastExact = new Array<number>(tags.length).fill(-1);
+  const lastFused = new Array<number>(tags.length).fill(-1);
+
+  for (let i = 0; i < n; i++) {
+    if (i + 1 >= positionLogprobs.length) continue;
+    // Latest reference behavior: a whitespace-only token leaves rstrip() at
+    // the same tag boundary and must not shadow the distribution captured at
+    // the preceding position.
+    if (isPythonWhitespaceOnly(tokens[i]!)) continue;
+    const end = cumLen[i]!;
+    const trimmed = end - wsRun[end]!;
+    for (let t = 0; t < tags.length; t++) {
+      const el = exactLens[t]!;
+      if (trimmed >= el && joined.slice(trimmed - el, trimmed) === tags[t]) {
+        lastExact[t] = i;
+      }
+      const fl = fusedLens[t]!;
+      if (trimmed >= fl && joined.slice(trimmed - fl, trimmed) === fused[t]) {
+        lastFused[t] = i;
+      }
+    }
+  }
+  for (let t = 0; t < tags.length; t++) {
+    const exact = lastExact[t]!;
+    out[t] = exact >= 0
+      ? positionLogprobs[exact + 1]
+      : lastFused[t]! >= 0
+        ? positionLogprobs[lastFused[t]! + 1]
+        : undefined;
+  }
+  return out;
+}
+
 export function findTagLogprobs(
   reply: VerifierReply,
   tag: string,
 ): PositionLogprobs | undefined {
-  const { tokens, positionLogprobs } = reply;
-  if (!tokens || !positionLogprobs || tokens.length === 0) return undefined;
-  for (const suffix of [tag, tag.slice(0, -1)]) {
-    let found: PositionLogprobs | undefined;
-    let textSoFar = "";
-    for (let i = 0; i < tokens.length; i++) {
-      textSoFar += tokens[i];
-      if (textSoFar.trimEnd().endsWith(suffix)) {
-        if (i + 1 < positionLogprobs.length) {
-          found = positionLogprobs[i + 1];
-        }
-      }
-    }
-    if (found !== undefined) return found;
-  }
-  return undefined;
+  return scanTagMatches(reply, [tag])[0];
 }
 
 /** Normalize a raw expectation over the scale to [0, 1]. */
@@ -106,21 +181,33 @@ function normalize(raw: number): number {
   return (raw - MIN_VAL) / (MAX_VAL - MIN_VAL);
 }
 
-/**
- * Expected score over the verifier's token distribution at `tag`,
- * normalized to [0, 1]. Falls back to parsing the literal `<tag> X </tag>`
- * text when no logprobs were returned.
- */
-export function extractScore(reply: VerifierReply, tag: string): number {
-  const tagLp = findTagLogprobs(reply, tag);
+export type ScoreEvidenceSource = "logprobs" | "text_fallback" | "missing";
+
+interface ExtractedScore {
+  score: number;
+  source: ScoreEvidenceSource;
+  support: number;
+  probabilityMass: number;
+}
+
+/** Expected score plus the evidence source that produced it. */
+function scoreFromPosition(
+  reply: VerifierReply,
+  tag: string,
+  position: PositionLogprobs | undefined,
+): ExtractedScore {
   const probs: Record<number, number> = {};
-  if (tagLp) {
-    for (const [tokStr, logprob] of tagLp) {
+  if (position) {
+    for (const [tokStr, logprob] of position) {
+      if (!Number.isFinite(logprob)) continue;
       let tok = tokStr.trim();
-      if (tok.startsWith(">")) tok = tok.slice(1).trim(); // fused '>A'
+      if (tok.startsWith(">")) tok = tok.slice(1).trim();
       const raw = LETTER_VALUES[tok];
       if (raw !== undefined) {
-        probs[raw] = Math.max(probs[raw] ?? 0, Math.exp(logprob));
+        const probability = Math.exp(logprob);
+        if (Number.isFinite(probability) && probability > 0) {
+          probs[raw] = Math.max(probs[raw] ?? 0, probability);
+        }
       }
     }
   }
@@ -129,7 +216,12 @@ export function extractScore(reply: VerifierReply, tag: string): number {
     const expected =
       Object.entries(probs).reduce((a, [v, p]) => a + Number(v) * p, 0) /
       totalP;
-    return normalize(expected);
+    return {
+      score: normalize(expected),
+      source: "logprobs",
+      support: Object.keys(probs).length,
+      probabilityMass: totalP,
+    };
   }
 
   // Literal-text fallback: last `<tag> letter </tag>` match.
@@ -152,25 +244,68 @@ export function extractScore(reply: VerifierReply, tag: string): number {
         }
       }
     }
-    if (raw !== undefined) return normalize(raw);
+    if (raw !== undefined) {
+      return {
+        score: normalize(raw),
+        source: "text_fallback",
+        support: 0,
+        probabilityMass: 0,
+      };
+    }
   }
-  return 0.5;
+  return { score: 0.5, source: "missing", support: 0, probabilityMass: 0 };
+}
+
+/**
+ * Expected score over the verifier's token distribution at `tag`,
+ * normalized to [0, 1]. Falls back to parsing the literal `<tag> X </tag>`
+ * text when no logprobs were returned.
+ */
+export function extractScore(reply: VerifierReply, tag: string): number {
+  return scoreFromPosition(reply, tag, findTagLogprobs(reply, tag)).score;
 }
 
 /** Whether a reply contains a usable score for `tag`. */
 export function hasExtractableScore(reply: VerifierReply, tag: string): boolean {
-  const tagLp = findTagLogprobs(reply, tag);
-  if (tagLp?.some(([token, logprob]) => {
-    let normalized = token.trim();
-    if (normalized.startsWith(">")) normalized = normalized.slice(1).trim();
-    return LETTER_VALUES[normalized] !== undefined && Number.isFinite(logprob);
-  })) {
-    return true;
-  }
-  const tagName = tag.replace(/[<>]/g, "");
-  const pattern = new RegExp(
-    `<${tagName}>\\s*([A-T])\\s*</${tagName}>`,
-    "i",
-  );
-  return pattern.test(reply.text ?? "");
+  return scoreFromPosition(reply, tag, findTagLogprobs(reply, tag)).source !== "missing";
+}
+
+export interface ScorePair {
+  scoreA: number;
+  scoreB: number;
+  extractableA: boolean;
+  extractableB: boolean;
+  sourceA: ScoreEvidenceSource;
+  sourceB: ScoreEvidenceSource;
+  supportA: number;
+  supportB: number;
+  probabilityMassA: number;
+  probabilityMassB: number;
+}
+
+/**
+ * Both fine-grained rewards and their extractability from ONE linear scan of
+ * the reply. The reference pipeline scores `<score_A>` and `<score_B>` from
+ * the same response; a single pass over the token stream locates both
+ * distributions, so PPT scoring of a long verifier reply parses once instead
+ * of four separate O(n) tag scans.
+ */
+export function extractScorePair(
+  reply: VerifierReply,
+): ScorePair {
+  const [posA, posB] = scanTagMatches(reply, ["<score_A>", "<score_B>"]);
+  const scoreA = scoreFromPosition(reply, "<score_A>", posA);
+  const scoreB = scoreFromPosition(reply, "<score_B>", posB);
+  return {
+    scoreA: scoreA.score,
+    scoreB: scoreB.score,
+    extractableA: scoreA.source !== "missing",
+    extractableB: scoreB.source !== "missing",
+    sourceA: scoreA.source,
+    sourceB: scoreB.source,
+    supportA: scoreA.support,
+    supportB: scoreB.support,
+    probabilityMassA: scoreA.probabilityMass,
+    probabilityMassB: scoreB.probabilityMass,
+  };
 }

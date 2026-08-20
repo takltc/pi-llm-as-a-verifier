@@ -23,7 +23,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
-export const CACHE_VERSION = 4;
+export const CACHE_VERSION = 6;
 const LOCK_TIMEOUT_MS = 30_000;
 const LOCK_STALE_MS = 120_000;
 
@@ -41,6 +41,33 @@ interface LockMetadata {
 export interface CachedEntry {
   score_A: number;
   score_B: number;
+  source_A?: CachedScoreSource;
+  source_B?: CachedScoreSource;
+  support_A?: number;
+  support_B?: number;
+  probability_mass_A?: number;
+  probability_mass_B?: number;
+}
+
+export type CachedScoreSource =
+  | "logprobs"
+  | "text_fallback"
+  | "neutral_tie"
+  | "unknown";
+
+export interface ScoreSourceCounts {
+  logprobs: number;
+  textFallback: number;
+  neutralTie: number;
+  unknown: number;
+}
+
+export interface ScoreDistributionQuality {
+  logprobScores: number;
+  minSupport: number;
+  meanSupport: number;
+  minProbabilityMass: number;
+  meanProbabilityMass: number;
 }
 
 export type ScoreCache = Record<string, CachedEntry>;
@@ -53,6 +80,9 @@ export interface CacheContext {
   problem: string;
   traceA: string;
   traceB: string;
+  imagesFingerprint: string;
+  trajectoryImagesAFingerprint: string;
+  trajectoryImagesBFingerprint: string;
   provider: string;
   api: string;
   model: string;
@@ -119,8 +149,90 @@ function isCachedEntry(value: unknown): value is CachedEntry {
     typeof entry.score_B === "number" &&
     Number.isFinite(entry.score_B) &&
     entry.score_B >= 0 &&
-    entry.score_B <= 1
+    entry.score_B <= 1 &&
+    isCachedScoreSource(entry.source_A) &&
+    isCachedScoreSource(entry.source_B) &&
+    isOptionalNonNegativeNumber(entry.support_A) &&
+    isOptionalNonNegativeNumber(entry.support_B) &&
+    isOptionalNonNegativeNumber(entry.probability_mass_A) &&
+    isOptionalNonNegativeNumber(entry.probability_mass_B)
   );
+}
+
+function isDurableCachedEntry(value: unknown): value is CachedEntry {
+  return isCachedEntry(value) &&
+    value.source_A !== "neutral_tie" &&
+    value.source_B !== "neutral_tie";
+}
+
+function isCachedScoreSource(value: unknown): value is CachedScoreSource | undefined {
+  return value === undefined || value === "logprobs" || value === "text_fallback" ||
+    value === "neutral_tie" || value === "unknown";
+}
+
+function isOptionalNonNegativeNumber(value: unknown): value is number | undefined {
+  return value === undefined ||
+    (typeof value === "number" && Number.isFinite(value) && value >= 0);
+}
+
+function resolvedScoreSource(
+  entry: CachedEntry | undefined,
+  side: "A" | "B",
+): CachedScoreSource {
+  const source = side === "A" ? entry?.source_A : entry?.source_B;
+  if (source !== "logprobs") return source ?? "unknown";
+  const support = side === "A" ? entry?.support_A : entry?.support_B;
+  const mass = side === "A" ? entry?.probability_mass_A : entry?.probability_mass_B;
+  return typeof support === "number" && Number.isInteger(support) && support >= 1 &&
+      typeof mass === "number" && Number.isFinite(mass) && mass > 0
+    ? "logprobs"
+    : "unknown";
+}
+
+/** Count score-tag evidence sources for theory-equivalence telemetry. */
+export function summarizeScoreSources(
+  entries: Iterable<CachedEntry | undefined>,
+): ScoreSourceCounts {
+  const counts: ScoreSourceCounts = {
+    logprobs: 0,
+    textFallback: 0,
+    neutralTie: 0,
+    unknown: 0,
+  };
+  const add = (source: CachedScoreSource): void => {
+    if (source === "logprobs") counts.logprobs += 1;
+    else if (source === "text_fallback") counts.textFallback += 1;
+    else if (source === "neutral_tie") counts.neutralTie += 1;
+    else counts.unknown += 1;
+  };
+  for (const entry of entries) {
+    add(resolvedScoreSource(entry, "A"));
+    add(resolvedScoreSource(entry, "B"));
+  }
+  return counts;
+}
+
+/** Aggregate returned A-T support and probability mass for logprob-backed tags. */
+export function summarizeScoreDistribution(
+  entries: Iterable<CachedEntry | undefined>,
+): ScoreDistributionQuality {
+  const supports: number[] = [];
+  const masses: number[] = [];
+  for (const entry of entries) {
+    for (const side of ["A", "B"] as const) {
+      if (resolvedScoreSource(entry, side) !== "logprobs") continue;
+      supports.push((side === "A" ? entry?.support_A : entry?.support_B)!);
+      masses.push((side === "A" ? entry?.probability_mass_A : entry?.probability_mass_B)!);
+    }
+  }
+  const count = supports.length;
+  return {
+    logprobScores: count,
+    minSupport: count ? Math.min(...supports) : 0,
+    meanSupport: count ? supports.reduce((sum, value) => sum + value, 0) / count : 0,
+    minProbabilityMass: count ? Math.min(...masses) : 0,
+    meanProbabilityMass: count ? masses.reduce((sum, value) => sum + value, 0) / count : 0,
+  };
 }
 
 function parseCache(text: string): ScoreCache {
@@ -130,7 +242,7 @@ function parseCache(text: string): ScoreCache {
   }
   const cache: ScoreCache = {};
   for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-    if (isCachedEntry(value)) cache[key] = value;
+    if (isDurableCachedEntry(value)) cache[key] = value;
   }
   return cache;
 }
@@ -313,7 +425,7 @@ export function saveCache(cacheFile: string, cache: ScoreCache): void {
   try {
     const merged: ScoreCache = { ...readCacheFile(cacheFile) };
     for (const [key, entry] of Object.entries(cache)) {
-      if (isCachedEntry(entry)) merged[key] = entry;
+      if (isDurableCachedEntry(entry)) merged[key] = entry;
     }
     writeAtomic(cacheFile, merged);
   } finally {

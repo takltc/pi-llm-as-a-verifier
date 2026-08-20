@@ -5,7 +5,9 @@
 - [LLM-as-a-Verifier: A General-Purpose Verification Framework](https://arxiv.org/abs/2607.05391)
 - [Self-Verification / Terminal-Bench 2.1 reference implementation](https://github.com/llm-as-a-verifier/llm-as-a-verifier#self-verification-terminal-bench-21)
 
-The plugin applies the paper's 20-level token-logprob scoring and Probabilistic Pivot Tournament. Each ordinary OMP request generates three complete candidates, verifies them with the active OMP default model, and replays the winning response, including text, reasoning, images, tool calls, and the stop state.
+The plugin applies the paper's 20-level token-logprob scoring and Probabilistic Pivot Tournament. Each terminal OMP answer expands to three complete candidates by default, scores them with the configured verifier model (the session default when unset), and replays the winning response with its text, reasoning, images, and stop state. Tool-use turns continue the active trajectory directly.
+
+The versioned sources, formal invariants, product boundaries, and drift gates live in [docs/theory-baseline.md](docs/theory-baseline.md).
 
 See the [Chinese guide](README.zh-CN.md) for the same workflow in Chinese.
 
@@ -41,9 +43,29 @@ omp plugin disable omp-llm-verifier
 omp plugin enable omp-llm-verifier
 ```
 
-The verifier model must expose OpenAI Chat Completions or Responses token logprobs — the paper's fine-grained reward is read off the score-token distribution, so a model without token logprobs cannot run the paper's verifier. When the resolved verifier model cannot provide logprobs, the plugin refuses to wrap the session model and shows a capability warning instead of degrading every request.
+The verifier model must expose OpenAI Chat Completions or Responses token logprobs — the paper's fine-grained reward is read off the score-token distribution, so a model without token logprobs cannot run the paper's verifier. When the resolved verifier model cannot provide logprobs, the plugin refuses to wrap the session model and shows a capability warning instead of degrading every request. Tasks with visual evidence also require image input support on the verifier model. Every pairwise request carries shared user/assistant/tool-result images first, followed by labeled Trajectory A and Trajectory B images, preserving the reference implementation's multimodal evidence path.
 
-Verified comparisons are cached on disk at `.omp-llm-verifier-cache.json` in the project root, keyed by a fingerprint of the task, both candidates, criteria, model, and prompt version, so repeat verifications of identical content cost no verifier tokens. The file is safe to delete and worth git-ignoring.
+Verified comparisons are cached on disk at `.omp-llm-verifier-cache.json` in the project root, keyed by a fingerprint of the task, ordered shared and candidate-specific images, both candidate traces, criteria, model, and prompt version, so repeat verifications of identical content cost no verifier tokens. The file is safe to delete and worth git-ignoring.
+
+Every verified answer is observable: on the OMP console the wrapper logs one
+`event:decision` JSON line per final answer with `path` (how the winner was
+chosen — `verifier` for the paper's PPT tournament, `fallback` when verification
+could not run, plus `aborted` and `error` terminal states), the
+winner's candidate index and mean score, the directed-comparison count, the
+verifier model and prompt contract that scored it, and the verifier token
+usage for that request. `scoreSources` separately counts logprob expectations,
+literal-text fallbacks, runtime neutral ties, and legacy/unknown cache entries;
+`paperEquivalent` is true only when every score tag came from token logprobs.
+`scoreDistribution` reports the minimum and mean valid A–T support and returned
+probability mass for those logprob-backed tags.
+The same data is exposed to extensions through the
+`onDecision` callback on the wrapped provider state.
+
+Every terminal selection with at least two successful terminal candidates runs
+the paper's PPT path, including cases where several candidate texts are identical.
+Tool-use turns continue the active agent trajectory directly. Alternative samples
+that propose another tool action remain outside the terminal-answer tournament and
+are reported through `nonterminalCandidates`.
 
 ## Local development
 
