@@ -34,6 +34,7 @@ import {
 import { SELF_VERIFICATION_DEFAULTS } from "../src/run.ts";
 import { select } from "../src/select.ts";
 import {
+  CAPABILITY_PROBE_TIMEOUT_MS,
   createVerifierClient,
   isVerifierLogprobsUnsupportedError,
   VerifierClient,
@@ -206,6 +207,25 @@ async function collect(stream: AssistantMessageEventStream) {
 }
 
 describe("automatic request/action-level provider", () => {
+  test("keeps the startup capability probe inside OMP's handler deadline", async () => {
+    class ProbeBudgetVerifier extends VerifierClient {
+      timeoutMs: number | undefined;
+
+      override async scoreReply(
+        _prompt: string,
+        opts: Parameters<VerifierClient["scoreReply"]>[1] = {},
+      ): Promise<VerifierReply> {
+        this.timeoutMs = opts.timeoutMs;
+        return { text: "A" };
+      }
+    }
+
+    const verifier = new ProbeBudgetVerifier(clientConfig());
+    await verifier.probeLogprobs();
+    expect(verifier.timeoutMs).toBe(CAPABILITY_PROBE_TIMEOUT_MS);
+    expect(CAPABILITY_PROBE_TIMEOUT_MS).toBeLessThan(30_000);
+  });
+
   test("retries a transient 429 before parsing verifier logprobs", async () => {
     const originalFetch = globalThis.fetch;
     let attempts = 0;
@@ -824,7 +844,9 @@ describe("automatic request/action-level provider", () => {
       winnerIndex: 0,
       winnerStopReason: "toolUse",
       nComparisons: 0,
-      scores: [1, 1, 0],
+      successfulCandidates: 2,
+      discardedCandidates: 1,
+      scores: [1, 1],
     });
   });
 
@@ -1116,6 +1138,175 @@ describe("automatic request/action-level provider", () => {
     expect(result.responseId).toBe("response-2");
     expect(calls).toHaveLength(3);
     expect(degraded).toEqual([]);
+  });
+
+  test("retries transient candidate failures once and restores the configured candidate count", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const degraded: unknown[] = [];
+    const decisions: unknown[] = [];
+    let nextAttempt = 0;
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      candidateRetryDelayMs: 0,
+      streamSimpleFn: (_model, candidateContext, options = {}) => {
+        const attempt = nextAttempt++;
+        calls.push({ context: candidateContext, options });
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          if (attempt < 2) {
+            const error = new Error("429 Too Many Requests: all replicas at capacity");
+            candidate.fail(attempt === 0 ? Object.assign(error, { status: 429 }) : error);
+            return;
+          }
+          const result = message(attempt);
+          candidate.push({ type: "start", partial: result });
+          candidate.push({ type: "done", reason: "stop", message: result });
+        });
+        return candidate;
+      },
+      onDegraded: (event) => degraded.push(event),
+      onDecision: (decision) => decisions.push(decision),
+    }, context());
+
+    await collect(stream);
+    expect(calls).toHaveLength(5);
+    expect(degraded).toEqual([]);
+    expect(decisions[0]).toMatchObject({
+      candidateCount: 3,
+      successfulCandidates: 3,
+    });
+  });
+
+  test("cancels a pending candidate retry without issuing replacement requests", async () => {
+    const controller = new AbortController();
+    const decisions: unknown[] = [];
+    let calls = 0;
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      candidateRetryDelayMs: 1_000,
+      streamSimpleFn: () => {
+        calls += 1;
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => candidate.fail(new Error("429 Too Many Requests")));
+        return candidate;
+      },
+      onDecision: (decision) => decisions.push(decision),
+    }, context(), { signal: controller.signal });
+
+    setTimeout(() => controller.abort(), 10);
+    const { result } = await collect(stream);
+    expect(result.stopReason).toBe("aborted");
+    expect(calls).toBe(3);
+    expect(decisions[0]).toMatchObject({ path: "aborted" });
+  });
+  test("short-circuits candidate fan-out once a strict majority is guaranteed", async () => {
+    const decisions: unknown[] = [];
+    const abortedAfterMajority: string[] = [];
+    let nextIndex = 0;
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: (_model, _candidateContext, options = {}) => {
+        const index = nextIndex++;
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          if (index < 2) {
+            // Candidates 0 and 1 finish with the exact same action text.
+            const result = message(0);
+            candidate.push({ type: "start", partial: result });
+            candidate.push({ type: "done", reason: "stop", message: result });
+            return;
+          }
+          // Candidate 2 stalls until the majority short circuit cancels it.
+          options.signal?.addEventListener("abort", () => {
+            abortedAfterMajority.push(String(index));
+            candidate.fail(new DOMException("aborted", "AbortError"));
+          });
+        });
+        return candidate;
+      },
+      onDecision: (decision) => decisions.push(decision),
+    }, context());
+
+    const { result } = await collect(stream);
+    expect(result.responseId).toBe("response-0");
+    expect(abortedAfterMajority).toEqual(["2"]);
+    expect(decisions[0]).toMatchObject({
+      path: "majority",
+      candidateCount: 3,
+      successfulCandidates: 2,
+      discardedCandidates: 1,
+      winnerIndex: 0,
+    });
+  });
+
+  test("replays a strict majority when a discarded provider ignores abort", async () => {
+    const decisions: unknown[] = [];
+    let nextIndex = 0;
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: () => {
+        const index = nextIndex++;
+        const candidate = new AssistantMessageEventStream();
+        if (index < 2) {
+          queueMicrotask(() => {
+            const result = message(0);
+            candidate.push({ type: "start", partial: result });
+            candidate.push({ type: "done", reason: "stop", message: result });
+          });
+        }
+        return candidate;
+      },
+      onDecision: (decision) => decisions.push(decision),
+    }, context());
+
+    const { result } = await collect(stream);
+    expect(result.responseId).toBe("response-0");
+    expect(decisions[0]).toMatchObject({
+      path: "majority",
+      candidateCount: 3,
+      successfulCandidates: 2,
+      discardedCandidates: 1,
+      winnerIndex: 0,
+    });
+  });
+
+  test("does not short-circuit when no action reaches a strict majority early", async () => {
+    const decisions: unknown[] = [];
+    let nextIndex = 0;
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: (_model, _candidateContext) => {
+        const index = nextIndex++;
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          const result = message(index);
+          candidate.push({ type: "start", partial: result });
+          candidate.push({ type: "done", reason: "stop", message: result });
+        });
+        return candidate;
+      },
+      onDecision: (decision) => decisions.push(decision),
+    }, context());
+
+    const { result } = await collect(stream);
+    // Three distinct actions: no majority, so the full PPT selects the winner.
+    expect(decisions[0]).toMatchObject({
+      path: "verifier",
+      candidateCount: 3,
+      successfulCandidates: 3,
+      discardedCandidates: 0,
+    });
+    expect(result.stopReason).toBe("stop");
   });
 
   test("reports degradation when only one candidate succeeds", async () => {

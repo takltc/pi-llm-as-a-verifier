@@ -75,7 +75,9 @@ literal-text fallbacks, runtime neutral ties, and legacy/unknown cache entries;
 `paperEquivalent` is true only when every score tag came from token logprobs.
 `scoreDistribution` reports the minimum and mean valid A–T support and returned
 probability mass for those logprob-backed tags.
-The decision also reports `toolUseCandidates`, `terminalCandidates`, and the
+The decision also reports `toolUseCandidates`, `terminalCandidates`,
+`discardedCandidates` (in-flight candidate requests cancelled once a strict
+action majority `count > N/2` became unavoidable), and the
 winning stop reason. The same data is exposed to extensions through the
 `onDecision` callback on the wrapped provider state.
 

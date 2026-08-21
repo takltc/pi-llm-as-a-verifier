@@ -167,6 +167,9 @@ TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确�
 - no-logprobs 电路断路：同一选择内所有评分 job 共享同一请求形态，前 2 个独立 job 均以 logprobs 不支持失败（各自已耗尽客户端内部重试）后，未启动的 job 直接进入运行期 0.5 平局、不再发起 provider 调用；平局不持久化，`paperEquivalent` 保持 false。属于成本护栏，不改动 Eq. (3.1) 期望、PPT pair 集或失败语义。
 - 缓存写入节流：一个阶段内部最多约 5 次中间 checkpoint 落盘加末尾一次，避免把每次评分完成都变成同步锁+fsync 重写；崩溃最多丢失最近一小批分数。
 - 插件把 K（`nEvaluations`，1–16）与 k（`pivots`，1–8）暴露为在线配置项，默认 K=1、k=2。K 是论文 §4.2 的质量/成本轴，k 是论文 §3.2 的 PPT 参数；上调后按论文语义增加验证计算。`k` 在运行时按候选数 `min(k,N)` 收敛。
+- 候选生成 transient 重试（工程护栏）：每个候选在 provider 瞬时故障（可重试状态或等价错误）时重试一次，等待时间按候选索引错开并顺从外部分流 `signal` 的 abort；重试是同一候选索引的新独立采样，采样分布与关闭 server-side turn-chaining 的 side-channel 语义不变，`successfulCandidates` 仍按成功候选数上报。护栏不掉 `temperature=1`、不改变 Eq. (3.1) 期望与 PPT pair 集，只扩充失败容错路径。
+- 能力探测时序（生命周期护栏）：启动期 logprobs 能力探测使用 `CAPABILITY_PROBE_TIMEOUT_MS=10_000` 超时，为 OMP 30 秒扩展 handler 期限留下充裕余量；探测只作绑定判断，不影响评分请求形态或 Eq. (3.1) 期望。
+- 候选多数即决（工程延迟/成本护栏）：候选 fan-out 采用竞速收集，一旦某动作的严格多数不可逆（`count > N/2`），立即结束等待并通过私有信号取消剩余在途候选，随后按多数决回放胜者。剩余候选的生成结果被丢弃、不进入 `successfulCandidates`，决策以 `discardedCandidates` 遥测报告取消数量。多数行动作唯一，剩余候选无法改变该判定，因此胜者与等待全部 N 个候选的结果一致；外部 `signal` 的 abort 语义与 PPT 路径不受影响。
 
 ## 7. 图片输入
 
@@ -193,7 +196,7 @@ TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确�
 | INV-11 | 真实 verifier 路径必须取得 token logprobs；文本字母回退、空支持和解析失败进入显式来源统计。论文等价决策要求全部 score tag 来自 logprob 期望，并记录有效 A–T 支持数与返回概率质量。 | Chat/Responses/DeepSeek/Vertex 响应契约 fixture；断言 `scoreSources`、`scoreDistribution` 与 `paperEquivalent`，使文本回退和中性平局排除在论文等价统计之外。 | [Appendix B.6，pp. 30–31](https://arxiv.org/pdf/2607.05391#page=30)；[OpenAI Chat](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)；[DeepSeek](https://api-docs.deepseek.com/api/create-chat-completion/)；[Vertex GenerationConfig](https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1beta1/GenerationConfig) |
 | INV-12 | pair、criterion、rep、模型、prompt/scale、任务证据、图片摘要和方向共同决定缓存身份；缓存项携带评分来源，失败平局保持运行期作用域。 | 缓存碰撞测试、方向测试、版本失效测试、来源持久化测试、失败后重试测试。 | [作者实现 L748–811、L862–910](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L748-L811) |
 | INV-13 | 候选携带可判断任务完成度的证据；图片输入在候选与 verifier 条件中保持一致。 | 证据截断标记、图片顺序/摘要测试、能力前置校验。 | [论文 §3.1–§3.2，pp. 4–5](https://arxiv.org/pdf/2607.05391#page=4)；[作者实现 L403–447、L696–745](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L403-L447) |
-| INV-14 | 每次 coding-agent 模型请求生成 N 个并行候选，工具调用和终态回复共同进入精确多数决/PPT，agent loop 只接收胜出动作。 | 并发启动屏障、全工具候选、混合 stop reason、胜出 tool-call 回放测试。 | [论文 §6 Coding Agent Extension](https://arxiv.org/html/2607.05391v2)；[TurboAgent backend](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py) |
+| INV-14 | 每次 coding-agent 模型请求生成 N 个并行候选，工具调用和终态回复共同进入精确多数决/PPT，agent loop 只接收胜出动作。 | 并发启动屏障、全工具候选、混合 stop reason、胜出 tool-call 回放测试；严格多数不可逆时提前结束 fan-out 仍选同一胜者（`discardedCandidates` 遥测）。 | [论文 §6 Coding Agent Extension](https://arxiv.org/html/2607.05391v2)；[TurboAgent backend](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py) |
 | INV-15 | 并行候选共享完整上下文和 prompt-cache 身份；side-channel 候选关闭 turn chaining/cache-refresh ownership；生成期原生工具执行在 fan-out 前终止。 | session/cache identity、temperature、cache refresh ownership 与 `execHandlers` 零调用测试。 | [TurboAgent 并发请求配置](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo-agent.yaml)；[TurboAgent `_gather_completions`](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py#L146-L176) |
 
 ## 9. 常见偏离风险

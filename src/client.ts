@@ -17,6 +17,8 @@ export const DEFAULT_EFFORT = "high";
 export const DEFAULT_MAX_TOKENS = 32768;
 /** Generic OpenAI-compatible verifiers cap output like the reference call_openai (4096). */
 export const DEFAULT_OUTPUT_MAX_TOKENS = 4096;
+/** Keep startup capability probing comfortably inside OMP's 30 s extension-handler deadline. */
+export const CAPABILITY_PROBE_TIMEOUT_MS = 10_000;
 const VERIFIER_TRANSIENT_RETRIES = 3;
 const VERIFIER_TRANSIENT_STATUSES = new Set([429, 502, 503, 504]);
 type VerifierHttpError = Error & { status?: number; retryAfterMs?: number };
@@ -492,7 +494,7 @@ export class VerifierClient {
     await this.scoreReply("Respond with exactly the single letter A. Do not explain.", {
       ...opts,
       maxTokens: opts.maxTokens ?? 1024,
-      timeoutMs: opts.timeoutMs ?? 30_000,
+      timeoutMs: opts.timeoutMs ?? CAPABILITY_PROBE_TIMEOUT_MS,
     });
   }
   private requestHeaders(apiKey: string): Record<string, string> {

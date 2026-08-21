@@ -66,7 +66,8 @@ omp plugin enable omp-llm-verifier
 期望、文本字母回退、运行期中性平局和旧版/未知缓存项；全部评分标签均来自 token
 logprobs 时，`paperEquivalent` 为 `true`。`scoreDistribution` 记录这些标签的有效
 A–T 支持数与返回概率质量的最小值和平均值。
-决策还包含 `toolUseCandidates`、`terminalCandidates` 与胜出 stop reason。扩展程序
+决策还包含 `toolUseCandidates`、`terminalCandidates`、`discardedCandidates`（严格
+多数 `count > N/2` 已不可逆时被取消的在途候选请求）与胜出 stop reason。扩展程序
 也可以通过包装 provider 状态上的 `onDecision` 回调读取同样的数据。
 
 并行候选共享调用方的完整上下文、工具定义、session ID、prompt-cache key 与 provider

@@ -14,6 +14,7 @@ import {
 } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import type { ApiKeyResolver } from "@oh-my-pi/pi-ai/auth-retry";
+import { isProviderRetryableError } from "@oh-my-pi/pi-ai/error";
 import { select } from "./select.ts";
 import {
   CODING_AGENT_ACTION_CRITERIA,
@@ -44,6 +45,9 @@ const THINKING_MAX_CHARS = 800;
 // cannot dominate every pairwise prompt. 16k chars is far past any task
 // statement while staying far below context limits.
 const PROBLEM_MAX_CHARS = 16000;
+const CANDIDATE_TRANSIENT_RETRIES = 1;
+const CANDIDATE_RETRY_BASE_DELAY_MS = 500;
+const CANDIDATE_RETRY_STAGGER_MS = 100;
 // TurboAgent's latency-sensitive online configuration: every model request
 // generates configurable N actions concurrently (default 3, range 2-8), exact
 // majority may short-circuit, and
@@ -64,6 +68,8 @@ export interface AutoVerifierState {
   verifierClient: VerifierClient;
   apiKeyResolver: ApiKeyResolver;
   streamSimpleFn?: typeof streamSimple;
+  /** Override the transient candidate retry delay for deterministic tests. */
+  candidateRetryDelayMs?: number;
   /** Optional JSON score cache reused across requests in the same working tree. */
   cacheFile?: string;
   onDegraded?: (event: AutoVerifierDegradedEvent) => void;
@@ -165,6 +171,9 @@ export interface AutoVerifierDecision {
   granularity: AutoVerificationGranularity;
   candidateCount: number;
   successfulCandidates: number;
+  /** Candidates still in flight when a strict majority (count > N/2) became
+   *  guaranteed and the remaining fan-out was cancelled (majority shortcut). */
+  discardedCandidates?: number;
   /** Successful candidates that proposed a tool action. */
   toolUseCandidates?: number;
   /** Successful candidates that proposed a terminal response. */
@@ -288,20 +297,22 @@ async function runAutomaticVerification(
     // all N candidates launch concurrently and every successful action enters
     // majority/PPT selection before the agent loop observes a winner.
     let firstError: unknown;
-    const settled = await Promise.allSettled(
-      Array.from({ length: candidateCount }, (_, index) =>
-        generateCandidate(state, context, streamOptions, index, controller.signal),
-      ),
+    const gathered = await gatherCandidates(
+      (index, signal) => generateCandidate(state, context, streamOptions, index, signal),
+      candidateCount,
+      controller.signal,
     );
     if (controller.signal.aborted) throw controller.signal.reason ?? abortReason();
 
     const successful: CandidateResult[] = [];
-    for (const result of settled) {
+    for (const result of gathered.results) {
       if (result.status === "fulfilled") {
         successful.push(result.value);
         if (isToolUseMessage(result.value.message)) toolUseCandidates += 1;
         else terminalCandidates += 1;
-      } else firstError ??= result.reason;
+      } else if (gathered.discardedCandidates === 0 || !isAbortError(result.reason)) {
+        firstError ??= result.reason;
+      }
     }
     successful.sort((a, b) => a.index - b.index);
     successfulCandidates = successful.length;
@@ -316,6 +327,7 @@ async function runAutomaticVerification(
       granularity: AUTO_VERIFICATION_GRANULARITY,
       candidateCount,
       successfulCandidates,
+      discardedCandidates: gathered.discardedCandidates,
       toolUseCandidates,
       terminalCandidates,
       nonterminalCandidates: toolUseCandidates,
@@ -486,18 +498,171 @@ async function generateCandidate(
     anthropicCacheRefresh: false,
     anthropicCacheRefreshRequest: false,
   };
-  const stream = (state.streamSimpleFn ?? streamSimple)(
-    state.originalModel,
-    cloneContext(context),
-    candidateOptions,
-  );
-  const message = await stream.result();
-  if (message.stopReason === "error" || message.stopReason === "aborted") {
-    throw new Error(message.errorMessage ?? "Candidate " + index + " failed");
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const stream = (state.streamSimpleFn ?? streamSimple)(
+        state.originalModel,
+        cloneContext(context),
+        candidateOptions,
+      );
+      const message = await stream.result();
+      if (message.stopReason === "error" || message.stopReason === "aborted") {
+        throw candidateGenerationError(message, index);
+      }
+      return { index, message };
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) throw error;
+      if (
+        attempt >= CANDIDATE_TRANSIENT_RETRIES ||
+        !isProviderRetryableError(error, { provider: state.originalModel.provider })
+      ) {
+        throw error;
+      }
+      const delayMs = state.candidateRetryDelayMs ??
+        CANDIDATE_RETRY_BASE_DELAY_MS + index * CANDIDATE_RETRY_STAGGER_MS;
+      await waitForCandidateRetry(delayMs, signal);
+    }
   }
-  return { index, message };
 }
 
+function candidateGenerationError(message: AssistantMessage, index: number): Error {
+  const error = new Error(message.errorMessage ?? "Candidate " + index + " failed") as Error & {
+    status?: number;
+  };
+  if (message.errorStatus !== undefined) error.status = message.errorStatus;
+  return error;
+}
+
+function waitForCandidateRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? abortReason());
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason ?? abortReason());
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
+
+interface GatheredCandidates {
+  results: Array<PromiseSettledResult<CandidateResult>>;
+  /** Candidates still in flight when a strict majority became guaranteed. */
+  discardedCandidates: number;
+}
+
+/**
+ * Race the candidate fan-out and finish once a strict action majority is
+ * mathematically guaranteed (some action identity has > N/2 confirmations).
+ * The majority verdict cannot change with the remaining candidates, so the
+ * replayed winner is identical to waiting for all N — this only skips the
+ * slowest candidate's tail latency and its generation cost. Remaining
+ * in-flight requests are aborted through a private signal (never the
+ * caller's), and their settled results are swallowed so no rejection becomes
+ * unhandled. `discardedCandidates` reports how many were cancelled.
+ */
+async function gatherCandidates(
+  generate: (index: number, signal: AbortSignal) => Promise<CandidateResult>,
+  count: number,
+  external: AbortSignal,
+): Promise<GatheredCandidates> {
+  const discard = new AbortController();
+  const merged = mergeAbortSignals(external, discard.signal);
+  const promises = Array.from({ length: count }, (_, index) => generate(index, merged.signal));
+  const results = new Array<PromiseSettledResult<CandidateResult>>(count);
+  let pending = count;
+  let resolved = false;
+
+  return await new Promise<GatheredCandidates>((resolveOuter) => {
+    const finish = (): void => {
+      if (resolved) return;
+      resolved = true;
+      const discardedReason = discard.signal.reason ?? abortReason();
+      const snapshot: Array<PromiseSettledResult<CandidateResult>> = Array.from(
+        { length: count },
+        (_, index) => {
+          const result = results[index];
+          if (result) return result;
+          // Late candidates after a short circuit: swallow their outcome.
+          void promises[index]!.then(() => undefined, () => undefined);
+          return { status: "rejected", reason: discardedReason };
+        },
+      );
+      resolveOuter({ results: snapshot, discardedCandidates: pending });
+    };
+    const afterSettle = (): void => {
+      if (resolved) return;
+      if (pending > 0) {
+        // A strict majority could be decided by the candidates that already
+        // finished; the rest cannot change it. Count only fulfilled actions.
+        const counts = new Map<string, number>();
+        let confirmed = 0;
+        for (const result of results) {
+          if (!result || result.status !== "fulfilled") continue;
+          confirmed += 1;
+          const identity = serializeActionIdentity(result.value.message);
+          counts.set(identity, (counts.get(identity) ?? 0) + 1);
+        }
+        for (const tally of counts.values()) {
+          if (tally > count / 2 && confirmed < count) {
+            discard.abort(new DOMException(
+              "Strict action majority reached before all candidates finished",
+              "AbortError",
+            ));
+            finish();
+            return;
+          }
+        }
+      }
+      if (pending === 0) finish();
+    };
+    for (const [index, promise] of promises.entries()) {
+      promise.then(
+        (value) => {
+          results[index] = { status: "fulfilled", value };
+          pending -= 1;
+          afterSettle();
+        },
+        (reason) => {
+          results[index] = { status: "rejected", reason };
+          pending -= 1;
+          afterSettle();
+        },
+      );
+    }
+  }).finally(() => merged.dispose());
+}
+
+/** Combine two abort signals into once; call `dispose()` to release listeners. */
+function mergeAbortSignals(
+  a: AbortSignal,
+  b: AbortSignal,
+): { signal: AbortSignal; dispose(): void } {
+  if (a.aborted) return { signal: a, dispose: () => undefined };
+  if (b.aborted) return { signal: b, dispose: () => undefined };
+  const controller = new AbortController();
+  const onA = () => controller.abort(a.reason);
+  const onB = () => controller.abort(b.reason);
+  a.addEventListener("abort", onA, { once: true });
+  b.addEventListener("abort", onB, { once: true });
+  return {
+    signal: controller.signal,
+    dispose() {
+      a.removeEventListener("abort", onA);
+      b.removeEventListener("abort", onB);
+    },
+  };
+}
 /** TurboAgent's exact-action majority shortcut (§ verifier.py). */
 function exactActionMajority(
   actions: readonly string[],

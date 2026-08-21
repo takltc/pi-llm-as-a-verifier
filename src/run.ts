@@ -451,6 +451,7 @@ export async function scoreDirectedPairs(
 
   const results: ScoreCache = mergeCaches(available);
   let errors = 0;
+  let skipped = 0;
   let completed = 0;
   let firstError: unknown;
   const breaker = opts.unsupportedBreaker ?? createUnsupportedBreaker();
@@ -594,7 +595,7 @@ export async function scoreDirectedPairs(
               source_A: "neutral_tie",
               source_B: "neutral_tie",
             };
-            errors += 1;
+            skipped += 1;
           }
           continue;
         }
@@ -623,7 +624,7 @@ export async function scoreDirectedPairs(
     externalAbort?.removeEventListener("abort", onExternalAbort);
     if (cacheFile && Object.keys(cached).length > 0) saveCache(cacheFile, cached);
   }
-  log(`  Done (${errors} errors)`);
+  log(`  Done (${errors} errors, ${skipped} skipped)`);
   return results;
 }
 
