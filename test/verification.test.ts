@@ -47,6 +47,12 @@ import {
 } from "../src/client.ts";
 import { extractScorePair, type VerifierReply } from "../src/scale.ts";
 const temporaryFiles: string[] = [];
+const silentExtensionLogger = {
+  debug: () => undefined,
+  error: () => undefined,
+  info: () => undefined,
+  warn: () => undefined,
+};
 
 afterEach(() => {
   for (const path of temporaryFiles.splice(0)) Bun.file(path).delete().catch(() => undefined);
@@ -2150,6 +2156,12 @@ describe("automatic process-reward provider", () => {
 });
 
 describe("OMP default model inheritance", () => {
+  test("keeps extension diagnostics off the interactive terminal streams", () => {
+    const extensionSource = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+
+    expect(extensionSource).not.toMatch(/\bconsole\.(?:log|info|warn|error)\s*\(/);
+  });
+
   test("reports verifier score failure without claiming candidate loss", () => {
     const message = degradedWarningMessage({
       reason: "non_probabilistic_scores",
@@ -2174,6 +2186,7 @@ describe("OMP default model inheritance", () => {
     let activeModel: Model = configuredModel;
     let registrations = 0;
     const fakePi = {
+      logger: silentExtensionLogger,
       pi: { settings: { getModelRole: () => "opencode-go/mimo-v2.5" } },
       registerProvider: () => { registrations += 1; },
       getThinkingLevel: () => "high",
@@ -2257,6 +2270,7 @@ describe("OMP default model inheritance", () => {
     const configuredModel = activeModel;
     const wrappers = new Map<string, Model>();
     const fakePi = {
+      logger: silentExtensionLogger,
       pi: { settings: { getModelRole: () => "opencode-go/deepseek-v4-flash-0731:high" } },
       registerProvider: (provider: string) => {
         wrappers.set(provider + "/default", { ...configuredModel, provider, id: "default" } as unknown as Model);
@@ -2291,6 +2305,7 @@ describe("OMP default model inheritance", () => {
     const configuredModel = activeModel;
     const wrappers = new Map<string, Model>();
     const fakePi = {
+      logger: silentExtensionLogger,
       pi: { settings: { getModelRole: () => "opencode-go/deepseek-v4-flash-0731:high" } },
       registerProvider: (provider: string) => {
         wrappers.set(provider + "/default", { ...configuredModel, provider, id: "default" } as unknown as Model);

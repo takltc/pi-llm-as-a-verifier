@@ -117,11 +117,19 @@ export default function verifierExtension(pi: ExtensionAPI): void {
   let lastRebindError = "";
   let lastRebindErrorAt = 0;
   let lastUiWarning = "";
-  const notifyWarning = (ctx: ExtensionContext, error: unknown): void => {
+  const notifyWarning = (
+    ctx: ExtensionContext,
+    error: unknown,
+    event = "runtime_warning",
+  ): void => {
     const message = formatVerifierError(error, resolveSourceModel(ctx, runtime));
     if (message === lastUiWarning) return;
     lastUiWarning = message;
-    console.warn("Warning: " + message);
+    pi.logger.warn("LLM-as-a-Verifier " + event, {
+      component: PLUGIN_NAME,
+      event,
+      error: message,
+    });
     ctx.ui.notify(message, "warning");
   };
 
@@ -149,12 +157,7 @@ export default function verifierExtension(pi: ExtensionAPI): void {
             if (message === lastRebindError && now - lastRebindErrorAt < 5_000) return;
             lastRebindError = message;
             lastRebindErrorAt = now;
-            console.warn(JSON.stringify({
-              component: PLUGIN_NAME,
-              event: "model_rebind_failed",
-              error: message,
-            }));
-            notifyWarning(ctx, error);
+            notifyWarning(ctx, error, "model_rebind_failed");
           });
       }, MODEL_REBIND_INTERVAL_MS);
       await ensureAutomaticVerification(pi, ctx, runtime, candidateCount, verifierModel, nEvaluations, pivots);
@@ -379,12 +382,12 @@ async function createVerificationBinding(
     try {
       await probeVerifier(verifierClient, verifierModel);
     } catch (error) {
-      console.warn(JSON.stringify({
+      pi.logger.warn("LLM-as-a-Verifier capability probe failed", {
         component: PLUGIN_NAME,
         event: "capability_probe_failed",
         model: verifierModel.provider + "/" + verifierModel.id,
         error: error instanceof Error ? error.message : String(error),
-      }));
+      });
       if (isVerifierLogprobsUnsupportedError(error)) throw error;
       throw new VerifierCapabilityProbeError(
         error instanceof Error ? error.message : String(error),
@@ -406,20 +409,24 @@ async function createVerificationBinding(
         apiKeyResolver: resolver,
         cacheFile: ctx.cwd ? join(ctx.cwd, ".omp-llm-verifier-cache.json") : undefined,
         onDegraded: (event) => {
-          console.warn(JSON.stringify({ component: PLUGIN_NAME, event: "degraded", ...event }));
+          pi.logger.warn("LLM-as-a-Verifier degraded", {
+            component: PLUGIN_NAME,
+            event: "degraded",
+            ...event,
+          });
           ctx.ui.notify(degradedWarningMessage(event), "warning");
         },
         onPhase: (event) => {
           ctx.ui.setWorkingMessage(automaticVerificationWorkingMessage(event));
         },
         onDecision: (decision) => {
-          console.info(JSON.stringify({
+          pi.logger.info("LLM-as-a-Verifier decision", {
             component: PLUGIN_NAME,
             event: "decision",
             ...decision,
             winnerScore: decision.winnerScore === undefined ? undefined : Number(decision.winnerScore.toFixed(4)),
             scores: decision.scores?.map((score) => Number(score.toFixed(4))),
-          }));
+          });
         },
       },
       { candidateCount, nEvaluations, pivots },
