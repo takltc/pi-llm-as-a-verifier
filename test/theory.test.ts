@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { AUTO_SELECTION_DEFAULTS } from "../src/auto.ts";
+import { AUTO_SELECTION_DEFAULTS, AUTO_VERIFICATION_GRANULARITY } from "../src/auto.ts";
 import type { VerifierClient } from "../src/client.ts";
 import {
   buildPrompt,
@@ -111,6 +111,9 @@ describe("paper theory anchors", () => {
   });
 
   test("online action profile matches TurboAgent and the formal Algorithm 1 edge set", async () => {
+    // ORM, PRM and TRM are the paper's reward scopes. The operation-conditioned
+    // checkpoint scheduler stays inside PRM and keeps that runtime label.
+    expect(AUTO_VERIFICATION_GRANULARITY).toBe("prm");
     expect(AUTO_SELECTION_DEFAULTS).toEqual({ pivots: 2, nEvaluations: 1, seed: 0, maxWorkers: 8 });
     expect(CODING_AGENT_ACTION_GROUND_TRUTH_NOTE).toBe(
       "There is no reference solution available. Judge each trajectory purely on " +

@@ -1,4 +1,4 @@
-/** OMP extension entry point for request/action-level LLM-as-a-Verifier. */
+/** OMP extension entry point for process-reward checkpoint verification. */
 
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getPluginSettings } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/loader";
@@ -89,7 +89,7 @@ export function automaticVerificationWorkingMessage(
   event: AutoVerifierPhaseEvent,
 ): string | undefined {
   if (event.phase === "generating_candidates") {
-    return "Generating " + event.candidateCount + " candidate actions…";
+    return "Expanding a consequential action to " + event.candidateCount + " candidates…";
   }
   if (event.phase === "verifying_candidates") {
     return "Verifying " + (event.successfulCandidates ?? event.candidateCount) +
@@ -158,7 +158,10 @@ export default function verifierExtension(pi: ExtensionAPI): void {
           });
       }, MODEL_REBIND_INTERVAL_MS);
       await ensureAutomaticVerification(pi, ctx, runtime, candidateCount, verifierModel, nEvaluations, pivots);
-      ctx.ui.notify("LLM-as-a-Verifier enabled: every model action now generates candidates and replays the selected winner.", "info");
+      ctx.ui.notify(
+        "LLM-as-a-Verifier enabled: audited observations use one sample; state-changing and terminal actions expand to verified candidates.",
+        "info",
+      );
     } catch (error) {
       notifyWarning(ctx, error);
     }

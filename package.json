@@ -1,7 +1,7 @@
 {
   "name": "omp-llm-verifier",
   "version": "0.3.0",
-  "description": "LLM-as-a-Verifier request/action selection extension for oh-my-pi.",
+  "description": "LLM-as-a-Verifier process-reward checkpoint extension for oh-my-pi.",
   "type": "module",
   "license": "MIT",
   "module": "src/index.ts",
@@ -22,7 +22,7 @@
         "min": 2,
         "max": 8,
         "step": 1,
-        "description": "每次模型动作请求并行生成的候选数量（2-8，默认 3）"
+        "description": "高影响动作检查点的候选总数（2-8，默认 3；经审计的观测固定使用 1 个样本）"
       },
       "nEvaluations": {
         "type": "number",

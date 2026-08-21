@@ -6,7 +6,9 @@
 - [Self-Verification / Terminal-Bench 2.1 参考实现](https://github.com/llm-as-a-verifier/llm-as-a-verifier#self-verification-terminal-bench-21)
 - [面向 coding agent 的 TurboAgent 扩展](https://github.com/llm-as-a-verifier/TurboAgent/tree/eeb61be9cb618ea9c52262cebf15092e7c185146)
 
-插件在 TurboAgent 的 request/action 边界应用论文的 20 级 token logprob 评分和 Probabilistic Pivot Tournament。每次 OMP 模型请求并行生成 `candidateCount` 个候选动作，范围为 2–8、默认值为 3；精确动作多数决可以直接选出结果，其余候选统一进入 PPT，工具调用与终态回复都参与选择。OMP 只接收一个胜出响应，因此 agent loop 只会执行胜出的工具动作。
+论文定义 ORM（结果奖励模型）、PRM（过程奖励模型）和 TRM（轨迹奖励模型）三种奖励范围。本插件在交互式 coding agent 路径选择 PRM，并在高影响检查点应用 20 级 token logprob 评分和 Probabilistic Pivot Tournament。每一步先采样一个动作：所有调用都属于经过审计的 OMP 观测工具时，该步骤直接使用这一个样本；终态回复以及状态提交、控制流提交、`write`、`exec`、未知、格式异常或无法分类的工具动作会扩展至 `candidateCount` 个总样本，范围为 2–8、默认值为 3，随后通过精确多数决或 PPT 选择 winner。agent loop 只会执行被选中的高影响工具动作。
+
+这套边界属于论文的 PRM 方案，并采用自适应采样预算。论文 Appendix B.3 对逐步动作采样的 `k=1,3,5,9` 做了实验，§4 明确把验证计算量作为可按下游延迟预算调节的参数；OMP 参数级 approval tier 与经过审计的 effect adapter 共同确定产品检查点。按操作影响面路由是 PRM 内部的工程调度策略，其收益与论文报告结果分开测量。验证器算法、20 级 token-logprob 期望和 PPT 均保持论文语义。来源见[论文](https://arxiv.org/html/2607.05391v2)、[粒度选择研究](docs/granularity-selection.md)和[理论基线](docs/theory-baseline.md)。
 
 版本化来源、形式化不变量、产品边界和防漂移门禁记录在 [docs/theory-baseline.md](docs/theory-baseline.md)。
 
@@ -19,7 +21,7 @@ omp plugin config set omp-llm-verifier candidateCount 3
 omp plugin doctor
 ```
 
-`enabled` 控制自动验证，`candidateCount` 控制候选数量，范围为 2-8，默认值为 3。配置在新 OMP 会话中生效。验证器默认继承 OMP `modelRoles.default` 的模型、推理等级、凭据、请求头和兼容配置。
+`enabled` 控制自动验证。`candidateCount` 表示高影响检查点的候选总数，范围为 2-8、默认值为 3；经过审计的观测工具固定使用一个样本。会提交状态/控制流的 read-tier 工具与未分类扩展工具继续作为高影响检查点。配置在新 OMP 会话中生效。验证器默认继承 OMP `modelRoles.default` 的模型、推理等级、凭据、请求头和兼容配置。
 
 按照论文的 智能体≠验证器 架构（参考实现用 Gemini 或 DeepSeek 给 GPT/Claude 的轨迹打分），可以通过 OMP 模型选择器指定独立的验证器模型：
 
@@ -29,7 +31,7 @@ omp plugin config set omp-llm-verifier verifierModel deepseek/deepseek-v4-flash
 
 `verifierModel` 留空时使用会话默认模型做自我验证。kimi-code（Kimi for Coding）会拒绝 logprobs 请求，会话模型是 kimi-code 时必须配置 `verifierModel`。
 
-在线动作配置对齐 TurboAgent（`K=1`、`pivots=2`、一个 Task Success 准则）。TurboAgent 参考配置的 N 为 3；本插件通过 `candidateCount` 暴露 2–8 的 N 范围。论文的质量/成本轴仍可配置：
+高影响检查点使用 TurboAgent 的在线选择配置（`K=1`、`pivots=2`、一个 Task Success 准则）。TurboAgent 参考配置的 N 为 3；本插件通过 `candidateCount` 暴露 2–8 的 N 范围。首个样本会先完成并预热共享 provider 前缀，其余 N-1 个样本随后并发生成。论文的质量/成本轴仍可配置：
 
 ```bash
 # 每个准则的独立重复验证次数（论文 §4.2）：在线默认 K=1，论文主实验常用 K=8
@@ -59,31 +61,34 @@ OMP 的 `--max-time` 是整个 agent loop 的绝对截止时间，候选生成�
 
 已验证的比较结果会缓存在项目根目录的 `.omp-llm-verifier-cache.json`，缓存键覆盖任务、有序共享图片、候选专属图片、两个候选轨迹、评分标准、模型和 prompt 版本的内容指纹，因此相同内容的重复验证不消耗验证器 token。该文件可以直接删除，建议加入 gitignore。
 
-每个被选择的动作都是可观测的：OMP 控制台会针对每次模型请求输出一行
-`event:decision` JSON，包含 `granularity=request_action` 与 `path`（`majority`
-表示 TurboAgent 的精确动作多数决，`verifier` 表示论文 PPT，`fallback` 表示可恢复
-降级，`aborted` 与 `error` 表示终止状态）、
+每个过程步骤都有可观测遥测：OMP 控制台会针对每次 coding-agent 模型请求输出一行
+`event:decision` JSON，包含 `granularity=prm` 与 `path`（`single`
+表示经过审计的观测使用一个样本，`majority` 表示 TurboAgent 的精确动作多数决，`verifier`
+表示论文 PPT，`fallback` 表示可恢复降级，`aborted` 与 `error` 表示终止状态）、
 获胜候选的索引与平均得分、有向比较次数、参与打分的验证器模型与 prompt
 契约版本，以及本次请求的验证器 token 用量。`scoreSources` 分别统计 logprob
 期望、文本字母回退、运行期中性平局和旧版/未知缓存项；全部评分标签均来自 token
 logprobs 时，`paperEquivalent` 为 `true`。`scoreDistribution` 记录这些标签的有效
 A–T 支持数与返回概率质量的最小值和平均值。
-决策还包含 `toolUseCandidates`、`terminalCandidates`、`discardedCandidates`（严格
+决策还包含 `sampledCandidates`、`checkpointReason`、`toolUseCandidates`、
+`terminalCandidates`、`discardedCandidates`（严格
 多数 `count > N/2` 已不可逆时被取消的在途候选请求）与胜出 stop reason。扩展程序
 也可以通过包装 provider 状态上的 `onDecision` 回调读取同样的数据。
 
-候选生成与 PPT 在返回 winner 前保持内容隔离；TUI 的 working loader 会分别显示
-`Generating N candidate actions…` 与 `Verifying N candidate actions with PPT…`，并在
-winner 回放前恢复默认状态，避免跨工具分段沿用上一条工具 intent。
+首个动作采样、候选扩展与 PPT 在回放前保持内容隔离。单样本观测沿用 OMP 的常规 working
+UI；高影响检查点显示 `Expanding a consequential action to N candidates…` 与
+`Verifying N candidate actions with PPT…`，并在 winner 回放前恢复默认状态，避免跨过程步骤
+沿用上一条工具 intent。
 
-OMP 自动标题等低 token 辅助请求采用单轨原模型调用，request/action 选择范围保持在
-coding-agent 动作上。支持 reasoning 的辅助模型在首次请求中使用调用方已选择的思考
+OMP 自动标题等低 token 辅助请求采用单轨原模型调用。PRM 调度范围覆盖 coding-agent
+动作。支持 reasoning 的辅助模型在首次请求中使用调用方已选择的思考
 强度；辅助调用未选择强度时使用模型支持的最低强度。模型元数据滞后并导致动态 endpoint
 以 400 拒绝 `disableReasoning` 时，包装器会记录这项 endpoint 能力并重试一次。用户为
 编码轨迹选择的 `high` 或 `max` 会原样保留。
 
-并行候选共享调用方的完整上下文、工具定义、session ID、prompt-cache key 与 provider
-session state，使大段编码上下文保持相同前缀并提高缓存亲和性。插件会在 fan-out 前拒绝
+所有样本共享调用方的完整上下文、工具定义、session ID、prompt-cache key 与 provider
+session state。首个样本完成后会预热相同的编码上下文前缀，其余 N-1 个高影响动作候选
+随后并发生成，从而提高缓存亲和性。插件会在采样前拒绝
 可能在生成期间直接执行副作用的 provider-native `execHandlers`；声明式工具调用完整参与
 选择，胜出调用才会回放到 agent loop。
 

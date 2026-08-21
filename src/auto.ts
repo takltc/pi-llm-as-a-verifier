@@ -1,4 +1,4 @@
-/** Request/action-level automatic self-verification provider for OMP. */
+/** Process-reward checkpoint verification provider for OMP. */
 
 import {
   streamSimple,
@@ -15,6 +15,11 @@ import {
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import type { ApiKeyResolver } from "@oh-my-pi/pi-ai/auth-retry";
 import { isProviderRetryableError } from "@oh-my-pi/pi-ai/error";
+import {
+  resolveToolTier,
+  type ToolApproval,
+  type ToolTier,
+} from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { select } from "./select.ts";
 import {
   CODING_AGENT_ACTION_CRITERIA,
@@ -51,11 +56,14 @@ const CANDIDATE_RETRY_STAGGER_MS = 100;
 const OMP_UTILITY_REQUEST_MAX_TOKENS = 2048;
 const MANDATORY_REASONING_REJECTION =
   /(?:reasoning|thinking).{0,120}(?:mandatory|required|must be enabled|cannot be disabled)/i;
-// TurboAgent's latency-sensitive online configuration: every model request
-// generates configurable N actions concurrently (default 3, range 2-8), exact
-// majority may short-circuit, and
-// the remaining actions run PPT with k=2 pivots, K=1 verification and C=1
-// criterion. The offline self-verification API keeps its separate Bo3 profile.
+// Appendix B.3 evaluates LLM-as-a-Verifier as a process reward model (PRM)
+// while varying the sampled actions per step. Audited OMP read-tier observation
+// calls use one sample. Consequential checkpoints expand to configurable N
+// actions (default 3, range 2-8), then
+// use TurboAgent's exact majority shortcut or PPT with k=2, K=1 and C=1.
+// The first sample completes before expansion, warming the shared provider
+// prompt prefix for the remaining N-1 calls. The offline self-verification API
+// keeps its separate Bo3 profile.
 export const AUTO_SELECTION_DEFAULTS = {
   pivots: 2,
   nEvaluations: 1,
@@ -63,8 +71,26 @@ export const AUTO_SELECTION_DEFAULTS = {
   maxWorkers: 8,
 } as const;
 
-export const AUTO_VERIFICATION_GRANULARITY = "request_action" as const;
+export const AUTO_VERIFICATION_GRANULARITY = "prm" as const;
 export type AutoVerificationGranularity = typeof AUTO_VERIFICATION_GRANULARITY;
+
+export type ProcessCheckpointReason =
+  | "read_only_tools"
+  | "terminal_response"
+  | "write_tool"
+  | "exec_tool"
+  | "stateful_read_tool"
+  | "unclassified_read_tool"
+  | "unknown_tool"
+  | "approval_error"
+  | "missing_tool_call"
+  | "proposal_failed";
+
+export interface ProcessActionClassification {
+  scope: "observation" | "checkpoint";
+  reason: Exclude<ProcessCheckpointReason, "proposal_failed">;
+  toolTiers: ToolTier[];
+}
 
 export interface AutoVerifierState {
   originalModel: Model;
@@ -165,7 +191,11 @@ export interface AutoVerifierDegradedEvent {
 }
 
 export interface AutoVerifierPhaseEvent {
-  phase: "generating_candidates" | "verifying_candidates" | "replaying_winner";
+  phase:
+    | "sampling_action"
+    | "generating_candidates"
+    | "verifying_candidates"
+    | "replaying_winner";
   candidateCount: number;
   successfulCandidates?: number;
 }
@@ -173,6 +203,7 @@ export interface AutoVerifierPhaseEvent {
 export interface AutoVerifierDecision {
   /** How the winner was chosen for this agent action.
    *
+   *  - "single": a read-only PRM observation used k=1 and skipped selection
    *  - "majority": an exact action majority selected the winner without PPT
    *  - "verifier": the paper's PPT tournament selected the winner
    *  - "fallback": PPT failed or too few candidates succeeded; the earliest
@@ -180,10 +211,15 @@ export interface AutoVerifierDecision {
    *  - "aborted": the caller cancelled the request
    *  - "error": no usable candidate; the request errored
    */
-  path: "majority" | "verifier" | "fallback" | "aborted" | "error";
+  path: "single" | "majority" | "verifier" | "fallback" | "aborted" | "error";
   granularity: AutoVerificationGranularity;
+  /** Configured sample budget N for consequential PRM checkpoints. */
   candidateCount: number;
+  /** Candidate indices actually dispatched for this process step. */
+  sampledCandidates: number;
   successfulCandidates: number;
+  /** Why this process step used k=1 or expanded to the configured N. */
+  checkpointReason?: ProcessCheckpointReason;
   /** Candidates still in flight when a strict majority (count > N/2) became
    *  guaranteed and the remaining fan-out was cancelled (majority shortcut). */
   discardedCandidates?: number;
@@ -301,30 +337,84 @@ async function runAutomaticVerification(
   if (streamOptions.signal?.aborted) onAbort();
   else streamOptions.signal?.addEventListener("abort", onAbort, { once: true });
   const startedAt = Date.now();
+  let sampledCandidates = 0;
   let successfulCandidates = 0;
   let toolUseCandidates = 0;
   let terminalCandidates = 0;
+  let checkpointReason: ProcessCheckpointReason | undefined;
   try {
     if (streamOptions.execHandlers) {
       throw new Error(
-        "Automatic request/action verification requires declarative tool calls; " +
+        "Automatic process-reward verification requires declarative tool calls; " +
           "provider-native execHandlers can execute during candidate generation.",
       );
     }
 
-    // Paper §2 treats natural language, code edits and tool calls uniformly as
-    // actions. TurboAgent applies Best-of-N selection to every API request, so
-    // all N candidates launch concurrently and every successful action enters
-    // majority/PPT selection before the agent loop observes a winner.
-    reportPhase(state, { phase: "generating_candidates", candidateCount });
-    let firstError: unknown;
+    // Appendix B.3 treats the number of sampled actions at a process step as a
+    // quality/compute axis. Sample one proposal first. Read-tier observations
+    // use k=1; consequential steps expand to N total samples and enter the same
+    // exact-majority/PPT selector. Completing the proposal before fan-out also
+    // warms the shared prompt prefix for all N-1 additional calls.
+    reportPhase(state, { phase: "sampling_action", candidateCount: 1 });
+    sampledCandidates = 1;
+    let proposal: PromiseSettledResult<CandidateResult>;
+    try {
+      proposal = {
+        status: "fulfilled",
+        value: await generateCandidate(state, context, streamOptions, 0, controller.signal),
+      };
+    } catch (reason) {
+      proposal = { status: "rejected", reason };
+    }
+    if (controller.signal.aborted) throw controller.signal.reason ?? abortReason();
+
+    if (proposal.status === "fulfilled") {
+      const classification = classifyProcessAction(proposal.value.message, context.tools);
+      checkpointReason = classification.reason;
+      if (classification.scope === "observation") {
+        successfulCandidates = 1;
+        toolUseCandidates = 1;
+        reportPhase(state, {
+          phase: "replaying_winner",
+          candidateCount: 1,
+          successfulCandidates,
+        });
+        reportDecision(state, {
+          path: "single",
+          granularity: AUTO_VERIFICATION_GRANULARITY,
+          candidateCount,
+          sampledCandidates,
+          successfulCandidates,
+          checkpointReason,
+          toolUseCandidates,
+          terminalCandidates,
+          nonterminalCandidates: toolUseCandidates,
+          winnerIndex: proposal.value.index,
+          winnerStopReason: proposal.value.message.stopReason,
+          durationMs: Date.now() - startedAt,
+        });
+        replayAssistantMessage(output, proposal.value.message);
+        return;
+      }
+    } else {
+      checkpointReason = "proposal_failed";
+    }
+
+    reportPhase(state, {
+      phase: "generating_candidates",
+      candidateCount,
+      successfulCandidates: proposal.status === "fulfilled" ? 1 : 0,
+    });
+    sampledCandidates = candidateCount;
     const gathered = await gatherCandidates(
       (index, signal) => generateCandidate(state, context, streamOptions, index, signal),
       candidateCount,
       controller.signal,
+      [proposal],
     );
     if (controller.signal.aborted) throw controller.signal.reason ?? abortReason();
 
+    let firstError: unknown;
     const successful: CandidateResult[] = [];
     for (const result of gathered.results) {
       if (result.status === "fulfilled") {
@@ -347,7 +437,9 @@ async function runAutomaticVerification(
       path: "fallback",
       granularity: AUTO_VERIFICATION_GRANULARITY,
       candidateCount,
+      sampledCandidates,
       successfulCandidates,
+      checkpointReason,
       discardedCandidates: gathered.discardedCandidates,
       toolUseCandidates,
       terminalCandidates,
@@ -478,7 +570,9 @@ async function runAutomaticVerification(
       path: reason,
       granularity: AUTO_VERIFICATION_GRANULARITY,
       candidateCount,
+      sampledCandidates,
       successfulCandidates,
+      checkpointReason,
       toolUseCandidates,
       terminalCandidates,
       nonterminalCandidates: toolUseCandidates,
@@ -535,7 +629,137 @@ async function runUtilityRequest(
   }
 }
 
-/** Classify the winning action for telemetry; both classes enter selection. */
+type RuntimeApprovalTool = NonNullable<Context["tools"]>[number] & {
+  approval?: ToolApproval;
+  formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
+};
+
+// OMP's approval tier models execution risk, while PRM scheduling needs action
+// effects. These built-ins are stable, read-tier observations whose execution
+// only obtains evidence or advances an internal wait. Every other read-tier
+// tool remains a checkpoint until OMP exposes first-class effect metadata.
+const OMP_OBSERVATION_TOOL_NAMES = new Set([
+  "ast_grep",
+  "computer",
+  "debug",
+  "find",
+  "glob",
+  "grep",
+  "github",
+  "inspect_image",
+  "ls",
+  "lsp",
+  "read",
+  "recall",
+  "reflect",
+  "think",
+  "vibe_list",
+  "vibe_wait",
+  "web_search",
+]);
+
+// These OMP tools deliberately use approval="read" for UX/security purposes,
+// yet they commit control flow, session state, worker state, or durable memory.
+// Keeping the list explicit makes upgrades auditable and prevents them from
+// silently taking the PRM k=1 observation path.
+const OMP_STATEFUL_READ_TOOL_NAMES = new Set([
+  "approve",
+  "ask",
+  "checkpoint",
+  "learn",
+  "memory_edit",
+  "retain",
+  "rewind",
+  "rewrite",
+  "todo",
+  "vibe_kill",
+  "yield",
+]);
+
+/**
+ * Map one proposed OMP action onto the paper's PRM sample budget.
+ *
+ * OMP's argument-aware approval tier supplies execution risk and the audited
+ * effect adapter above separates read-only evidence gathering from read-tier
+ * control/state commits. A batch is an observation only when every emitted
+ * call resolves to `read` and every tool is a known observation. Missing tools,
+ * unclassified read tools, malformed tool-use messages and approval failures
+ * conservatively become consequential checkpoints. Terminal responses are also
+ * checkpoints because they commit the agent to yielding its final result.
+ */
+export function classifyProcessAction(
+  message: AssistantMessage,
+  tools: Context["tools"],
+): ProcessActionClassification {
+  const toolCalls = Array.isArray(message.content)
+    ? message.content.filter((block): block is ToolCall => block.type === "toolCall")
+    : [];
+  if (toolCalls.length === 0) {
+    return {
+      scope: "checkpoint",
+      reason: message.stopReason === "toolUse" ? "missing_tool_call" : "terminal_response",
+      toolTiers: [],
+    };
+  }
+
+  const toolTiers: ToolTier[] = [];
+  let hasStatefulReadTool = false;
+  let hasUnclassifiedReadTool = false;
+  for (const toolCall of toolCalls) {
+    const tool = tools?.find((candidate) =>
+      candidate.name === toolCall.name || candidate.customWireName === toolCall.name
+    ) as RuntimeApprovalTool | undefined;
+    if (!tool) {
+      return { scope: "checkpoint", reason: "unknown_tool", toolTiers };
+    }
+    let tier: ToolTier;
+    try {
+      tier = resolveToolTier(tool, toolCall.arguments);
+    } catch {
+      return { scope: "checkpoint", reason: "approval_error", toolTiers };
+    }
+    toolTiers.push(tier);
+    if (tier !== "read") continue;
+
+    const effect = classifyReadTierEffect(tool, toolCall.name, toolCall.arguments);
+    if (effect === "stateful") hasStatefulReadTool = true;
+    else if (effect === "unclassified") hasUnclassifiedReadTool = true;
+  }
+  if (toolTiers.includes("exec")) {
+    return { scope: "checkpoint", reason: "exec_tool", toolTiers };
+  }
+  if (toolTiers.includes("write")) {
+    return { scope: "checkpoint", reason: "write_tool", toolTiers };
+  }
+  if (hasStatefulReadTool) {
+    return { scope: "checkpoint", reason: "stateful_read_tool", toolTiers };
+  }
+  if (hasUnclassifiedReadTool) {
+    return { scope: "checkpoint", reason: "unclassified_read_tool", toolTiers };
+  }
+  return { scope: "observation", reason: "read_only_tools", toolTiers };
+}
+
+function classifyReadTierEffect(
+  tool: RuntimeApprovalTool,
+  emittedName: string,
+  args: unknown,
+): "observation" | "stateful" | "unclassified" {
+  const names = [tool.name, tool.customWireName, emittedName]
+    .filter((name): name is string => typeof name === "string")
+    .map((name) => name.trim().toLowerCase());
+  if (names.some((name) => OMP_STATEFUL_READ_TOOL_NAMES.has(name))) return "stateful";
+  if (names.some((name) => OMP_OBSERVATION_TOOL_NAMES.has(name))) return "observation";
+  if (names.includes("hub")) {
+    const op = typeof args === "object" && args !== null && "op" in args
+      ? String((args as { op?: unknown }).op).toLowerCase()
+      : "";
+    return op === "cancel" || op === "send" ? "stateful" : "observation";
+  }
+  return "unclassified";
+}
+
+/** Classify the winning action for telemetry. */
 function isToolUseMessage(message: AssistantMessage): boolean {
   return message.stopReason === "toolUse" ||
     (Array.isArray(message.content) &&
@@ -693,12 +917,24 @@ async function gatherCandidates(
   generate: (index: number, signal: AbortSignal) => Promise<CandidateResult>,
   count: number,
   external: AbortSignal,
+  initial: ReadonlyArray<PromiseSettledResult<CandidateResult> | undefined> = [],
 ): Promise<GatheredCandidates> {
   const discard = new AbortController();
   const merged = mergeAbortSignals(external, discard.signal);
-  const promises = Array.from({ length: count }, (_, index) => generate(index, merged.signal));
   const results = new Array<PromiseSettledResult<CandidateResult>>(count);
-  let pending = count;
+  const promises = new Array<Promise<CandidateResult> | undefined>(count);
+  let seeded = 0;
+  for (let index = 0; index < Math.min(initial.length, count); index += 1) {
+    const result = initial[index];
+    if (!result) continue;
+    results[index] = result;
+    seeded += 1;
+  }
+  for (let index = 0; index < count; index += 1) {
+    if (results[index]) continue;
+    promises[index] = generate(index, merged.signal);
+  }
+  let pending = count - seeded;
   let resolved = false;
 
   return await new Promise<GatheredCandidates>((resolveOuter) => {
@@ -712,7 +948,7 @@ async function gatherCandidates(
           const result = results[index];
           if (result) return result;
           // Late candidates after a short circuit: swallow their outcome.
-          void promises[index]!.then(() => undefined, () => undefined);
+          void promises[index]?.then(() => undefined, () => undefined);
           return { status: "rejected", reason: discardedReason };
         },
       );
@@ -744,7 +980,12 @@ async function gatherCandidates(
       }
       if (pending === 0) finish();
     };
+    if (pending === 0) {
+      finish();
+      return;
+    }
     for (const [index, promise] of promises.entries()) {
+      if (!promise) continue;
       promise.then(
         (value) => {
           results[index] = { status: "fulfilled", value };

@@ -13,6 +13,7 @@ import { cacheKey, loadCache, saveCache, type CacheContext } from "../src/cache.
 import {
   AUTO_CANDIDATE_COUNT,
   AUTO_SELECTION_DEFAULTS,
+  classifyProcessAction,
   createAutoVerifierStream,
   normalizeCandidateCount,
   normalizeEvaluations,
@@ -103,6 +104,22 @@ function message(index: number, withTool = false): AssistantMessage {
     ttft: 2,
     timestamp: 1000 + index,
   };
+}
+
+function toolMessage(
+  index: number,
+  name: string,
+  args: Record<string, unknown>,
+): AssistantMessage {
+  const result = message(index);
+  result.content.push({
+    type: "toolCall",
+    id: "call-" + index,
+    name,
+    arguments: args,
+  });
+  result.stopReason = "toolUse";
+  return result;
 }
 
 function fakeCandidateStreamFactory(
@@ -199,6 +216,21 @@ function context(): Context {
   };
 }
 
+function contextWithApprovalTool(
+  name: string,
+  approval: unknown,
+): Context {
+  return {
+    ...context(),
+    tools: [{
+      name,
+      description: name + " test tool",
+      parameters: {},
+      approval,
+    } as unknown as NonNullable<Context["tools"]>[number]],
+  };
+}
+
 async function collect(stream: AssistantMessageEventStream) {
   const events: unknown[] = [];
   const reader = (async () => {
@@ -209,7 +241,7 @@ async function collect(stream: AssistantMessageEventStream) {
   return { events, result };
 }
 
-describe("automatic request/action-level provider", () => {
+describe("automatic process-reward provider", () => {
   test("keeps the startup capability probe inside OMP's handler deadline", async () => {
     class ProbeBudgetVerifier extends VerifierClient {
       timeoutMs: number | undefined;
@@ -556,11 +588,183 @@ describe("automatic request/action-level provider", () => {
     expect(textDelta?.partial?.content[1]).toMatchObject({ type: "text", text: "candidate text 2" });
   });
 
-  test("starts all request/action candidates concurrently", async () => {
+  test("uses one sample for a read-only process observation", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const phases: AutoVerifierPhaseEvent[] = [];
+    const decisions: Array<Record<string, unknown>> = [];
+    const verifier = new RankingVerifier();
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: (_model, candidateContext, options = {}) => {
+        calls.push({ context: candidateContext, options });
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          const result = toolMessage(0, "read", { path: "src/auto.ts" });
+          candidate.push({ type: "start", partial: result });
+          candidate.push({ type: "done", reason: "toolUse", message: result });
+        });
+        return candidate;
+      },
+      onPhase: (event) => phases.push(event),
+      onDecision: (decision) => decisions.push(decision as unknown as Record<string, unknown>),
+    }, contextWithApprovalTool("read", "read"));
+
+    const { result } = await collect(stream);
+
+    expect(calls).toHaveLength(1);
+    expect(verifier.calls).toBe(0);
+    expect(result.stopReason).toBe("toolUse");
+    expect(phases).toEqual([
+      { phase: "sampling_action", candidateCount: 1 },
+      { phase: "replaying_winner", candidateCount: 1, successfulCandidates: 1 },
+    ]);
+    expect(decisions[0]).toMatchObject({
+      path: "single",
+      granularity: "prm",
+      candidateCount: 3,
+      sampledCandidates: 1,
+      successfulCandidates: 1,
+      checkpointReason: "read_only_tools",
+      toolUseCandidates: 1,
+      terminalCandidates: 0,
+    });
+  });
+
+  test("uses OMP's argument-aware tool tier as the process checkpoint boundary", () => {
+    const tools = contextWithApprovalTool(
+      "read",
+      (args: unknown) =>
+        String((args as { path?: unknown }).path).startsWith("ssh://") ? "exec" : "read",
+    ).tools;
+
+    expect(classifyProcessAction(toolMessage(0, "read", { path: "src/auto.ts" }), tools))
+      .toEqual({ scope: "observation", reason: "read_only_tools", toolTiers: ["read"] });
+    expect(classifyProcessAction(toolMessage(0, "read", { path: "ssh://host/repo" }), tools))
+      .toEqual({ scope: "checkpoint", reason: "exec_tool", toolTiers: ["exec"] });
+    expect(classifyProcessAction(toolMessage(0, "missing", {}), tools))
+      .toEqual({ scope: "checkpoint", reason: "unknown_tool", toolTiers: [] });
+    expect(classifyProcessAction(message(0), tools))
+      .toEqual({ scope: "checkpoint", reason: "terminal_response", toolTiers: [] });
+  });
+
+  test("keeps read-tier state commits and unclassified extension tools at PRM checkpoints", () => {
+    expect(classifyProcessAction(
+      toolMessage(0, "ask", { questions: [] }),
+      contextWithApprovalTool("ask", "read").tools,
+    )).toEqual({
+      scope: "checkpoint",
+      reason: "stateful_read_tool",
+      toolTiers: ["read"],
+    });
+    expect(classifyProcessAction(
+      toolMessage(0, "plugin_observer", {}),
+      contextWithApprovalTool("plugin_observer", "read").tools,
+    )).toEqual({
+      scope: "checkpoint",
+      reason: "unclassified_read_tool",
+      toolTiers: ["read"],
+    });
+    expect(classifyProcessAction(
+      toolMessage(0, "lsp", { action: "hover" }),
+      contextWithApprovalTool("lsp", "read").tools,
+    )).toEqual({
+      scope: "observation",
+      reason: "read_only_tools",
+      toolTiers: ["read"],
+    });
+    expect(classifyProcessAction(
+      toolMessage(0, "hub", { op: "logs" }),
+      contextWithApprovalTool("hub", "read").tools,
+    )).toEqual({
+      scope: "observation",
+      reason: "read_only_tools",
+      toolTiers: ["read"],
+    });
+    expect(classifyProcessAction(
+      toolMessage(0, "hub", { op: "cancel", ids: ["job-1"] }),
+      contextWithApprovalTool("hub", "read").tools,
+    )).toEqual({
+      scope: "checkpoint",
+      reason: "stateful_read_tool",
+      toolTiers: ["read"],
+    });
+    expect(classifyProcessAction(
+      toolMessage(0, "fragile", {}),
+      contextWithApprovalTool("fragile", () => {
+        throw new Error("cannot classify");
+      }).tools,
+    )).toEqual({
+      scope: "checkpoint",
+      reason: "approval_error",
+      toolTiers: [],
+    });
+
+    const mixed = toolMessage(0, "read", { path: "src/auto.ts" });
+    mixed.content.push({
+      type: "toolCall",
+      id: "call-edit",
+      name: "edit",
+      arguments: { path: "src/auto.ts" },
+    });
+    const mixedTools = [
+      ...(contextWithApprovalTool("read", "read").tools ?? []),
+      ...(contextWithApprovalTool("edit", "write").tools ?? []),
+    ];
+    expect(classifyProcessAction(mixed, mixedTools)).toEqual({
+      scope: "checkpoint",
+      reason: "write_tool",
+      toolTiers: ["read", "write"],
+    });
+  });
+
+  test("expands read-tier control commits to the configured candidate budget", async () => {
+    let nextIndex = 0;
+    const calls: number[] = [];
+    const decisions: Array<Record<string, unknown>> = [];
+    const verifier = new RankingVerifier();
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: () => {
+        const index = nextIndex++;
+        calls.push(index);
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          const result = toolMessage(index, "ask", { questions: [{ id: "scope" }] });
+          candidate.push({ type: "start", partial: result });
+          candidate.push({ type: "done", reason: "toolUse", message: result });
+        });
+        return candidate;
+      },
+      onDecision: (decision) => decisions.push(decision as unknown as Record<string, unknown>),
+    }, contextWithApprovalTool("ask", "read"), {}, { candidateCount: 3 });
+
+    await collect(stream);
+
+    expect(calls).toHaveLength(3);
+    expect(verifier.calls).toBeGreaterThan(0);
+    expect(verifier.calls).toBeLessThanOrEqual(6);
+    expect(decisions[0]).toMatchObject({
+      path: "verifier",
+      granularity: "prm",
+      candidateCount: 3,
+      sampledCandidates: 3,
+      checkpointReason: "stateful_read_tool",
+    });
+  });
+
+  test("warms one proposal then starts the remaining checkpoint candidates concurrently", async () => {
     let started = 0;
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
+    let releaseProposal!: () => void;
+    let releaseAlternatives!: () => void;
+    const proposalGate = new Promise<void>((resolve) => {
+      releaseProposal = resolve;
+    });
+    const alternativesGate = new Promise<void>((resolve) => {
+      releaseAlternatives = resolve;
     });
     const stream = createAutoVerifierStream({
       originalModel: model(),
@@ -569,6 +773,7 @@ describe("automatic request/action-level provider", () => {
       streamSimpleFn: () => {
         const index = started++;
         const candidate = new AssistantMessageEventStream();
+        const gate = index === 0 ? proposalGate : alternativesGate;
         void gate.then(() => {
           const result = message(index);
           candidate.push({ type: "start", partial: result });
@@ -580,8 +785,11 @@ describe("automatic request/action-level provider", () => {
 
     const pending = collect(stream);
     await Bun.sleep(0);
+    expect(started).toBe(1);
+    releaseProposal();
+    await Bun.sleep(0);
     expect(started).toBe(3);
-    release();
+    releaseAlternatives();
     const { result } = await pending;
     expect(result.responseId).toBe("response-2");
   });
@@ -731,7 +939,7 @@ describe("automatic request/action-level provider", () => {
     expect(result.errorMessage).toContain("declarative tool calls");
     expect(decisions[0]).toMatchObject({
       path: "error",
-      granularity: "request_action",
+      granularity: "prm",
       successfulCandidates: 0,
     });
   });
@@ -899,7 +1107,12 @@ describe("automatic request/action-level provider", () => {
     await collect(stream);
 
     expect(phases).toEqual([
-      { phase: "generating_candidates", candidateCount: 3 },
+      { phase: "sampling_action", candidateCount: 1 },
+      {
+        phase: "generating_candidates",
+        candidateCount: 3,
+        successfulCandidates: 1,
+      },
       { phase: "verifying_candidates", candidateCount: 3, successfulCandidates: 3 },
       { phase: "replaying_winner", candidateCount: 3, successfulCandidates: 3 },
     ]);
@@ -907,9 +1120,13 @@ describe("automatic request/action-level provider", () => {
 
   test("maps buffered selection phases to transient OMP working messages", () => {
     expect(automaticVerificationWorkingMessage({
+      phase: "sampling_action",
+      candidateCount: 1,
+    })).toBeUndefined();
+    expect(automaticVerificationWorkingMessage({
       phase: "generating_candidates",
       candidateCount: 8,
-    })).toBe("Generating 8 candidate actions…");
+    })).toBe("Expanding a consequential action to 8 candidates…");
     expect(automaticVerificationWorkingMessage({
       phase: "verifying_candidates",
       candidateCount: 8,
@@ -922,7 +1139,7 @@ describe("automatic request/action-level provider", () => {
     })).toBeUndefined();
   });
 
-  test("compares terminal and tool-use actions in one request/action-level PPT", async () => {
+  test("compares terminal and tool-use actions in one PRM checkpoint PPT", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
     const degraded: unknown[] = [];
     const decisions: unknown[] = [];
@@ -959,7 +1176,7 @@ describe("automatic request/action-level provider", () => {
     expect(degraded).toEqual([]);
     expect(decisions[0]).toMatchObject({
       path: "verifier",
-      granularity: "request_action",
+      granularity: "prm",
       winnerIndex: 2,
       winnerStopReason: "toolUse",
       successfulCandidates: 3,
@@ -1012,7 +1229,7 @@ describe("automatic request/action-level provider", () => {
     expect(decisions).toHaveLength(1);
     expect(decisions[0]).toMatchObject({
       path: "majority",
-      granularity: "request_action",
+      granularity: "prm",
       winnerIndex: 0,
       winnerStopReason: "toolUse",
       nComparisons: 0,
@@ -1089,7 +1306,7 @@ describe("automatic request/action-level provider", () => {
     expect(decision.winnerIndex).toBe(2);
     expect(decision.candidateCount).toBe(3);
     expect(decision.successfulCandidates).toBe(3);
-    expect(decision.granularity).toBe("request_action");
+    expect(decision.granularity).toBe("prm");
     expect(decision.toolUseCandidates).toBe(0);
     expect(decision.terminalCandidates).toBe(3);
     expect(decision.nComparisons).toBe(5);
@@ -1200,7 +1417,7 @@ describe("automatic request/action-level provider", () => {
     expect(degraded).toHaveLength(1);
     expect(degraded[0]).toMatchObject({
       reason: "non_probabilistic_scores",
-      granularity: "request_action",
+      granularity: "prm",
       scoreSources: { logprobs: 0, textFallback: 0, neutralTie: 8, unknown: 0 },
     });
     expect(decisions[0]).toMatchObject({
@@ -1327,7 +1544,7 @@ describe("automatic request/action-level provider", () => {
         calls.push({ context: candidateContext, options });
         const candidate = new AssistantMessageEventStream();
         queueMicrotask(() => {
-          if (attempt < 2) {
+          if (attempt === 0) {
             const error = new Error("429 Too Many Requests: all replicas at capacity");
             candidate.fail(attempt === 0 ? Object.assign(error, { status: 429 }) : error);
             return;
@@ -1343,7 +1560,7 @@ describe("automatic request/action-level provider", () => {
     }, context());
 
     await collect(stream);
-    expect(calls).toHaveLength(5);
+    expect(calls).toHaveLength(4);
     expect(degraded).toEqual([]);
     expect(decisions[0]).toMatchObject({
       candidateCount: 3,
@@ -1372,7 +1589,7 @@ describe("automatic request/action-level provider", () => {
     setTimeout(() => controller.abort(), 10);
     const { result } = await collect(stream);
     expect(result.stopReason).toBe("aborted");
-    expect(calls).toBe(3);
+    expect(calls).toBe(1);
     expect(decisions[0]).toMatchObject({ path: "aborted" });
   });
   test("short-circuits candidate fan-out once a strict majority is guaranteed", async () => {
@@ -1495,7 +1712,7 @@ describe("automatic request/action-level provider", () => {
     expect(result.responseId).toBe("response-2");
     expect(degraded).toEqual([{
       reason: "insufficient_candidates",
-      granularity: "request_action",
+      granularity: "prm",
       candidateCount: 3,
       successfulCandidates: 1,
       toolUseCandidates: 0,
@@ -1936,7 +2153,7 @@ describe("OMP default model inheritance", () => {
   test("reports verifier score failure without claiming candidate loss", () => {
     const message = degradedWarningMessage({
       reason: "non_probabilistic_scores",
-      granularity: "request_action",
+      granularity: "prm",
       candidateCount: 3,
       successfulCandidates: 3,
       scoreSources: { logprobs: 0, textFallback: 0, neutralTie: 8, unknown: 0 },
@@ -2473,7 +2690,7 @@ describe("documentation and plugin surface", () => {
       min: 2,
       max: 8,
       step: 1,
-      description: "每次模型动作请求并行生成的候选数量（2-8，默认 3）",
+      description: "高影响动作检查点的候选总数（2-8，默认 3；经审计的观测固定使用 1 个样本）",
     });
     expect(manifest.omp.settings.nEvaluations.default).toBe(1);
     expect(manifest.omp.settings.pivots.default).toBe(2);

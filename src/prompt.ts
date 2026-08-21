@@ -80,7 +80,7 @@ export const CODING_AGENT_GROUND_TRUTH_NOTE =
   "are safe, relevant, and likely to advance the current coding task.";
 
 /**
- * TurboAgent's online request/action selection contract, pinned to
+ * TurboAgent's online consequential-checkpoint selection contract, pinned to
  * llm-as-a-verifier/TurboAgent@eeb61be9. Keeping this profile separate from
  * the richer offline criteria makes the latency-sensitive agent path explicit.
  */

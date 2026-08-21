@@ -1,7 +1,7 @@
 # LLM-as-a-Verifier 理论与实现基线
 
 > 状态：后续自回归优化的理论门禁
-> 核验日期：2026-08-20
+> 核验日期：2026-08-21
 > 论文版本：[arXiv:2607.05391v2](https://arxiv.org/abs/2607.05391)，2026-07-07
 > 作者参考实现：[commit `8db8a114355a9d7fdf9a8d1d5c87f6aeebd18770`](https://github.com/llm-as-a-verifier/llm-as-a-verifier/tree/8db8a114355a9d7fdf9a8d1d5c87f6aeebd18770)
 > Coding-agent 参考实现：[TurboAgent commit `eeb61be9cb618ea9c52262cebf15092e7c185146`](https://github.com/llm-as-a-verifier/TurboAgent/tree/eeb61be9cb618ea9c52262cebf15092e7c185146)
@@ -16,9 +16,9 @@
 | `package.json` | 插件名、默认候选数 3、候选范围 2–8、可选 verifier model | 未增加论文或算法来源。 |
 | `src/ppt.ts` | PPT、Hamiltonian ring、Bradley–Terry、比较次数公式 | pair 集采用论文 Appendix B.2 Algorithm 1 的集合定义；正文复杂度公式作为上界；注释定位为论文 §3.2 与 Appendix B.2。 |
 | `src/scale.ts`、`src/prompt.ts`、`src/client.ts` | 20 级 A–T、双轨迹 pairwise prompt、token logprobs | 与作者实现的兼容方向一致。 |
-| `src/auto.ts` | request/action 级可配置 N（2–8，默认 3）、k=2、K=1、C=1、精确多数决与 PPT | 默认值与作者 TurboAgent 在线 coding-agent 配置一致；插件把候选规模扩展为受限配置项，离线 self-verification 继续使用独立 Bo3 配置。 |
+| `src/auto.ts` | PRM 高影响检查点、按 effect 分配动作采样预算、N（2–8，默认 3）、k=2、K=1、C=1、精确多数决与 PPT | 经审计的观测采用一个样本；终态、状态/控制提交及 OMP `write`/`exec`/未知动作扩展至 N 个样本。检查点选择属于论文 PRM 的产品映射，选择器默认值与 TurboAgent 一致。 |
 | `_ref/` | 作者仓库本地参考副本 | 最新核验固定在提交 `8db8a114355a9d7fdf9a8d1d5c87f6aeebd18770`；上一轮兼容快照为 `115de305f23ed89bc42e86e010853c40059f3f7d`。 |
-| `docs/theory-baseline.md` | 理论来源、产品映射与防漂移不变量 | 固定论文、作者主仓库和 TurboAgent 三类一手来源。 |
+| `docs/theory-baseline.md`、`docs/granularity-selection.md` | 理论来源、三种奖励范围、产品映射与防漂移不变量 | 固定论文、作者主仓库、TurboAgent 与 OMP 四类一手来源。 |
 
 ## 2. 理论目标与适用边界
 
@@ -35,17 +35,22 @@
 
 | 方案 | 论文/官方落点 | 对 coding agent 的含义 |
 | --- | --- | --- |
-| 完整轨迹 ORM / Best-of-N | 为同一任务生成 N 条完整 trajectory，结束后用 PPT 选出结果。[论文 §3、§5 与 Appendix B.3](https://arxiv.org/html/2607.05391v2) | 适合离线 benchmark 或具备 N 个隔离工作区、隔离终端和隔离副作用的 harness。首个动作分叉后，共享 provider 前缀缓存迅速减少。 |
-| 逐步 PRM | 每一步采样多个候选 action，并对轨迹前缀评分；Appendix B.3 报告 sampled actions per step 从 1 增至 9 时 pass@1 单调提升。[论文 Appendix B.3](https://arxiv.org/html/2607.05391v2) | 适合能够克隆环境状态并控制每个候选动作执行的 agent harness。它给每一步提供选择信号，环境隔离与调度成本较高。 |
-| 每请求 TurboAgent | coding-agent 代理对每个 API request 并发派发 N 个候选 response，再用精确动作多数决或 PPT 选出一个。[论文 §6 Coding Agent Extension](https://arxiv.org/html/2607.05391v2)；[TurboAgent backend](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py) | 与 OMP provider seam 一一对应；每次工具调用和终态回复都先选择，agent loop 只接收胜出动作。 |
+| 结果奖励模型 ORM | 对候选最终答案或最终结果评分；Appendix B.3 用 ORM 运行 coding/math Best-of-N。[论文 Appendix B.3](https://arxiv.org/html/2607.05391v2) | 适合单轮补丁与最终结果选择；过程中的工具动作已经发生。 |
+| 过程奖励模型 PRM | 在状态 (s_t) 采样候选 action，并对步骤或轨迹前缀评分；Appendix B.3 报告 sampled actions per step 的 (k=1,3,5,9)，随 k 增长时 pass@1 单调提升。[论文 Appendix B.3](https://arxiv.org/html/2607.05391v2) | 声明式工具调用允许先比较候选 action、再只执行 winner，适配交互式 OMP。k=1 是低计算基线，k>1 用于需要提高上限的决策点。 |
+| 轨迹奖励模型 TRM | 对包含动作、工具调用和观测结果的完整交互轨迹评分；论文 §5 的主实验采用该范围。[论文 §2、§5](https://arxiv.org/html/2607.05391v2) | 适合离线 benchmark 或具备 N 个隔离工作区、终端与副作用环境的 harness。首个动作分叉后，跨轨迹生成缓存复用下降。 |
 
-本插件选择 **每请求 TurboAgent / request-action 粒度**。该边界直接面向 coding agent，且有论文正文与作者官方可执行实现共同支撑。实现采用以下成本与质量配置：
+TurboAgent 的 per-request fan-out 是 coding-agent 部署 seam，评分范围继续落在 ORM/PRM/TRM 三种论文术语中。[论文 §6 Coding Agent Extension](https://arxiv.org/html/2607.05391v2)；[TurboAgent backend](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py)
 
-1. 每次模型请求并发生成 N=`candidateCount` 个候选，N 的范围为 2–8、默认值为 3。所有候选共享完整消息历史、工具 schema、session ID、prompt-cache key 与 provider session state，大段 coding context 保持相同前缀。
-2. 精确序列化动作出现严格多数时采用 TurboAgent 多数决；工具调用 ID 不进入动作身份，工具名与参数进入身份。其余候选进入 G=20 的 PPT。
-3. 在线默认使用 k=2、K=1、C=1，与 TurboAgent 参考配置一致。默认 N=3 时，本插件的 Algorithm 1 集合差实现执行 4–5 次逻辑比较，上界为 6；其他 N 按论文的 `O(Nk)` 关系扩展，候选生成和 verifier job 均并行执行。
-4. 工具调用与终态回复共同参与选择，胜出动作回放后才进入 agent loop。provider-native `execHandlers` 具备生成期副作用，插件在 fan-out 前显式报错并要求声明式工具调用。
-5. 完整轨迹 ORM 继续用于离线 self-verification；逐步 PRM 保留为需要环境克隆能力的 harness 集成方向。
+本插件选择 **逐步 PRM**，并把论文的 sampled-actions-per-step 预算映射为高影响检查点调度。论文 Appendix B.3 给出 k=1 与 k>1 的逐步采样实验；§4 说明验证计算量可按下游延迟预算调节。按操作 effect 路由属于 PRM 内部的工程调度策略，收益通过本插件实验单独验证。[论文 §4 L170–174、Appendix B.3 L492–500](https://arxiv.org/html/2607.05391v2)
+
+1. 每个 coding-agent 步骤先生成一个 proposal。proposal 只包含经审计的 OMP 观测工具时，本步骤使用 PRM 的 k=1 基线并直接执行；该路径不触发 candidate warning、插件 working 文案或 verifier 请求。
+2. 终态回复与任一状态/控制提交、`write`、`exec`、未知工具、未分类 read-tier 工具、缺失工具或 approval 解析异常构成高影响检查点。插件随后补充生成 N-1 个候选，使总样本数达到 N=`candidateCount`（2–8，默认 3）。
+3. OMP 的参数级 approval tier 与受测试的 effect adapter 共同确定动作影响：动态本地 read/grep、LSP 查询、只读 debug/GitHub/computer 与 job list/logs 等保持观测语义；SSH read 等由 OMP 归入 `exec`；ask/yield/checkpoint/rewind/todo/长期记忆提交及 worker cancel/send 等 read-tier 控制工具进入检查点；省略 approval 的工具按 OMP 契约归入 `exec`。
+4. 高影响检查点采用 TurboAgent 的精确动作多数决，剩余分歧进入 G=20 的 PPT。在线默认 k=2、K=1、C=1；工具调用 ID 不进入动作身份，工具名与参数进入身份。
+5. proposal 完成后才并发派发 N-1 个额外样本。该调度保持相同采样分布和候选总数，并先预热完整消息历史、工具 schema、session ID、prompt-cache key 与 provider session state 形成的公共前缀。
+6. `granularity=prm` 标识 PRM，`path=single` 标识 k=1 观测步骤；`sampledCandidates` 与 `checkpointReason` 公开真实计算量和调度原因。
+7. effect-gated 检查点策略是 OMP 场景的产品映射。论文为 PRM、可调 sampled actions 和 PPT 提供理论与实验依据；该策略的端到端收益由插件 benchmark 与真实 OMP 运行数据验证。
+8. 最终结果 ORM 与完整轨迹 TRM 继续服务离线 self-verification/benchmark；TurboAgent 每请求全量 fan-out 作为最高密度在线配置保留理论参照。
 
 ## 3. 细粒度期望奖励
 
@@ -147,9 +152,9 @@ L=N+k(N-k)+\binom{k}{2}-|E_{ring}\cap E^*_{piv}|.
 
 当前插件冻结 **4 次逻辑比较** 作为论文形式化算法基线。作者可执行实现对应的 5 次累计作为独立兼容 fixture：它会复用缓存中的 ring 观测并再次加权一条边。遥测同时报告 logical comparisons、unique keys 与 provider calls，使两种语义可以直接比较。
 
-### 5.4 官方默认 N=3、k=2 在线动作配置
+### 5.4 高影响检查点的 N=3、k=2 在线选择配置
 
-TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确动作多数决。本插件保持 k/K/C 默认值，并将 N 暴露为 `candidateCount`（2–8，默认 3）。[TurboAgent 配置](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo-agent.yaml)；[多数决与 PPT 选择](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/verifier/verifier.py)
+TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确动作多数决。本插件在高影响 PRM 检查点保持 k/K/C 默认值，并将 N 暴露为 `candidateCount`（2–8，默认 3）；经审计的观测步骤采用一个 proposal。[TurboAgent 配置](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo-agent.yaml)；[多数决与 PPT 选择](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/verifier/verifier.py)
 
 对 N=3、k=2，正文上界为 `3 + 2×1 + 1 = 6`。Algorithm 1 的有向集合差会移除 1–2 条 ring 重叠，因此本插件每次冷启动且无多数时执行 4–5 个逻辑比较。每个比较在在线默认下对应一个 verifier 请求；评分缓存可进一步减少 provider calls。精确动作多数决对应 0 个 verifier 请求。
 
@@ -159,17 +164,19 @@ TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确�
 
 实现边界：
 
-- 在线 coding-agent 路径使用可配置 N（2–8，默认 3）以及 TurboAgent 的 k=2、K=1、C=1；离线 self-verification 使用 Bo3 的 N=3、k=1、K=2 与三项 coding-agent criteria。两组配置拥有独立来源和延迟预算。
+- 在线 coding-agent 路径采用 effect-gated PRM 动作预算：经审计的观测为 1，高影响检查点为可配置 N（2–8，默认 3），检查点选择器使用 TurboAgent 的 PPT k=2、K=1、C=1；离线 self-verification 使用 Bo3 的 N=3、PPT k=1、K=2 与三项 coding-agent criteria。两组配置拥有独立来源和延迟预算。
 - 独立 verifier model 是支持项；同模型 self-verification 也是支持项。遥测需记录实际 generator/verifier 身份。
-- 候选采样相互独立，并共享相同任务、前置证据、工具 schema 和缓存身份。候选请求关闭 server-side turn chaining，保留 session/prompt cache affinity，并使用 TurboAgent 的 temperature=1 默认采样温度。
-- 同一在线 PPT 的候选处于同一个 request/action 边界；工具调用、代码相关动作文本和终态回复统一进入选择。胜出响应保留原始 tool-call ID 与 provider payload，agent loop 只看到这一条响应。
+- 高影响检查点的候选采样相互独立，并共享相同任务、前置证据、工具 schema 和缓存身份。候选请求关闭 server-side turn chaining，保留 session/prompt cache affinity，并使用 TurboAgent 的 temperature=1 默认采样温度。
+- 每个步骤先完成 proposal。OMP 参数级 approval tier 与 effect adapter 只将已知无状态的 `read` 调用归为观测步骤；终态、read-tier 状态/控制提交、未分类扩展工具、`write`、`exec`、未知或解析异常调用归为高影响检查点。混合工具批次按最高影响 effect 处理。
+- 同一在线 PPT 的候选处于同一个 PRM 检查点；工具调用、代码相关动作文本和终态回复统一进入选择。胜出响应保留原始 tool-call ID 与 provider payload，agent loop 只看到这一条响应。
 - 精确动作多数决使用序列化后的可见文本、工具名和工具参数；provider 生成的调用 ID 不影响一致性判断。多数决采用独立 `path=majority`，PPT 的 `paperEquivalent` 指标保持独立。
 - no-logprobs 电路断路：同一选择内所有评分 job 共享同一请求形态，前 2 个独立 job 均以 logprobs 不支持失败（各自已耗尽客户端内部重试）后，未启动的 job 直接进入运行期 0.5 平局、不再发起 provider 调用；平局不持久化，`paperEquivalent` 保持 false。属于成本护栏，不改动 Eq. (3.1) 期望、PPT pair 集或失败语义。
 - 缓存写入节流：一个阶段内部最多约 5 次中间 checkpoint 落盘加末尾一次，避免把每次评分完成都变成同步锁+fsync 重写；崩溃最多丢失最近一小批分数。
 - 插件把 K（`nEvaluations`，1–16）与 k（`pivots`，1–8）暴露为在线配置项，默认 K=1、k=2。K 是论文 §4.2 的质量/成本轴，k 是论文 §3.2 的 PPT 参数；上调后按论文语义增加验证计算。`k` 在运行时按候选数 `min(k,N)` 收敛。
 - 候选生成 transient 重试（工程护栏）：每个候选在 provider 瞬时故障（可重试状态或等价错误）时重试一次，等待时间按候选索引错开并顺从外部分流 `signal` 的 abort；重试是同一候选索引的新独立采样，采样分布与关闭 server-side turn-chaining 的 side-channel 语义不变，`successfulCandidates` 仍按成功候选数上报。护栏不掉 `temperature=1`、不改变 Eq. (3.1) 期望与 PPT pair 集，只扩充失败容错路径。
 - 能力探测时序（生命周期护栏）：启动期 logprobs 能力探测使用 `CAPABILITY_PROBE_TIMEOUT_MS=10_000` 超时，为 OMP 30 秒扩展 handler 期限留下充裕余量；探测只作绑定判断，不影响评分请求形态或 Eq. (3.1) 期望。
-- 候选多数即决（工程延迟/成本护栏）：候选 fan-out 采用竞速收集，一旦某动作的严格多数不可逆（`count > N/2`），立即结束等待并通过私有信号取消剩余在途候选，随后按多数决回放胜者。剩余候选的生成结果被丢弃、不进入 `successfulCandidates`，决策以 `discardedCandidates` 遥测报告取消数量。多数行动作唯一，剩余候选无法改变该判定，因此胜者与等待全部 N 个候选的结果一致；外部 `signal` 的 abort 语义与 PPT 路径不受影响。
+- proposal 前缀预热（工程延迟/成本护栏）：proposal 完成后再并发启动 N-1 个高影响候选。所有调用保留相同 prompt-cache identity，因此 proposal 的已完成请求可预热公共 coding-context 前缀；候选总数和后续多数决/PPT 语义保持一致。
+- 候选多数即决（工程延迟/成本护栏）：额外候选 fan-out 采用竞速收集，并把已完成 proposal 纳入计数；某动作的严格多数不可逆（`count > N/2`）时，立即结束等待并通过私有信号取消剩余在途候选，随后按多数决回放胜者。剩余候选的生成结果被丢弃、不进入 `successfulCandidates`，决策以 `discardedCandidates` 遥测报告取消数量。多数行动作唯一，剩余候选无法改变该判定，因此胜者与等待全部 N 个候选的结果一致；外部 `signal` 的 abort 语义与 PPT 路径保持不变。
 
 ## 7. 图片输入
 
@@ -179,7 +186,7 @@ TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确�
 
 ## 8. 可实现的理论不变量
 
-截至 2026-08-20，`INV-01` 至 `INV-15` 的最小自动门禁已全部落地：`test/core.test.ts` 覆盖期望值/映射/扫描差分/缓存方向与环比与版本/准则顺序无关/K 槽位互换与候选身份回映/PPT pair 集与复杂度，`test/theory.test.ts` 固化离线 Bo3 与在线 TurboAgent 配置，`test/verification.test.ts` 覆盖动作级并发、工具调用选择、精确多数决、缓存身份、副作用保护、证据图片与降级来源。
+截至 2026-08-21，`INV-01` 至 `INV-15` 的最小自动门禁已全部落地：`test/core.test.ts` 覆盖期望值/映射/扫描差分/缓存方向与环比与版本/准则顺序无关/K 槽位互换与候选身份回映/PPT pair 集与复杂度，`test/theory.test.ts` 固化离线 Bo3 与在线选择器配置，`test/verification.test.ts` 覆盖 PRM 检查点分类、观测单样本、read-tier 状态提交、未分类工具、proposal 前缀预热、额外候选并发、工具调用选择、精确多数决、缓存身份、副作用保护、证据图片与降级来源。
 
 | ID | 必须保持的实现性质 | 最小自动门禁 | 一手依据 |
 | --- | --- | --- | --- |
@@ -196,8 +203,8 @@ TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确�
 | INV-11 | 真实 verifier 路径必须取得 token logprobs；文本字母回退、空支持和解析失败进入显式来源统计。论文等价决策要求全部 score tag 来自 logprob 期望，并记录有效 A–T 支持数与返回概率质量。 | Chat/Responses/DeepSeek/Vertex 响应契约 fixture；断言 `scoreSources`、`scoreDistribution` 与 `paperEquivalent`，使文本回退和中性平局排除在论文等价统计之外。 | [Appendix B.6，pp. 30–31](https://arxiv.org/pdf/2607.05391#page=30)；[OpenAI Chat](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)；[DeepSeek](https://api-docs.deepseek.com/api/create-chat-completion/)；[Vertex GenerationConfig](https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1beta1/GenerationConfig) |
 | INV-12 | pair、criterion、rep、模型、prompt/scale、任务证据、图片摘要和方向共同决定缓存身份；缓存项携带评分来源，失败平局保持运行期作用域。 | 缓存碰撞测试、方向测试、版本失效测试、来源持久化测试、失败后重试测试。 | [作者实现 L748–811、L862–910](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L748-L811) |
 | INV-13 | 候选携带可判断任务完成度的证据；图片输入在候选与 verifier 条件中保持一致。 | 证据截断标记、图片顺序/摘要测试、能力前置校验。 | [论文 §3.1–§3.2，pp. 4–5](https://arxiv.org/pdf/2607.05391#page=4)；[作者实现 L403–447、L696–745](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L403-L447) |
-| INV-14 | 每次 coding-agent 模型请求生成 N 个并行候选，工具调用和终态回复共同进入精确多数决/PPT，agent loop 只接收胜出动作。 | 并发启动屏障、全工具候选、混合 stop reason、胜出 tool-call 回放测试；严格多数不可逆时提前结束 fan-out 仍选同一胜者（`discardedCandidates` 遥测）。 | [论文 §6 Coding Agent Extension](https://arxiv.org/html/2607.05391v2)；[TurboAgent backend](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py) |
-| INV-15 | 并行候选共享完整上下文和 prompt-cache 身份；side-channel 候选关闭 turn chaining/cache-refresh ownership；生成期原生工具执行在 fan-out 前终止。 | session/cache identity、temperature、cache refresh ownership 与 `execHandlers` 零调用测试。 | [TurboAgent 并发请求配置](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo-agent.yaml)；[TurboAgent `_gather_completions`](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py#L146-L176) |
+| INV-14 | 每个 coding-agent 步骤先采样一个 proposal；只有全部工具同时满足 OMP `read` tier 与受审计 observation effect 时使用 PRM 单样本路径。终态、read-tier 状态/控制提交、未分类工具、`write`/`exec`/未知或解析异常动作扩展至配置 N。 | 静态与参数级动态 approval fixture；本地 read、SSH read、ask、未分类 extension tool、approval error、未知工具、终态、混合批次；断言观测路径 1 次 generator、0 次 verifier、无 degraded warning与插件 working 文案，并记录 `path=single`。 | [论文 §2](https://arxiv.org/html/2607.05391v2#S2)；[论文 §4](https://arxiv.org/html/2607.05391v2#S4)；[Appendix B.3 PRM](https://arxiv.org/html/2607.05391v2)；[OMP effect 映射研究](granularity-selection.md#42-哪些操作进入验证边界) |
+| INV-15 | 高影响检查点的首个 proposal 完成后并发启动 N-1 个额外候选；所有样本共享完整上下文与 prompt-cache 身份，随后统一进入严格多数决/PPT，agent loop 只接收 winner。side-channel 候选关闭 turn chaining/cache-refresh ownership；生成期原生工具执行在采样前终止。 | proposal/额外候选双屏障、总样本数 2–8、session/cache identity、temperature、cache refresh ownership、全工具候选、混合 stop reason、胜出 tool-call 回放、`execHandlers` 零调用；严格多数提前结束仍选同一 winner。 | [论文 Appendix B.3](https://arxiv.org/html/2607.05391v2)；[论文 §6 Coding Agent Extension](https://arxiv.org/html/2607.05391v2)；[TurboAgent `_gather_completions`](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py#L146-L176) |
 
 ## 9. 常见偏离风险
 
@@ -216,8 +223,9 @@ TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确�
 | 丢失完整轨迹、终端输出或图片证据 | verifier 的条件信息发生变化，候选正确性可能无法识别。截断策略应保留最终验证证据并输出截断遥测。 | [论文 §3.1–§3.2，pp. 4–5](https://arxiv.org/pdf/2607.05391#page=4)；[作者 loader L155–184](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/loaders.py#L155-L184) |
 | 持久化失败调用生成的 0.5 平局 | 暂时性接口故障会固化为未来评分证据。失败 tie 仅用于当前运行，并允许后续重试。 | [作者实现 L796–910](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L796-L910) |
 | 对近似文本或语义相似动作使用多数决 | TurboAgent 只接受序列化动作的严格字符串多数；扩大等价关系会改变捷径的错误边界。动作身份固定为可见文本、工具名与参数，调用 ID 作为传输元数据。 | [TurboAgent `_try_majority_voting`](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/verifier/verifier.py#L163-L185)；[TurboAgent `format_action`](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py#L314-L325) |
-| 只在 session 或终态回答结束时触发在线验证 | 中间工具动作直接越过选择边界，coding-agent 修改质量失去逐动作改进信号。每个 provider request 统一 fan-out 和选择。 | [论文 §6 Coding Agent Extension](https://arxiv.org/html/2607.05391v2)；[TurboAgent request pipeline](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py) |
-| 把插件动作级选择结果直接外推为论文 benchmark 提升 | 候选生成、轨迹长度、证据截断、模型和任务分布均影响外部效度。发布指标需使用本插件固定协议复测。 | [论文 §5 与 Appendix A，pp. 10–22、26](https://arxiv.org/pdf/2607.05391#page=10) |
+| 对观测与高影响动作统一使用 N | 文件读取、搜索等可恢复观测承担完整 BoN+PPT 延迟，在线体验和调用成本随工具步数线性放大。PRM 调度将经审计的 observation tools 固定为一个样本，并把 N 集中到终态、状态/控制提交、`write`/`exec` 与未知检查点。 | [论文 §4 的延迟预算调节](https://arxiv.org/html/2607.05391v2#S4)；[Appendix B.3 的 sampled actions per step](https://arxiv.org/html/2607.05391v2) |
+| 只在 session 或终态回答结束时触发在线验证 | 中间 `write`/`exec` 动作直接越过选择边界，coding-agent 修改质量失去过程级改进信号。每个高影响 PRM 检查点统一扩展与选择。 | [论文 Appendix B.3 PRM](https://arxiv.org/html/2607.05391v2)；[论文 §6 Coding Agent Extension](https://arxiv.org/html/2607.05391v2) |
+| 把插件检查点选择结果直接外推为论文 benchmark 提升 | 候选生成、检查点策略、轨迹长度、证据截断、模型和任务分布均影响外部效度。发布指标需使用本插件固定协议复测。 | [论文 §5 与 Appendix A，pp. 10–22、26](https://arxiv.org/pdf/2607.05391#page=10) |
 
 ## 10. 自回归优化门禁
 
@@ -226,7 +234,7 @@ TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确�
 1. 在变更说明中列出受影响的不变量 ID、理论来源和产品化假设。
 2. 先增加属性测试与作者实现 parity fixture，再修改实现。
 3. 同时评估选择质量、降级率、token/调用成本和延迟；PPT 成本分开报告三种计数。
-4. 遥测至少记录 N、k、C、K、G、seed、criteria、prompt/scale version、generator/verifier model、有效评分 token 支持与概率质量、图片摘要、截断、缓存命中、比较数、实际调用数、decision path 和错误。
+4. 遥测至少记录配置 N、实际 `sampledCandidates`、`checkpointReason`、PPT k、C、K、G、seed、criteria、prompt/scale version、generator/verifier model、有效评分 token 支持与概率质量、图片摘要、截断、缓存命中、比较数、实际调用数、decision path 和错误。
 5. 精确多数决、最早成功候选 fallback 与 capability failure 使用独立 decision path。文本字母回退和 0.5 tie 进入 `scoreSources`，并令 `paperEquivalent=false`。论文等价指标只聚合真实 logprob 期望经过 PPT 产生的决策。
 6. 来源歧义继续保留；形式化算法、正文上界与作者实现分别形成可追溯 fixture，pair 调度变更同时报告三类计数和选择结果差异。
 
