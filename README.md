@@ -59,7 +59,9 @@ omp plugin disable omp-llm-verifier
 omp plugin enable omp-llm-verifier
 ```
 
-The verifier model must expose OpenAI Chat Completions or Responses token logprobs — the paper's fine-grained reward is read off the score-token distribution, so a model without token logprobs cannot run the paper's verifier. When the resolved verifier model cannot provide logprobs, the plugin refuses to wrap the session model and shows a capability warning instead of degrading every request. Tasks with visual evidence also require image input support on the verifier model. Every pairwise request carries shared user/assistant/tool-result images first, followed by labeled Trajectory A and Trajectory B images, preserving the reference implementation's multimodal evidence path.
+The verifier model must expose OpenAI Chat Completions or Responses token logprobs — the paper's fine-grained reward is read off the score-token distribution, so a model without token logprobs cannot run the paper's verifier. When the resolved verifier model cannot provide logprobs, the plugin refuses to wrap the session model and shows a capability warning instead of degrading every request. A probe timeout or transport failure also keeps the original agent model active and retries capability probing after 60 seconds. Tasks with visual evidence also require image input support on the verifier model. Every pairwise request carries shared user/assistant/tool-result images first, followed by labeled Trajectory A and Trajectory B images, preserving the reference implementation's multimodal evidence path.
+
+OMP's `--max-time` is an absolute deadline for the whole agent loop, so candidate generation and PPT share that total budget. Omitting it leaves normal interactive sessions without an agent deadline. High-effort headless/CI runs should budget for the complete multi-action turn, for example `--max-time 15m`; each verifier HTTP request allows up to 10 minutes while still honoring OMP's session cancellation signal.
 
 Verified comparisons are cached on disk at `.omp-llm-verifier-cache.json` in the project root, keyed by a fingerprint of the task, ordered shared and candidate-specific images, both candidate traces, criteria, model, and prompt version, so repeat verifications of identical content cost no verifier tokens. The file is safe to delete and worth git-ignoring.
 
@@ -80,6 +82,21 @@ The decision also reports `toolUseCandidates`, `terminalCandidates`,
 action majority `count > N/2` became unavoidable), and the
 winning stop reason. The same data is exposed to extensions through the
 `onDecision` callback on the wrapped provider state.
+
+Candidate generation and PPT keep their content buffered until winner replay.
+During those silent phases the TUI working loader shows `Generating N candidate
+actions…` and `Verifying N candidate actions with PPT…`, then restores the
+default loader before replay so a prior tool intent does not leak across action
+segments.
+
+OMP utility calls such as automatic title generation stay on a single
+original-model track; request/action selection remains scoped to coding-agent
+actions. Reasoning-capable utility models receive the caller's selected effort
+on the first dispatch, or the model's lowest supported effort when the utility
+caller selected none. If stale model metadata still allows a dynamic endpoint
+to reject `disableReasoning` with a mandatory-reasoning 400, the wrapper records
+that endpoint capability and retries once. A user's `high` or `max` coding
+effort therefore remains unchanged.
 
 Candidate generation preserves the caller's full context, tools, session ID,
 prompt-cache key, and provider session state across all parallel samples. This

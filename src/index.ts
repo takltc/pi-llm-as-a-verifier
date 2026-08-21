@@ -13,6 +13,8 @@ import {
   normalizeCandidateCount,
   normalizeEvaluations,
   normalizePivots,
+  type AutoVerifierDegradedEvent,
+  type AutoVerifierPhaseEvent,
 } from "./auto.ts";
 import {
   createVerifierClient,
@@ -26,6 +28,14 @@ const PLUGIN_NAME = "omp-llm-verifier";
 const WRAPPER_KEY = "omp-llm-verifier-internal";
 const WRAPPER_API_PREFIX = "omp-llm-verifier-api-";
 const MODEL_REBIND_INTERVAL_MS = 500;
+const CAPABILITY_PROBE_RETRY_MS = 60_000;
+
+class VerifierCapabilityProbeError extends Error {
+  constructor(message: string, cause: unknown) {
+    super(message, { cause });
+    this.name = "VerifierCapabilityProbeError";
+  }
+}
 
 export interface VerifierPluginSettings {
   enabled: boolean;
@@ -48,11 +58,44 @@ export interface VerificationBinding {
 export interface AutomaticVerificationRuntime {
   bindings: Map<string, VerificationBinding>;
   capabilityErrors: Map<string, string>;
+  probeErrors: Map<string, { message: string; retryAt: number }>;
   probeVerifier?: (client: VerifierClient, model: Model) => Promise<void>;
+  now: () => number;
   activeSourceKey?: string;
   inFlight?: Promise<VerificationBinding>;
   inFlightSourceKey?: string;
   generation: number;
+}
+
+export function degradedWarningMessage(event: AutoVerifierDegradedEvent): string {
+  const candidateSummary = event.successfulCandidates + "/" + event.candidateCount +
+    " candidates succeeded";
+  if (event.reason === "insufficient_candidates") {
+    return "LLM-as-a-Verifier " + candidateSummary +
+      "; returned the only successful candidate.";
+  }
+  if (event.reason === "verification_error") {
+    const detail = event.error ? " Error: " + event.error : "";
+    return "LLM-as-a-Verifier PPT verification failed after " + candidateSummary +
+      "; returned the earliest successful candidate." + detail;
+  }
+  return "LLM-as-a-Verifier PPT scoring lacked complete token-logprob evidence although " +
+    candidateSummary +
+    "; selected with neutral-tie fallback. Pin a logprobs-capable verifier with " +
+    "`omp plugin config set omp-llm-verifier verifierModel <provider/model>`.";
+}
+
+export function automaticVerificationWorkingMessage(
+  event: AutoVerifierPhaseEvent,
+): string | undefined {
+  if (event.phase === "generating_candidates") {
+    return "Generating " + event.candidateCount + " candidate actions…";
+  }
+  if (event.phase === "verifying_candidates") {
+    return "Verifying " + (event.successfulCandidates ?? event.candidateCount) +
+      " candidate actions with PPT…";
+  }
+  return undefined;
 }
 
 export default function verifierExtension(pi: ExtensionAPI): void {
@@ -140,11 +183,14 @@ export default function verifierExtension(pi: ExtensionAPI): void {
 
 export function createAutomaticVerificationRuntime(options: {
   probeVerifier?: (client: VerifierClient, model: Model) => Promise<void>;
+  now?: () => number;
 } = {}): AutomaticVerificationRuntime {
   return {
     bindings: new Map(),
     capabilityErrors: new Map(),
+    probeErrors: new Map(),
     probeVerifier: options.probeVerifier,
+    now: options.now ?? Date.now,
     generation: 0,
   };
 }
@@ -187,6 +233,11 @@ export async function ensureAutomaticVerification(
     const capabilityError = runtime.capabilityErrors.get(sourceKey);
     if (capabilityError) {
       throw new VerifierLogprobsUnsupportedError(capabilityError);
+    }
+    const probeError = runtime.probeErrors.get(sourceKey);
+    if (probeError) {
+      if (runtime.now() < probeError.retryAt) throw new Error(probeError.message);
+      runtime.probeErrors.delete(sourceKey);
     }
     const activeBinding = runtime.bindings.get(sourceKey);
     if (
@@ -236,7 +287,17 @@ export async function ensureAutomaticVerification(
             runtime.capabilityErrors.set(sourceKey, message);
             throw new VerifierLogprobsUnsupportedError(message);
           }
-          throw error;
+          if (!(error instanceof VerifierCapabilityProbeError)) throw error;
+          const detail = error instanceof Error ? error.message : String(error);
+          const message = "LLM-as-a-Verifier capability probe failed for " +
+            verifierModel.provider + "/" + verifierModel.id + ": " + detail +
+            ". The original agent model remains active; capability probing will retry after 60 seconds. " +
+            "Pin a known logprobs-capable verifier with `omp plugin config set omp-llm-verifier verifierModel <provider/model>`.";
+          runtime.probeErrors.set(sourceKey, {
+            message,
+            retryAt: runtime.now() + CAPABILITY_PROBE_RETRY_MS,
+          });
+          throw new Error(message, { cause: error });
         }
         runtime.bindings.set(sourceKey, binding);
       }
@@ -315,13 +376,17 @@ async function createVerificationBinding(
     try {
       await probeVerifier(verifierClient, verifierModel);
     } catch (error) {
-      if (isVerifierLogprobsUnsupportedError(error)) throw error;
       console.warn(JSON.stringify({
         component: PLUGIN_NAME,
         event: "capability_probe_failed",
         model: verifierModel.provider + "/" + verifierModel.id,
         error: error instanceof Error ? error.message : String(error),
       }));
+      if (isVerifierLogprobsUnsupportedError(error)) throw error;
+      throw new VerifierCapabilityProbeError(
+        error instanceof Error ? error.message : String(error),
+        error,
+      );
     }
   }
   const wrapperApi = wrapperApiName(providerName);
@@ -339,12 +404,10 @@ async function createVerificationBinding(
         cacheFile: ctx.cwd ? join(ctx.cwd, ".omp-llm-verifier-cache.json") : undefined,
         onDegraded: (event) => {
           console.warn(JSON.stringify({ component: PLUGIN_NAME, event: "degraded", ...event }));
-          ctx.ui.notify(
-            event.reason === "verification_error"
-              ? "LLM-as-a-Verifier verification failed; returned the first candidate response."
-              : "LLM-as-a-Verifier had too few usable candidates; returned the only successful candidate.",
-            "warning",
-          );
+          ctx.ui.notify(degradedWarningMessage(event), "warning");
+        },
+        onPhase: (event) => {
+          ctx.ui.setWorkingMessage(automaticVerificationWorkingMessage(event));
         },
         onDecision: (decision) => {
           console.info(JSON.stringify({

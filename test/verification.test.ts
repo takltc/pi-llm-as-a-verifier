@@ -19,10 +19,13 @@ import {
   normalizePivots,
   serializeAssistantMessage,
   serializeContext,
+  type AutoVerifierPhaseEvent,
 } from "../src/auto.ts";
 import {
+  automaticVerificationWorkingMessage,
   createAutomaticVerificationRuntime,
   createDefaultVerifierClient,
+  degradedWarningMessage,
   ensureAutomaticVerification,
   resolvePluginSettings,
 } from "../src/index.ts";
@@ -583,6 +586,129 @@ describe("automatic request/action-level provider", () => {
     expect(result.responseId).toBe("response-2");
   });
 
+  test("keeps OMP utility requests single-track and enables supported reasoning before dispatch", async () => {
+    const calls: SimpleStreamOptions[] = [];
+    const phases: unknown[] = [];
+    const decisions: unknown[] = [];
+    const verifier = new RankingVerifier();
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: (_model, _context, options = {}) => {
+        calls.push(options);
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          if (options.disableReasoning) {
+            const error = Object.assign(
+              new Error("400 Reasoning is mandatory for this endpoint and cannot be disabled."),
+              { status: 400 },
+            );
+            candidate.fail(error);
+            return;
+          }
+          const result = message(0);
+          candidate.push({ type: "start", partial: result });
+          candidate.push({ type: "done", reason: "stop", message: result });
+        });
+        return candidate;
+      },
+      onPhase: (event) => phases.push(event),
+      onDecision: (event) => decisions.push(event),
+    }, { ...context(), tools: [] }, {
+      disableReasoning: true,
+      temperature: 0,
+      maxTokens: 1024,
+    });
+
+    const { result } = await collect(stream);
+
+    expect(result.stopReason).toBe("stop");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.disableReasoning).toBeUndefined();
+    expect(calls[0]?.forceReasoningOff).toBeUndefined();
+    expect(String(calls[0]?.reasoning)).toBe("low");
+    expect(verifier.calls).toBe(0);
+    expect(phases).toEqual([]);
+    expect(decisions).toEqual([]);
+  });
+
+  test("learns mandatory reasoning when endpoint model metadata is stale", async () => {
+    const calls: SimpleStreamOptions[] = [];
+    const staleModel = model();
+    staleModel.reasoning = false;
+    staleModel.thinking = undefined;
+    const stream = createAutoVerifierStream({
+      originalModel: staleModel,
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: (_model, _context, options = {}) => {
+        calls.push(options);
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          if (options.disableReasoning) {
+            candidate.fail(Object.assign(
+              new Error("400 Reasoning is mandatory for this endpoint and cannot be disabled."),
+              { status: 400 },
+            ));
+            return;
+          }
+          const result = message(0);
+          candidate.push({ type: "start", partial: result });
+          candidate.push({ type: "done", reason: "stop", message: result });
+        });
+        return candidate;
+      },
+    }, { ...context(), tools: [] }, {
+      disableReasoning: true,
+      temperature: 0,
+      maxTokens: 1024,
+    });
+
+    const { result } = await collect(stream);
+
+    expect(result.stopReason).toBe("stop");
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.disableReasoning).toBe(true);
+    expect(calls[1]?.disableReasoning).toBeUndefined();
+  });
+
+  test("preserves a selected high effort on mandatory-reasoning utility requests", async () => {
+    const calls: SimpleStreamOptions[] = [];
+    const mandatoryModel = model();
+    mandatoryModel.thinking = {
+      ...mandatoryModel.thinking!,
+      requiresEffort: true,
+    };
+    const stream = createAutoVerifierStream({
+      originalModel: mandatoryModel,
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: (_model, _context, options = {}) => {
+        calls.push(options);
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          const result = message(0);
+          candidate.push({ type: "start", partial: result });
+          candidate.push({ type: "done", reason: "stop", message: result });
+        });
+        return candidate;
+      },
+    }, { ...context(), tools: [] }, {
+      disableReasoning: true,
+      reasoning: "max" as NonNullable<SimpleStreamOptions["reasoning"]>,
+      temperature: 0,
+      maxTokens: 1024,
+    });
+
+    const { result } = await collect(stream);
+
+    expect(result.stopReason).toBe("stop");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.disableReasoning).toBeUndefined();
+    expect(String(calls[0]?.reasoning)).toBe("max");
+  });
+
   test("rejects provider-native execution before candidate fan-out", async () => {
     let candidateCalls = 0;
     const decisions: unknown[] = [];
@@ -748,6 +874,52 @@ describe("automatic request/action-level provider", () => {
       "toolcall_end",
       "done",
     ]);
+  });
+
+  test("reports selection phases so OMP replaces the previous tool intent while the wrapper is silent", async () => {
+    const phases: AutoVerifierPhaseEvent[] = [];
+    let nextIndex = 0;
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: new RankingVerifier(),
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: () => {
+        const index = nextIndex++;
+        const candidate = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          const result = message(index, true);
+          candidate.push({ type: "start", partial: result });
+          candidate.push({ type: "done", reason: "toolUse", message: result });
+        });
+        return candidate;
+      },
+      onPhase: (event) => phases.push(event),
+    }, context());
+
+    await collect(stream);
+
+    expect(phases).toEqual([
+      { phase: "generating_candidates", candidateCount: 3 },
+      { phase: "verifying_candidates", candidateCount: 3, successfulCandidates: 3 },
+      { phase: "replaying_winner", candidateCount: 3, successfulCandidates: 3 },
+    ]);
+  });
+
+  test("maps buffered selection phases to transient OMP working messages", () => {
+    expect(automaticVerificationWorkingMessage({
+      phase: "generating_candidates",
+      candidateCount: 8,
+    })).toBe("Generating 8 candidate actions…");
+    expect(automaticVerificationWorkingMessage({
+      phase: "verifying_candidates",
+      candidateCount: 8,
+      successfulCandidates: 7,
+    })).toBe("Verifying 7 candidate actions with PPT…");
+    expect(automaticVerificationWorkingMessage({
+      phase: "replaying_winner",
+      candidateCount: 8,
+      successfulCandidates: 7,
+    })).toBeUndefined();
   });
 
   test("compares terminal and tool-use actions in one request/action-level PPT", async () => {
@@ -1761,6 +1933,108 @@ describe("automatic request/action-level provider", () => {
 });
 
 describe("OMP default model inheritance", () => {
+  test("reports verifier score failure without claiming candidate loss", () => {
+    const message = degradedWarningMessage({
+      reason: "non_probabilistic_scores",
+      granularity: "request_action",
+      candidateCount: 3,
+      successfulCandidates: 3,
+      scoreSources: { logprobs: 0, textFallback: 0, neutralTie: 8, unknown: 0 },
+    });
+
+    expect(message).toContain("token-logprob");
+    expect(message).toContain("3/3 candidates succeeded");
+    expect(message).not.toContain("only successful candidate");
+  });
+
+  test("fails closed when the verifier capability probe times out", async () => {
+    const configuredModel = {
+      ...model(),
+      provider: "opencode-go",
+      id: "mimo-v2.5",
+      name: "MiMo V2.5",
+    } as unknown as Model;
+    let activeModel: Model = configuredModel;
+    let registrations = 0;
+    const fakePi = {
+      pi: { settings: { getModelRole: () => "opencode-go/mimo-v2.5" } },
+      registerProvider: () => { registrations += 1; },
+      getThinkingLevel: () => "high",
+      setThinkingLevel: () => undefined,
+      setModel: async (next: Model) => { activeModel = next; return true; },
+    } as never;
+    const ctx = {
+      get model() { return activeModel; },
+      models: { resolve: (spec: string) => spec === "@default" ? configuredModel : undefined },
+      modelRegistry: {
+        getApiKey: async () => "test-key",
+        resolver: () => () => "test-key",
+        getProviderHeaders: () => undefined,
+        refreshRuntimeProviders: async () => undefined,
+      },
+      sessionManager: { getSessionId: () => "probe-timeout-session" },
+    } as never;
+    let probeCalls = 0;
+    let now = 10_000;
+    const runtime = createAutomaticVerificationRuntime({
+      now: () => now,
+      probeVerifier: async () => {
+        probeCalls += 1;
+        throw new DOMException("The operation timed out", "TimeoutError");
+      },
+    });
+
+    await expect(ensureAutomaticVerification(fakePi, ctx, runtime)).rejects.toThrow(
+      "capability probe failed",
+    );
+    expect(registrations).toBe(0);
+    expect(activeModel).toBe(configuredModel);
+    await expect(ensureAutomaticVerification(fakePi, ctx, runtime)).rejects.toThrow(
+      "capability probe failed",
+    );
+    expect(probeCalls).toBe(1);
+    now += 60_000;
+    await expect(ensureAutomaticVerification(fakePi, ctx, runtime)).rejects.toThrow(
+      "capability probe failed",
+    );
+    expect(probeCalls).toBe(2);
+  });
+
+  test("does not cache provider registration failures as capability probe failures", async () => {
+    const configuredModel = model();
+    let probeCalls = 0;
+    const fakePi = {
+      pi: { settings: { getModelRole: () => "opencode-go/deepseek-v4-flash-0731:high" } },
+      registerProvider: () => { throw new Error("provider registration failed"); },
+      getThinkingLevel: () => "high",
+      setThinkingLevel: () => undefined,
+      setModel: async () => true,
+    } as never;
+    const ctx = {
+      model: configuredModel,
+      models: { resolve: (spec: string) => spec === "@default" ? configuredModel : undefined },
+      modelRegistry: {
+        getApiKey: async () => "test-key",
+        resolver: () => () => "test-key",
+        getProviderHeaders: () => undefined,
+        refreshRuntimeProviders: async () => undefined,
+      },
+      sessionManager: { getSessionId: () => "registration-failure-session" },
+    } as never;
+    const runtime = createAutomaticVerificationRuntime({
+      probeVerifier: async () => { probeCalls += 1; },
+    });
+
+    await expect(ensureAutomaticVerification(fakePi, ctx, runtime)).rejects.toThrow(
+      "provider registration failed",
+    );
+    expect(runtime.probeErrors.size).toBe(0);
+    await expect(ensureAutomaticVerification(fakePi, ctx, runtime)).rejects.toThrow(
+      "provider registration failed",
+    );
+    expect(probeCalls).toBe(2);
+  });
+
   test("caches an unsupported-model capability warning for startup and later turns", async () => {
     let activeModel: Model = model();
     const configuredModel = activeModel;

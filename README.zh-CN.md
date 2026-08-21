@@ -53,7 +53,9 @@ omp plugin disable omp-llm-verifier
 omp plugin enable omp-llm-verifier
 ```
 
-验证器模型必须能提供 OpenAI Chat Completions 或 Responses 的 token logprobs——论文的细粒度奖励从评分 token 分布读取。解析出的验证器模型缺少 logprobs 能力时，插件会拒绝包装会话模型并显示能力警告。任务包含视觉证据时，验证器模型还需支持图片输入。每次成对评分请求先携带共享的用户、assistant 和工具结果图片，再携带带标签的 Trajectory A 与 Trajectory B 图片，从而保持参考实现的多模态证据路径。
+验证器模型必须能提供 OpenAI Chat Completions 或 Responses 的 token logprobs——论文的细粒度奖励从评分 token 分布读取。解析出的验证器模型缺少 logprobs 能力时，插件会拒绝包装会话模型并显示能力警告。探测超时或传输失败时，插件会保持原始智能体模型，并在 60 秒后重新探测能力。任务包含视觉证据时，验证器模型还需支持图片输入。每次成对评分请求先携带共享的用户、assistant 和工具结果图片，再携带带标签的 Trajectory A 与 Trajectory B 图片，从而保持参考实现的多模态证据路径。
+
+OMP 的 `--max-time` 是整个 agent loop 的绝对截止时间，候选生成与 PPT 共享这份总预算。普通交互会话省略该参数时，agent deadline 保持未设置状态。高思考强度的 headless/CI 运行应给完整的多轮 action 留足预算，例如 `--max-time 15m`；插件的单次验证 HTTP 上限为 10 分钟，同时服从 OMP 的会话取消信号。
 
 已验证的比较结果会缓存在项目根目录的 `.omp-llm-verifier-cache.json`，缓存键覆盖任务、有序共享图片、候选专属图片、两个候选轨迹、评分标准、模型和 prompt 版本的内容指纹，因此相同内容的重复验证不消耗验证器 token。该文件可以直接删除，建议加入 gitignore。
 
@@ -69,6 +71,16 @@ A–T 支持数与返回概率质量的最小值和平均值。
 决策还包含 `toolUseCandidates`、`terminalCandidates`、`discardedCandidates`（严格
 多数 `count > N/2` 已不可逆时被取消的在途候选请求）与胜出 stop reason。扩展程序
 也可以通过包装 provider 状态上的 `onDecision` 回调读取同样的数据。
+
+候选生成与 PPT 在返回 winner 前保持内容隔离；TUI 的 working loader 会分别显示
+`Generating N candidate actions…` 与 `Verifying N candidate actions with PPT…`，并在
+winner 回放前恢复默认状态，避免跨工具分段沿用上一条工具 intent。
+
+OMP 自动标题等低 token 辅助请求采用单轨原模型调用，request/action 选择范围保持在
+coding-agent 动作上。支持 reasoning 的辅助模型在首次请求中使用调用方已选择的思考
+强度；辅助调用未选择强度时使用模型支持的最低强度。模型元数据滞后并导致动态 endpoint
+以 400 拒绝 `disableReasoning` 时，包装器会记录这项 endpoint 能力并重试一次。用户为
+编码轨迹选择的 `high` 或 `max` 会原样保留。
 
 并行候选共享调用方的完整上下文、工具定义、session ID、prompt-cache key 与 provider
 session state，使大段编码上下文保持相同前缀并提高缓存亲和性。插件会在 fan-out 前拒绝

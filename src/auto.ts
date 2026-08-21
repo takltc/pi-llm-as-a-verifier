@@ -48,6 +48,9 @@ const PROBLEM_MAX_CHARS = 16000;
 const CANDIDATE_TRANSIENT_RETRIES = 1;
 const CANDIDATE_RETRY_BASE_DELAY_MS = 500;
 const CANDIDATE_RETRY_STAGGER_MS = 100;
+const OMP_UTILITY_REQUEST_MAX_TOKENS = 2048;
+const MANDATORY_REASONING_REJECTION =
+  /(?:reasoning|thinking).{0,120}(?:mandatory|required|must be enabled|cannot be disabled)/i;
 // TurboAgent's latency-sensitive online configuration: every model request
 // generates configurable N actions concurrently (default 3, range 2-8), exact
 // majority may short-circuit, and
@@ -73,8 +76,12 @@ export interface AutoVerifierState {
   /** Optional JSON score cache reused across requests in the same working tree. */
   cacheFile?: string;
   onDegraded?: (event: AutoVerifierDegradedEvent) => void;
+  /** Surface long buffered selection phases without exposing losing candidate content. */
+  onPhase?: (event: AutoVerifierPhaseEvent) => void;
   /** Diagnose what decided each verified action (majority, PPT, fallback, abort, or error). */
   onDecision?: (decision: AutoVerifierDecision) => void;
+  /** Learned endpoint capability after a 400 rejects disabled reasoning. */
+  mandatoryReasoningRequired?: boolean;
 }
 
 export interface AutoVerifierOptions {
@@ -155,6 +162,12 @@ export interface AutoVerifierDegradedEvent {
   error?: string;
   scoreSources?: ScoreSourceCounts;
   scoreDistribution?: ScoreDistributionQuality;
+}
+
+export interface AutoVerifierPhaseEvent {
+  phase: "generating_candidates" | "verifying_candidates" | "replaying_winner";
+  candidateCount: number;
+  successfulCandidates?: number;
 }
 
 export interface AutoVerifierDecision {
@@ -275,6 +288,13 @@ async function runAutomaticVerification(
   options: AutoVerifierOptions,
   output: AssistantMessageEventStream,
 ): Promise<void> {
+  // OMP utility calls such as automatic title generation are outside the
+  // coding-agent action trajectory. Keep them single-track so a title request
+  // cannot trigger Best-of-N/PPT work or selection-phase UI.
+  if (isOmpUtilityRequest(context, streamOptions)) {
+    await runUtilityRequest(state, context, streamOptions, output);
+    return;
+  }
   const candidateCount = options.candidateCount ?? AUTO_CANDIDATE_COUNT;
   const controller = new AbortController();
   const onAbort = () => controller.abort(streamOptions.signal?.reason ?? abortReason());
@@ -296,6 +316,7 @@ async function runAutomaticVerification(
     // actions. TurboAgent applies Best-of-N selection to every API request, so
     // all N candidates launch concurrently and every successful action enters
     // majority/PPT selection before the agent loop observes a winner.
+    reportPhase(state, { phase: "generating_candidates", candidateCount });
     let firstError: unknown;
     const gathered = await gatherCandidates(
       (index, signal) => generateCandidate(state, context, streamOptions, index, signal),
@@ -363,6 +384,11 @@ async function runAutomaticVerification(
         };
       } else {
         try {
+          reportPhase(state, {
+            phase: "verifying_candidates",
+            candidateCount,
+            successfulCandidates,
+          });
           const verificationContext = serializeVerificationContext(context);
           const selection = await select(
             verificationContext.problem,
@@ -436,6 +462,11 @@ async function runAutomaticVerification(
         }
       }
     }
+    reportPhase(state, {
+      phase: "replaying_winner",
+      candidateCount,
+      successfulCandidates,
+    });
     reportDecision(state, {
       ...decision,
       durationMs: Date.now() - startedAt,
@@ -464,6 +495,46 @@ async function runAutomaticVerification(
   }
 }
 
+function isOmpUtilityRequest(context: Context, streamOptions: SimpleStreamOptions): boolean {
+  return (
+    streamOptions.disableReasoning === true &&
+    streamOptions.temperature === 0 &&
+    typeof streamOptions.maxTokens === "number" &&
+    streamOptions.maxTokens > 0 &&
+    streamOptions.maxTokens <= OMP_UTILITY_REQUEST_MAX_TOKENS &&
+    streamOptions.sessionId === undefined &&
+    streamOptions.promptCacheKey === undefined &&
+    !context.tools?.length
+  );
+}
+
+async function runUtilityRequest(
+  state: AutoVerifierState,
+  context: Context,
+  streamOptions: SimpleStreamOptions,
+  output: AssistantMessageEventStream,
+): Promise<void> {
+  const signal = streamOptions.signal ?? new AbortController().signal;
+  try {
+    const candidate = await generateCandidate(
+      state,
+      context,
+      streamOptions,
+      0,
+      signal,
+      true,
+    );
+    replayAssistantMessage(output, candidate.message);
+  } catch (error) {
+    const reason = signal.aborted || isAbortError(error) ? "aborted" : "error";
+    output.push({
+      type: "error",
+      reason,
+      error: terminalMessage(state.originalModel, reason, error),
+    });
+  }
+}
+
 /** Classify the winning action for telemetry; both classes enter selection. */
 function isToolUseMessage(message: AssistantMessage): boolean {
   return message.stopReason === "toolUse" ||
@@ -481,29 +552,21 @@ async function generateCandidate(
   streamOptions: SimpleStreamOptions,
   index: number,
   signal: AbortSignal,
+  preferReasoningCompatibility = false,
 ): Promise<CandidateResult> {
-  const candidateOptions: SimpleStreamOptions = {
-    ...streamOptions,
-    apiKey: state.apiKeyResolver,
-    signal,
-    temperature: streamOptions.temperature ?? 1,
-    // Candidates must be independent, not chained to the OMP conversation, so
-    // server-side turn chaining is disabled. But sessionId / promptCacheKey /
-    // providerSessionState are OMP's default-call identity: keep them so all
-    // candidates share the full-context prefix cache instead of paying one
-    // independent uncached-prefix write per candidate.
-    statefulResponses: false,
-    // These are side-channel requests. The primary agent loop owns cache keep-
-    // alive requests, and candidate generation must always produce an action.
-    anthropicCacheRefresh: false,
-    anthropicCacheRefreshRequest: false,
-  };
-  for (let attempt = 0; ; attempt += 1) {
+  let transientAttempts = 0;
+  for (;;) {
+    const candidateRequest = candidateStreamOptions(
+      state,
+      streamOptions,
+      signal,
+      preferReasoningCompatibility,
+    );
     try {
       const stream = (state.streamSimpleFn ?? streamSimple)(
         state.originalModel,
         cloneContext(context),
-        candidateOptions,
+        candidateRequest.options,
       );
       const message = await stream.result();
       if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -512,17 +575,72 @@ async function generateCandidate(
       return { index, message };
     } catch (error) {
       if (signal.aborted || isAbortError(error)) throw error;
+      if (!candidateRequest.mandatoryReasoning && isMandatoryReasoningRejection(error)) {
+        // Dynamic endpoints can tighten capabilities before OMP's model
+        // catalog catches up. Learn the requirement once for this wrapper and
+        // retry without lowering any explicit user-selected effort.
+        state.mandatoryReasoningRequired = true;
+        continue;
+      }
       if (
-        attempt >= CANDIDATE_TRANSIENT_RETRIES ||
+        transientAttempts >= CANDIDATE_TRANSIENT_RETRIES ||
         !isProviderRetryableError(error, { provider: state.originalModel.provider })
       ) {
         throw error;
       }
+      transientAttempts += 1;
       const delayMs = state.candidateRetryDelayMs ??
         CANDIDATE_RETRY_BASE_DELAY_MS + index * CANDIDATE_RETRY_STAGGER_MS;
       await waitForCandidateRetry(delayMs, signal);
     }
   }
+}
+
+function candidateStreamOptions(
+  state: AutoVerifierState,
+  streamOptions: SimpleStreamOptions,
+  signal: AbortSignal,
+  preferReasoningCompatibility: boolean,
+): { options: SimpleStreamOptions; mandatoryReasoning: boolean } {
+  const mandatoryReasoning =
+    state.mandatoryReasoningRequired === true ||
+    state.originalModel.thinking?.requiresEffort === true ||
+    (preferReasoningCompatibility && state.originalModel.reasoning);
+  const minimumEffort = state.originalModel.thinking?.efforts[0];
+  return {
+    mandatoryReasoning,
+    options: {
+      ...streamOptions,
+      ...(mandatoryReasoning
+        ? {
+            reasoning: streamOptions.reasoning ?? minimumEffort,
+            disableReasoning: undefined,
+            forceReasoningOff: undefined,
+          }
+        : {}),
+      apiKey: state.apiKeyResolver,
+      signal,
+      temperature: streamOptions.temperature ?? 1,
+      // Candidates must be independent, not chained to the OMP conversation, so
+      // server-side turn chaining is disabled. But sessionId / promptCacheKey /
+      // providerSessionState are OMP's default-call identity: keep them so all
+      // candidates share the full-context prefix cache instead of paying one
+      // independent uncached-prefix write per candidate.
+      statefulResponses: false,
+      // These are side-channel requests. The primary agent loop owns cache keep-
+      // alive requests, and candidate generation must always produce an action.
+      anthropicCacheRefresh: false,
+      anthropicCacheRefreshRequest: false,
+    },
+  };
+}
+
+function isMandatoryReasoningRejection(error: unknown): boolean {
+  const status = typeof error === "object" && error !== null && "status" in error
+    ? (error as { status?: unknown }).status
+    : undefined;
+  const message = errorMessage(error);
+  return (status === 400 || /\b400\b/.test(message)) && MANDATORY_REASONING_REJECTION.test(message);
 }
 
 function candidateGenerationError(message: AssistantMessage, index: number): Error {
@@ -1133,6 +1251,14 @@ function reportDegraded(state: AutoVerifierState, event: AutoVerifierDegradedEve
     state.onDegraded?.(event);
   } catch {
     // A diagnostic callback cannot change the provider result.
+  }
+}
+
+function reportPhase(state: AutoVerifierState, event: AutoVerifierPhaseEvent): void {
+  try {
+    state.onPhase?.(event);
+  } catch {
+    // A UI phase callback cannot change the provider result.
   }
 }
 
