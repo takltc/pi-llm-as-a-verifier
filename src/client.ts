@@ -522,11 +522,14 @@ export class VerifierClient {
       ...Object.values(this.headers),
       ...Object.values(this.headers).flatMap(headerSecretParts),
     ];
+    // Serialize once: verifier prompts can embed multi-megabyte image payloads,
+    // and transient-status retries must not re-stringify the same body.
+    const bodyText = JSON.stringify(body);
     for (let attempt = 0; attempt <= VERIFIER_TRANSIENT_RETRIES; attempt += 1) {
       const res = await fetch(endpoint, {
         method: "POST",
         headers: this.requestHeaders(apiKey),
-        body: JSON.stringify(body),
+        body: bodyText,
         signal,
       });
       if (!res.ok) {

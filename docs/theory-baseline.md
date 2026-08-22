@@ -172,6 +172,7 @@ TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确�
 - 精确动作多数决使用序列化后的可见文本、工具名和工具参数；provider 生成的调用 ID 不影响一致性判断。多数决采用独立 `path=majority`，PPT 的 `paperEquivalent` 指标保持独立。
 - no-logprobs 电路断路：同一选择内所有评分 job 共享同一请求形态，前 2 个独立 job 均以 logprobs 不支持失败（各自已耗尽客户端内部重试）后，未启动的 job 直接进入运行期 0.5 平局、不再发起 provider 调用；平局不持久化，`paperEquivalent` 保持 false。属于成本护栏，不改动 Eq. (3.1) 期望、PPT pair 集或失败语义。
 - 缓存写入节流：一个阶段内部最多约 5 次中间 checkpoint 落盘加末尾一次，避免把每次评分完成都变成同步锁+fsync 重写；崩溃最多丢失最近一小批分数。
+- 全缓存命中跳过落盘：`scoreDirectedPairs` 以脏标记跟踪本阶段新产生的持久分数；全部评分命中缓存时，末尾的锁+fsync 全文件重写被整体跳过（磁盘内容本就与内存一致），中间 checkpoint 同样只在脏标记置位后落盘，中性平局仍保持运行期作用域。图片指纹按 trials 数组引用做 WeakMap 记忆化、候选多数决身份串在候选收集期按候选索引只序列化一次并跨边界复用于精确多数决（身份恒含可见文本、工具名/参数与图片载荷；行为测试钉定不同截图必须进入 PPT 而非伪多数决）、verifier 请求体在瞬态重试间只序列化一次：三者均为位等价纯性能护栏，缓存身份、Eq. (3.1)、PPT pair 集与失败语义零改动。
 - 插件把 K（`nEvaluations`，1–16）与 k（`pivots`，1–8）暴露为在线配置项，默认 K=1、k=2。K 是论文 §4.2 的质量/成本轴，k 是论文 §3.2 的 PPT 参数；上调后按论文语义增加验证计算。`k` 在运行时按候选数 `min(k,N)` 收敛。
 - 候选生成 transient 重试（工程护栏）：每个候选在 provider 瞬时故障（可重试状态或等价错误）时重试一次，等待时间按候选索引错开并顺从外部分流 `signal` 的 abort；重试是同一候选索引的新独立采样，采样分布与关闭 server-side turn-chaining 的 side-channel 语义不变，`successfulCandidates` 仍按成功候选数上报。护栏不掉 `temperature=1`、不改变 Eq. (3.1) 期望与 PPT pair 集，只扩充失败容错路径。
 - 能力探测时序（生命周期护栏）：启动期 logprobs 能力探测使用 `CAPABILITY_PROBE_TIMEOUT_MS=10_000` 超时，为 OMP 30 秒扩展 handler 期限留下充裕余量；探测只作绑定判断，不影响评分请求形态或 Eq. (3.1) 期望。

@@ -459,8 +459,11 @@ async function runAutomaticVerification(
         nonterminalCandidates: toolUseCandidates,
       });
     } else {
-      const actionIdentities = successful.map((candidate) =>
-        serializeActionIdentity(candidate.message)
+      // gatherCandidates serialized each fulfilled candidate's action identity
+      // once (full visible text plus image payloads); reuse those strings
+      // instead of re-concatenating megabyte-scale payloads per checkpoint.
+      const actionIdentities = successful.map(
+        (candidate) => gathered.identities[candidate.index]!,
       );
       const majority = exactActionMajority(actionIdentities);
       if (majority) {
@@ -899,6 +902,10 @@ function waitForCandidateRetry(delayMs: number, signal: AbortSignal): Promise<vo
 
 interface GatheredCandidates {
   results: Array<PromiseSettledResult<CandidateResult>>;
+  /** Exact action identity per candidate slot, serialized once at seed/settle
+   *  time; defined for every fulfilled slot. Consumers must reuse these
+   *  strings instead of re-serializing megabyte-scale message payloads. */
+  identities: ReadonlyArray<string | undefined>;
   /** Candidates still in flight when a strict majority became guaranteed. */
   discardedCandidates: number;
 }
@@ -922,12 +929,20 @@ async function gatherCandidates(
   const discard = new AbortController();
   const merged = mergeAbortSignals(external, discard.signal);
   const results = new Array<PromiseSettledResult<CandidateResult>>(count);
+  // Action identities are pure functions of the settled message, but each one
+  // concatenates the candidate's full visible text and image payloads. Compute
+  // each identity exactly once (at settle/seed time) instead of re-serializing
+  // every confirmed candidate on every settle event.
+  const identities = new Array<string | undefined>(count);
   const promises = new Array<Promise<CandidateResult> | undefined>(count);
   let seeded = 0;
   for (let index = 0; index < Math.min(initial.length, count); index += 1) {
     const result = initial[index];
     if (!result) continue;
     results[index] = result;
+    if (result.status === "fulfilled") {
+      identities[index] = serializeActionIdentity(result.value.message);
+    }
     seeded += 1;
   }
   for (let index = 0; index < count; index += 1) {
@@ -952,7 +967,7 @@ async function gatherCandidates(
           return { status: "rejected", reason: discardedReason };
         },
       );
-      resolveOuter({ results: snapshot, discardedCandidates: pending });
+      resolveOuter({ results: snapshot, identities, discardedCandidates: pending });
     };
     const afterSettle = (): void => {
       if (resolved) return;
@@ -961,10 +976,10 @@ async function gatherCandidates(
         // finished; the rest cannot change it. Count only fulfilled actions.
         const counts = new Map<string, number>();
         let confirmed = 0;
-        for (const result of results) {
-          if (!result || result.status !== "fulfilled") continue;
+        for (let index = 0; index < count; index += 1) {
+          const identity = identities[index];
+          if (identity === undefined) continue;
           confirmed += 1;
-          const identity = serializeActionIdentity(result.value.message);
           counts.set(identity, (counts.get(identity) ?? 0) + 1);
         }
         for (const tally of counts.values()) {
@@ -989,6 +1004,7 @@ async function gatherCandidates(
       promise.then(
         (value) => {
           results[index] = { status: "fulfilled", value };
+          identities[index] = serializeActionIdentity(value.message);
           pending -= 1;
           afterSettle();
         },

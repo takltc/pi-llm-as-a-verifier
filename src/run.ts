@@ -94,9 +94,18 @@ interface Job {
   context: CacheContext;
 }
 
+// Image payloads are multi-megabyte base64 strings, and one selection hashes
+// the same trial images repeatedly (jobs, evidence summary, ring and pivot
+// accumulation each rebuild cache contexts). Trials keep stable array
+// references, so memoizing per reference keeps fingerprints bit-identical
+// while hashing each payload once per process.
+const imageFingerprintMemo = new WeakMap<readonly ImageContent[], string>();
+
 function imagesFingerprint(images: readonly ImageContent[] | undefined): string {
   if (!images || images.length === 0) return "";
-  return stableFingerprint(
+  const memoized = imageFingerprintMemo.get(images);
+  if (memoized !== undefined) return memoized;
+  const fingerprint = stableFingerprint(
     images.map((image) => ({
       type: image.type,
       mimeType: image.mimeType,
@@ -104,6 +113,8 @@ function imagesFingerprint(images: readonly ImageContent[] | undefined): string 
       data: image.data,
     })),
   );
+  imageFingerprintMemo.set(images, fingerprint);
+  return fingerprint;
 }
 
 export const SELF_VERIFICATION_DEFAULTS = {
@@ -453,6 +464,10 @@ export async function scoreDirectedPairs(
   let errors = 0;
   let skipped = 0;
   let completed = 0;
+  // Only successful scoring writes durable entries into `cached`. When every
+  // job was a cache hit, the on-disk file already holds everything durable,
+  // so the final lock+fsync rewrite would reproduce identical content.
+  let cacheDirty = false;
   let firstError: unknown;
   const breaker = opts.unsupportedBreaker ?? createUnsupportedBreaker();
   const executionAbort = new AbortController();
@@ -566,6 +581,7 @@ export async function scoreDirectedPairs(
     };
     cached[job.key] = entry;
     results[job.key] = entry;
+    cacheDirty = true;
   }
 
   async function runPhase(phaseJobs: Job[]): Promise<void> {
@@ -602,7 +618,15 @@ export async function scoreDirectedPairs(
         try {
           await scoreOne(phaseJobs[index]);
           completed += 1;
-          if (cacheFile && completed % checkpoint === 0 && Object.keys(cached).length > 0) {
+          // Same dirty-flag discipline as the final save: `cached` only grows
+          // through successful scoring, so with no durable writes since load
+          // the on-disk file already holds exactly this content and the
+          // lock+fsync rewrite would reproduce it byte for byte.
+          if (
+            cacheFile && cacheDirty &&
+            completed % checkpoint === 0 &&
+            Object.keys(cached).length > 0
+          ) {
             saveCache(cacheFile, cached);
           }
         } catch (error) {
@@ -622,7 +646,7 @@ export async function scoreDirectedPairs(
     await runPhase(rest);
   } finally {
     externalAbort?.removeEventListener("abort", onExternalAbort);
-    if (cacheFile && Object.keys(cached).length > 0) saveCache(cacheFile, cached);
+    if (cacheFile && cacheDirty && Object.keys(cached).length > 0) saveCache(cacheFile, cached);
   }
   log(`  Done (${errors} errors, ${skipped} skipped)`);
   return results;

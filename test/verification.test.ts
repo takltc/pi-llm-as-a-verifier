@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { afterEach } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import type {
   AssistantMessage,
@@ -1313,6 +1313,57 @@ describe("automatic process-reward provider", () => {
     expect(decisions[0]).toMatchObject({ path: "verifier" });
   });
 
+  test("keeps image payloads inside the exact-action identity", async () => {
+    const verifier = new RankingVerifier(false, true);
+    const decisions: unknown[] = [];
+    let next = 0;
+    const stream = createAutoVerifierStream({
+      originalModel: model(),
+      verifierClient: verifier,
+      apiKeyResolver: () => "original-key",
+      streamSimpleFn: () => {
+        const index = next++;
+        const out = new AssistantMessageEventStream();
+        queueMicrotask(() => {
+          const result = {
+            ...message(index),
+            content: [
+              {
+                type: "text" as const,
+                text: index === 1 ? "different plan B" : "shared plan A",
+              },
+              {
+                type: "toolCall" as const,
+                id: "provider-call-" + index,
+                name: "bash",
+                arguments: { command: index === 1 ? "printf plan-b" : "printf plan-a" },
+              },
+              ...(index === 1
+                ? []
+                : [{
+                    type: "image" as const,
+                    mimeType: "image/png",
+                    data: index === 0 ? "screenshot-alpha" : "screenshot-beta",
+                  }]),
+            ],
+            stopReason: "toolUse" as const,
+          };
+          out.push({ type: "start", partial: result });
+          out.push({ type: "done", reason: "toolUse", message: result });
+        });
+        return out;
+      },
+      onDecision: (decision) => decisions.push(decision),
+    }, context());
+    const { result } = await collect(stream);
+    // Identical text plus different screenshots: the action identities differ,
+    // so no strict majority exists and the PPT decides. A majority verdict
+    // here would mean image payloads leaked out of the action identity.
+    expect(verifier.calls).toBeGreaterThan(0);
+    expect(decisions[0]).toMatchObject({ path: "verifier", successfulCandidates: 3 });
+    expect(result.responseId).toBe("response-0");
+  });
+
   test("reports the PPT decision: winner, scores, comparison count, usage", async () => {
     const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
     const verifier = new RankingVerifier();
@@ -1531,6 +1582,49 @@ describe("automatic process-reward provider", () => {
       expect(entry.source_A).toBe("logprobs");
       expect(entry.source_B).toBe("logprobs");
     }
+  });
+
+  test("skips the final cache rewrite when every score was already cached", async () => {
+    const cacheFile = "/tmp/omp-verifier-clean-" + crypto.randomUUID() + ".json";
+    temporaryFiles.push(cacheFile);
+    const candidates = [
+      { name: "a", trace: "trace a" },
+      { name: "b", trace: "trace b" },
+    ];
+    const first = await select("problem", candidates, {
+      ...SELF_VERIFICATION_DEFAULTS,
+      criteria: CODING_AGENT_CRITERIA,
+      client: new RankingVerifier(),
+      cacheFile,
+      progress: false,
+    });
+    const persisted = readFileSync(cacheFile);
+    const mtimeBefore = statSync(cacheFile).mtimeMs;
+    let verifierCalls = 0;
+    class CacheOnly extends VerifierClient {
+      constructor() {
+        super(clientConfig());
+      }
+      override async scoreReply(): Promise<VerifierReply> {
+        verifierCalls += 1;
+        throw new Error("a fully cached selection must not call the verifier");
+      }
+    }
+    const second = await select("problem", candidates, {
+      ...SELF_VERIFICATION_DEFAULTS,
+      criteria: CODING_AGENT_CRITERIA,
+      client: new CacheOnly(),
+      cacheFile,
+      progress: false,
+    });
+
+    expect(verifierCalls).toBe(0);
+    expect(second.index).toBe(first.index);
+    expect(second.scores).toEqual(first.scores);
+    // A clean run must reproduce the on-disk content byte for byte and leave
+    // the file untouched: the lock+fsync rewrite is skipped entirely.
+    expect(readFileSync(cacheFile).equals(persisted)).toBe(true);
+    expect(statSync(cacheFile).mtimeMs).toBe(mtimeBefore);
   });
 
   test("marks literal score fallback outside the paper-equivalent metric", async () => {
