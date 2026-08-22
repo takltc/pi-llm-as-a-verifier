@@ -43,7 +43,7 @@
       "verifierModel": {
         "type": "string",
         "default": "",
-        "description": "验证器模型的 OMP 选择器（如 deepseek/deepseek-v4-flash:high）；留空则跟随会话默认模型。验证器必须能返回 token logprobs（kimi-code 不支持，需在此指定其他模型）"
+        "description": "可选的独立验证器模型；留空（默认）时跟随 OMP modelRoles.default。首次进入和同会话切换模型时都会探测 token logprobs，不支持时提示切换 default 或单独配置 verifierModel"
       }
     }
   },

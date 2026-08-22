@@ -784,6 +784,13 @@ function resolveOmpEffort(
   return supported.at(-1) ?? "off";
 }
 
+function isDeepSeekFamily(model: Pick<Model, "provider" | "id" | "requestModelId">): boolean {
+  return [model.provider, model.id, model.requestModelId].some(
+    (identity) => typeof identity === "string" &&
+      /(?:^|\/)deepseek(?:$|[\/_.-])/i.test(identity),
+  );
+}
+
 /** Create a verifier from the given OMP model (or the configured default) and its credentials. */
 export async function createVerifierClient(
   ctx: OmpModelContext,
@@ -817,7 +824,7 @@ export async function createVerifierClient(
   // DeepSeek mirrors the reference DEEPSEEK_MAX_TOKENS (thinking shares the
   // output budget); every other OpenAI-compatible verifier mirrors
   // call_openai's 4096 cap — the score block is short.
-  const deepSeek = model.provider === "deepseek";
+  const deepSeek = isDeepSeekFamily(model);
   const referenceCap = deepSeek ? DEFAULT_MAX_TOKENS : DEFAULT_OUTPUT_MAX_TOKENS;
   const maxTokens =
     typeof model.maxTokens === "number" && model.maxTokens > 0

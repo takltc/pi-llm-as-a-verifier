@@ -214,6 +214,16 @@ function model(): Model {
   } as unknown as Model;
 }
 
+function oxAlphaModel(): Model {
+  return {
+    ...model(),
+    provider: "openrouter",
+    id: "stealth/ox-alpha",
+    name: "Ox Alpha",
+    api: "openrouter",
+  } as unknown as Model;
+}
+
 function context(): Context {
   return {
     systemPrompt: ["You are an OMP coding agent."],
@@ -373,7 +383,12 @@ describe("automatic process-reward provider", () => {
       // createVerifierClient mirrors the reference defaults per provider:
       // the generic OpenAI-compatible path gets 4096 output + no reasoning,
       // the DeepSeek path gets 32768 + reasoning enabled.
-      const genericModel = { ...model(), provider: "inferx", id: "deepseek-v4-flash-0731" } as unknown as Model;
+      const genericModel = {
+        ...model(),
+        provider: "inferx",
+        id: "generic-openai-verifier",
+        name: "Generic OpenAI Verifier",
+      } as unknown as Model;
       const genericClient = await createVerifierClient({
         model: genericModel,
         models: { resolve: () => genericModel },
@@ -393,6 +408,29 @@ describe("automatic process-reward provider", () => {
       expect(generic.reasoning_effort).toBeUndefined();
       expect(generic.thinking).toBeUndefined();
 
+      const hostedDeepseekModel = {
+        ...model(),
+        provider: "inferx",
+        id: "deepseek-v4-flash-0731",
+        name: "DeepSeek V4 Flash 0731",
+      } as unknown as Model;
+      const hostedDeepseekClient = await createVerifierClient({
+        model: hostedDeepseekModel,
+        models: { resolve: () => hostedDeepseekModel },
+        modelRegistry: {
+          resolver: () => () => "test-key",
+          getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "test-key", headers: {} }),
+        },
+        defaultThinkingLevel: "max",
+        sessionId: "shape-session",
+      } as never);
+      expect(hostedDeepseekClient.effort).toBe("max");
+      expect(hostedDeepseekClient.maxTokens).toBe(32768);
+      await hostedDeepseekClient.scoreReply("Return A.");
+      const hostedDeepseek = bodies[1]!.body;
+      expect(hostedDeepseek.max_tokens).toBe(32768);
+      expect(hostedDeepseek.reasoning_effort).toBe("max");
+
       const deepseekModel = {
         ...model(),
         provider: "deepseek",
@@ -411,7 +449,7 @@ describe("automatic process-reward provider", () => {
       expect(deepseekClient.effort).toBe("high");
       expect(deepseekClient.maxTokens).toBe(32768);
       await deepseekClient.scoreReply("Return A.");
-      const deepseek = bodies[1]!.body;
+      const deepseek = bodies[2]!.body;
       expect(deepseek.temperature).toBe(1);
       expect(deepseek.max_tokens).toBe(32768);
       expect(deepseek.reasoning_effort).toBe("high");
@@ -2176,6 +2214,21 @@ describe("OMP default model inheritance", () => {
     expect(message).not.toContain("only successful candidate");
   });
 
+  test("reports partial scoring failure without claiming the verifier lacks logprobs", () => {
+    const message = degradedWarningMessage({
+      reason: "non_probabilistic_scores",
+      granularity: "prm",
+      candidateCount: 3,
+      successfulCandidates: 3,
+      scoreSources: { logprobs: 8, textFallback: 0, neutralTie: 2, unknown: 0 },
+    });
+
+    expect(message).toContain("1/5 PPT comparisons");
+    expect(message).toContain("valid token logprobs for 8/10 score tags");
+    expect(message).toContain("3/3 candidates succeeded");
+    expect(message).not.toContain("Pin a logprobs-capable verifier");
+  });
+
   test("fails closed when the verifier capability probe times out", async () => {
     const configuredModel = {
       ...model(),
@@ -2266,12 +2319,13 @@ describe("OMP default model inheritance", () => {
   });
 
   test("caches an unsupported-model capability warning for startup and later turns", async () => {
-    let activeModel: Model = model();
+    let activeModel: Model = oxAlphaModel();
     const configuredModel = activeModel;
     const wrappers = new Map<string, Model>();
+    const probedModels: string[] = [];
     const fakePi = {
       logger: silentExtensionLogger,
-      pi: { settings: { getModelRole: () => "opencode-go/deepseek-v4-flash-0731:high" } },
+      pi: { settings: { getModelRole: () => "openrouter/stealth/ox-alpha:max" } },
       registerProvider: (provider: string) => {
         wrappers.set(provider + "/default", { ...configuredModel, provider, id: "default" } as unknown as Model);
       },
@@ -2291,22 +2345,64 @@ describe("OMP default model inheritance", () => {
       sessionManager: { getSessionId: () => "unsupported-session" },
     } as never;
     const runtime = createAutomaticVerificationRuntime({
-      probeVerifier: async () => {
+      probeVerifier: async (_client, verifierModel) => {
+        probedModels.push(verifierModel.provider + "/" + verifierModel.id);
         throw new VerifierLogprobsUnsupportedError("probe returned no token logprobs");
       },
     });
-    await expect(ensureAutomaticVerification(fakePi, ctx, runtime)).rejects.toThrow("opencode-go/deepseek-v4-flash-0731");
+    let message = "";
+    try {
+      await ensureAutomaticVerification(fakePi, ctx, runtime);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain("OMP default model openrouter/stealth/ox-alpha");
+    expect(message).toContain("does not provide the token logprobs required by LLM-as-a-Verifier");
+    expect(message).toContain("(1) switch the OMP default model");
+    expect(message).toContain("(2) configure a separate verifier model");
+    expect(message).toContain("omp plugin config set omp-llm-verifier verifierModel <provider/model>");
+    expect(probedModels).toEqual(["openrouter/stealth/ox-alpha"]);
     expect(runtime.capabilityErrors.size).toBe(1);
-    await expect(ensureAutomaticVerification(fakePi, ctx, runtime)).rejects.toThrow("token logprobs");
+    await expect(ensureAutomaticVerification(fakePi, ctx, runtime)).rejects.toThrow(message);
+    expect(probedModels).toEqual(["openrouter/stealth/ox-alpha"]);
+  });
+
+  test("explains both recovery options when the default API cannot request logprobs", async () => {
+    const configuredModel = {
+      ...oxAlphaModel(),
+      api: "anthropic-messages",
+    } as unknown as Model;
+    const fakePi = {
+      pi: { settings: { getModelRole: () => "openrouter/stealth/ox-alpha:max" } },
+    } as never;
+    const ctx = {
+      model: configuredModel,
+      models: {
+        resolve: (spec: string) => spec === "@default" ? configuredModel : undefined,
+        list: () => [configuredModel, model()],
+      },
+      sessionManager: { getSessionId: () => "unsupported-api-session" },
+    } as never;
+
+    let message = "";
+    try {
+      await ensureAutomaticVerification(fakePi, ctx, createAutomaticVerificationRuntime());
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain("OMP default model openrouter/stealth/ox-alpha uses anthropic-messages");
+    expect(message).toContain("(1) switch the OMP default model");
+    expect(message).toContain("(2) configure a separate verifier model");
+    expect(message).toContain("Potential verifier models configured in this session: opencode-go/deepseek-v4-flash-0731");
   });
 
   test("suggests a logprobs-capable fallback model in the capability warning", async () => {
-    let activeModel: Model = model();
+    let activeModel: Model = oxAlphaModel();
     const configuredModel = activeModel;
     const wrappers = new Map<string, Model>();
     const fakePi = {
       logger: silentExtensionLogger,
-      pi: { settings: { getModelRole: () => "opencode-go/deepseek-v4-flash-0731:high" } },
+      pi: { settings: { getModelRole: () => "openrouter/stealth/ox-alpha:max" } },
       registerProvider: (provider: string) => {
         wrappers.set(provider + "/default", { ...configuredModel, provider, id: "default" } as unknown as Model);
       },
@@ -2345,6 +2441,8 @@ describe("OMP default model inheritance", () => {
     }
     expect(message).toContain("verifierModel");
     expect(message).toContain("deepseek/deepseek-v4-flash");
+    const alternatives = message.split("Potential verifier models configured in this session: ")[1] ?? "";
+    expect(alternatives).not.toContain("openrouter/stealth/ox-alpha");
     // kimi-code is declared openai-completions but rejects logprobs, so the
     // suggestion must never recommend it.
     expect(message).not.toContain("kimi-code");
@@ -2429,6 +2527,93 @@ describe("OMP default model inheritance", () => {
     expect(activeModel.provider).toBe(binding.providerName);
   });
 
+  test("keeps the configured verifierModel pinned after the default model changes", async () => {
+    const modelA = model();
+    const modelB = {
+      ...model(),
+      provider: "inferx",
+      id: "deepseek-v4-flash-0731",
+      name: "DeepSeek V4 Flash 0731",
+    } as unknown as Model;
+    const verifier = {
+      ...model(),
+      provider: "deepseek",
+      id: "deepseek-v4-flash",
+      name: "DeepSeek V4 Flash",
+    } as unknown as Model;
+    const verifierSelector = "deepseek/deepseek-v4-flash:high";
+    let configuredModel = modelA;
+    let activeModel: Model = modelA;
+    let defaultSelector = "opencode-go/deepseek-v4-flash-0731:max";
+    const wrappers = new Map<string, Model>();
+    const registrations: string[] = [];
+    const probes: Array<{ model: string; client: string; effort: string }> = [];
+    const fakePi = {
+      pi: { settings: { getModelRole: () => defaultSelector } },
+      registerProvider: (provider: string) => {
+        registrations.push(provider);
+        wrappers.set(provider + "/default", {
+          ...configuredModel,
+          provider,
+          id: "default",
+          name: "wrapped",
+        } as unknown as Model);
+      },
+      getThinkingLevel: () => "max",
+      setThinkingLevel: () => undefined,
+      setModel: async (next: Model) => { activeModel = next; return true; },
+    } as never;
+    const ctx = {
+      get model() { return activeModel; },
+      models: {
+        resolve: (spec: string) =>
+          spec === "@default" ? configuredModel :
+          spec === verifierSelector ? verifier :
+          wrappers.get(spec),
+      },
+      modelRegistry: {
+        getApiKey: async () => "test-key",
+        resolver: () => () => "test-key",
+        getProviderHeaders: () => undefined,
+        refreshRuntimeProviders: async () => undefined,
+      },
+      sessionManager: { getSessionId: () => "pinned-verifier-session" },
+      ui: { notify: () => undefined },
+    } as never;
+    const runtime = createAutomaticVerificationRuntime({
+      probeVerifier: async (client, verifierModel) => {
+        probes.push({
+          model: verifierModel.provider + "/" + verifierModel.id,
+          client: client.provider + "/" + client.model,
+          effort: client.effort,
+        });
+      },
+    });
+
+    const first = await ensureAutomaticVerification(fakePi, ctx, runtime, 3, verifierSelector);
+    configuredModel = modelB;
+    activeModel = modelB;
+    defaultSelector = "inferx/deepseek-v4-flash-0731:max";
+    const second = await ensureAutomaticVerification(fakePi, ctx, runtime, 3, verifierSelector);
+
+    expect(first.originalModel).toBe(modelA);
+    expect(second.originalModel).toBe(modelB);
+    expect(second.providerName).not.toBe(first.providerName);
+    expect(registrations).toHaveLength(2);
+    expect(probes).toEqual([
+      {
+        model: "deepseek/deepseek-v4-flash",
+        client: "deepseek/deepseek-v4-flash",
+        effort: "high",
+      },
+      {
+        model: "deepseek/deepseek-v4-flash",
+        client: "deepseek/deepseek-v4-flash",
+        effort: "high",
+      },
+    ]);
+  });
+
   test("rejects an unresolvable verifierModel selector with a clear error", async () => {
     const source = model();
     let activeModel: Model = source;
@@ -2499,12 +2684,18 @@ describe("OMP default model inheritance", () => {
       sessionManager: { getSessionId: () => "session-1" },
       ui: { notify: () => undefined },
     } as never;
-    const runtime = createAutomaticVerificationRuntime();
+    const probedModels: string[] = [];
+    const runtime = createAutomaticVerificationRuntime({
+      probeVerifier: async (_client, verifierModel) => {
+        probedModels.push(verifierModel.provider + "/" + verifierModel.id);
+      },
+    });
 
     const first = await ensureAutomaticVerification(fakePi, ctx, runtime);
     expect(first.originalModel).toBe(modelA);
     expect(activeModel.provider).toBe(first.providerName);
     expect(registrations).toHaveLength(1);
+    expect(probedModels).toEqual(["opencode-go/deepseek-v4-flash-0731"]);
     await ensureAutomaticVerification(fakePi, ctx, runtime);
     expect(registrations).toHaveLength(1);
 
@@ -2516,6 +2707,77 @@ describe("OMP default model inheritance", () => {
     expect(second.providerName).not.toBe(first.providerName);
     expect(activeModel.provider).toBe(second.providerName);
     expect(registrations).toHaveLength(2);
+    expect(probedModels).toEqual([
+      "opencode-go/deepseek-v4-flash-0731",
+      "inferx/deepseek-v4-flash-0731",
+    ]);
+  });
+
+  test("rechecks and explains both recovery options after switching to an unsupported default model", async () => {
+    const modelA = model();
+    const modelB = oxAlphaModel();
+    let configuredModel = modelA;
+    let activeModel: Model = modelA;
+    let selector = "opencode-go/deepseek-v4-flash-0731:max";
+    const wrappers = new Map<string, Model>();
+    const registrations: string[] = [];
+    const probedModels: string[] = [];
+    const fakePi = {
+      logger: silentExtensionLogger,
+      pi: { settings: { getModelRole: () => selector } },
+      registerProvider: (provider: string) => {
+        registrations.push(provider);
+        wrappers.set(provider + "/default", { ...configuredModel, provider, id: "default" } as unknown as Model);
+      },
+      getThinkingLevel: () => "high",
+      setThinkingLevel: () => undefined,
+      setModel: async (next: Model) => { activeModel = next; return true; },
+    } as never;
+    const ctx = {
+      get model() { return activeModel; },
+      models: {
+        resolve: (spec: string) => spec === "@default" ? configuredModel : wrappers.get(spec),
+        list: () => [modelA, modelB],
+      },
+      modelRegistry: {
+        getApiKey: async () => "test-key",
+        resolver: () => () => "test-key",
+        getProviderHeaders: () => undefined,
+        refreshRuntimeProviders: async () => undefined,
+      },
+      sessionManager: { getSessionId: () => "unsupported-switch-session" },
+      ui: { notify: () => undefined },
+    } as never;
+    const runtime = createAutomaticVerificationRuntime({
+      probeVerifier: async (_client, verifierModel) => {
+        const identity = verifierModel.provider + "/" + verifierModel.id;
+        probedModels.push(identity);
+        if (identity === "openrouter/stealth/ox-alpha") {
+          throw new VerifierLogprobsUnsupportedError("probe returned no token logprobs");
+        }
+      },
+    });
+
+    await ensureAutomaticVerification(fakePi, ctx, runtime);
+    configuredModel = modelB;
+    activeModel = modelB;
+    selector = "openrouter/stealth/ox-alpha:max";
+
+    let message = "";
+    try {
+      await ensureAutomaticVerification(fakePi, ctx, runtime);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain("OMP default model openrouter/stealth/ox-alpha");
+    expect(message).toContain("(1) switch the OMP default model");
+    expect(message).toContain("(2) configure a separate verifier model");
+    expect(activeModel).toBe(modelB);
+    expect(registrations).toHaveLength(1);
+    expect(probedModels).toEqual([
+      "opencode-go/deepseek-v4-flash-0731",
+      "openrouter/stealth/ox-alpha",
+    ]);
   });
 
   test("does not let a stale rebind overwrite a newer active model", async () => {
@@ -2760,7 +3022,9 @@ describe("documentation and plugin surface", () => {
     expect(resolvePluginSettings({ verifierModel: "   " }).verifierModel).toBeUndefined();
     expect(resolvePluginSettings({}).verifierModel).toBeUndefined();
     expect(resolvePluginSettings({ verifierModel: 42 }).verifierModel).toBeUndefined();
-    expect(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
-      .omp.settings.verifierModel.type).toBe("string");
+    const manifestSetting = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
+      .omp.settings.verifierModel;
+    expect(manifestSetting.type).toBe("string");
+    expect(manifestSetting.default).toBe("");
   });
 });

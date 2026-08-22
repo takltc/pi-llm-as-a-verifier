@@ -79,6 +79,24 @@ export function degradedWarningMessage(event: AutoVerifierDegradedEvent): string
     return "LLM-as-a-Verifier PPT verification failed after " + candidateSummary +
       "; returned the earliest successful candidate." + detail;
   }
+  const sources = event.scoreSources;
+  if (sources && sources.logprobs > 0) {
+    const totalScores = sources.logprobs + sources.textFallback +
+      sources.neutralTie + sources.unknown;
+    const totalComparisons = Math.ceil(totalScores / 2);
+    if (sources.neutralTie > 0 || sources.unknown > 0) {
+      const failedComparisons = Math.ceil((sources.neutralTie + sources.unknown) / 2);
+      return "LLM-as-a-Verifier " + candidateSummary + "; " +
+        failedComparisons + "/" + totalComparisons +
+        " PPT comparisons failed before complete score tags, while the configured verifier returned " +
+        "valid token logprobs for " + sources.logprobs + "/" + totalScores +
+        " score tags. Selection used neutral ties for failed comparisons; repeated occurrences warrant " +
+        "checking the verifier output budget and provider errors.";
+    }
+    return "LLM-as-a-Verifier " + candidateSummary + "; the configured verifier returned valid token " +
+      "logprobs for " + sources.logprobs + "/" + totalScores +
+      " score tags, with literal-text fallback for the remainder. Selection completed with mixed score evidence.";
+  }
   return "LLM-as-a-Verifier PPT scoring lacked complete token-logprob evidence although " +
     candidateSummary +
     "; selected with neutral-tie fallback. Pin a logprobs-capable verifier with " +
@@ -166,7 +184,7 @@ export default function verifierExtension(pi: ExtensionAPI): void {
         "info",
       );
     } catch (error) {
-      notifyWarning(ctx, error);
+      notifyWarning(ctx, error, "startup_verifier_unavailable");
     }
   });
 
@@ -182,7 +200,7 @@ export default function verifierExtension(pi: ExtensionAPI): void {
         ctx.ui.notify("LLM-as-a-Verifier followed the OMP default model switch and rebound successfully.", "info");
       }
     } catch (error) {
-      notifyWarning(ctx, error);
+      notifyWarning(ctx, error, "model_switch_verifier_unavailable");
     }
   });
 }
@@ -225,11 +243,12 @@ export async function ensureAutomaticVerification(
     }
     if (!verifierModel) throw new Error("OMP modelRoles.default did not resolve to an available model.");
     if (!isVerifierSupportedApi(verifierModel.api)) {
-      throw new Error(
-        (verifierSelector ? "LLM-as-a-Verifier verifier model " : "OMP default model ") +
-        verifierModel.provider + "/" + verifierModel.id +
-        " uses " + verifierModel.api + "; the verifier requires OpenAI token logprobs.",
-      );
+      throw new VerifierLogprobsUnsupportedError(unsupportedModelMessage(verifierModel, {
+        verifierSelector,
+        available: potentialVerifierModels(ctx, verifierModel),
+        reason: "uses " + verifierModel.api +
+          ", which does not expose the OpenAI-compatible token logprobs required by LLM-as-a-Verifier",
+      }), { retryable: false });
     }
 
     const sessionId = ctx.sessionManager.getSessionId();
@@ -288,7 +307,7 @@ export async function ensureAutomaticVerification(
           if (isVerifierLogprobsUnsupportedError(error)) {
             const message = unsupportedModelMessage(verifierModel, {
               verifierSelector,
-              available: logprobCapableModels(ctx),
+              available: potentialVerifierModels(ctx, verifierModel),
             });
             runtime.capabilityErrors.set(sourceKey, message);
             throw new VerifierLogprobsUnsupportedError(message);
@@ -298,7 +317,7 @@ export async function ensureAutomaticVerification(
           const message = "LLM-as-a-Verifier capability probe failed for " +
             verifierModel.provider + "/" + verifierModel.id + ": " + detail +
             ". The original agent model remains active; capability probing will retry after 60 seconds. " +
-            "Pin a known logprobs-capable verifier with `omp plugin config set omp-llm-verifier verifierModel <provider/model>`.";
+            verifierRecoveryHint(verifierSelector);
           runtime.probeErrors.set(sourceKey, {
             message,
             retryAt: runtime.now() + CAPABILITY_PROBE_RETRY_MS,
@@ -584,7 +603,7 @@ function getDefaultModelSelector(pi: ExtensionAPI): string | undefined {
  */
 const LOGPROBS_HOSTILE_PROVIDERS = new Set(["kimi-code"]);
 
-function logprobCapableModels(ctx: ExtensionContext): string[] {
+function potentialVerifierModels(ctx: ExtensionContext, excludedModel?: Model): string[] {
   if (!ctx.models || typeof ctx.models.list !== "function") return [];
   const seen = new Set<string>();
   const models: string[] = [];
@@ -592,6 +611,11 @@ function logprobCapableModels(ctx: ExtensionContext): string[] {
     if (!candidate || !isVerifierSupportedApi(candidate.api)) continue;
     if (isWrapperModel(candidate)) continue;
     if (LOGPROBS_HOSTILE_PROVIDERS.has(candidate.provider)) continue;
+    if (
+      excludedModel &&
+      candidate.provider === excludedModel.provider &&
+      candidate.id === excludedModel.id
+    ) continue;
     const id = candidate.provider + "/" + candidate.id;
     if (seen.has(id)) continue;
     seen.add(id);
@@ -603,17 +627,32 @@ function logprobCapableModels(ctx: ExtensionContext): string[] {
 
 function unsupportedModelMessage(
   model: Model,
-  options: { verifierSelector?: string; available?: string[] } = {},
+  options: {
+    verifierSelector?: string;
+    available?: string[];
+    reason?: string;
+  } = {},
 ): string {
-  const hint = options.verifierSelector
-    ? "Pick a logprobs-capable verifier model and rerun `omp plugin config set omp-llm-verifier verifierModel <provider/model>`."
-    : "Switch to a model that supports token logprobs, or pin a separate verifier: " +
-      "`omp plugin config set omp-llm-verifier verifierModel <provider/model>`.";
+  const subject = options.verifierSelector ? "Configured verifier model " : "OMP default model ";
+  const reason = options.reason ??
+    "does not provide the token logprobs required by LLM-as-a-Verifier";
   const available = options.available && options.available.length > 0
-    ? " Logprobs-capable models available in this session: " + options.available.join(", ") + "."
+    ? " Potential verifier models configured in this session: " +
+      options.available.join(", ") + "; each will be probed when selected."
     : "";
-  return "LLM-as-a-Verifier cannot use " + model.provider + "/" + model.id +
-    ": this model did not return token logprobs. " + hint + available;
+  return subject + model.provider + "/" + model.id + " " + reason + ". " +
+    verifierRecoveryHint(options.verifierSelector) + available;
+}
+
+function verifierRecoveryHint(verifierSelector?: string): string {
+  if (verifierSelector) {
+    return "Choose one: (1) configure another logprobs-capable verifier model with " +
+      "`omp plugin config set omp-llm-verifier verifierModel <provider/model>`; " +
+      "(2) clear verifierModel to follow the OMP default model.";
+  }
+  return "Choose one: (1) switch the OMP default model to one that supports token logprobs; " +
+    "(2) configure a separate verifier model with " +
+    "`omp plugin config set omp-llm-verifier verifierModel <provider/model>`.";
 }
 
 function formatVerifierError(error: unknown, model?: Model): string {

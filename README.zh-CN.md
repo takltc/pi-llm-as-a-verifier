@@ -29,7 +29,7 @@ omp plugin doctor
 omp plugin config set omp-llm-verifier verifierModel deepseek/deepseek-v4-flash
 ```
 
-`verifierModel` 留空时使用会话默认模型做自我验证。kimi-code（Kimi for Coding）会拒绝 logprobs 请求，会话模型是 kimi-code 时必须配置 `verifierModel`。
+`verifierModel` 留空是通用默认行为，此时使用 OMP `modelRoles.default` 做自我验证。可通过 `omp plugin config set omp-llm-verifier verifierModel ''` 清除已有覆盖。插件会在首次进入会话和同一会话切换 default 模型后重新探测实际验证器能力。
 
 高影响检查点使用 TurboAgent 的在线选择配置（`K=1`、`pivots=2`、一个 Task Success 准则）。TurboAgent 参考配置的 N 为 3；本插件通过 `candidateCount` 暴露 2–8 的 N 范围。首个样本会先完成并预热共享 provider 前缀，其余 N-1 个样本随后并发生成。论文的质量/成本轴仍可配置：
 
@@ -55,7 +55,7 @@ omp plugin disable omp-llm-verifier
 omp plugin enable omp-llm-verifier
 ```
 
-验证器模型必须能提供 OpenAI Chat Completions 或 Responses 的 token logprobs——论文的细粒度奖励从评分 token 分布读取。解析出的验证器模型缺少 logprobs 能力时，插件会拒绝包装会话模型并显示能力警告。探测超时或传输失败时，插件会保持原始智能体模型，并在 60 秒后重新探测能力。任务包含视觉证据时，验证器模型还需支持图片输入。每次成对评分请求先携带共享的用户、assistant 和工具结果图片，再携带带标签的 Trajectory A 与 Trajectory B 图片，从而保持参考实现的多模态证据路径。
+验证器模型必须能提供 OpenAI Chat Completions 或 Responses 的 token logprobs——论文的细粒度奖励从评分 token 分布读取。解析出的验证器模型缺少该能力时，原始智能体模型继续可用，本次模型不启用验证，同时 OMP 明确显示两条处理路径：（1）把 `modelRoles.default` 切换到支持 token logprobs 的模型；（2）单独配置 `verifierModel`。首次进入会话和同会话切换模型都会执行这项检查。探测超时或传输失败时，插件会保持原始智能体模型，并在 60 秒后重新探测能力。插件会根据 provider 与模型标识识别 DeepSeek 模型族，因此 `inferx/deepseek-*` 等托管变体使用参考实现的 32,768 token 输出预算，通用 OpenAI-compatible 验证器继续使用参考实现的 4,096 token 预算。任务包含视觉证据时，验证器模型还需支持图片输入。每次成对评分请求先携带共享的用户、assistant 和工具结果图片，再携带带标签的 Trajectory A 与 Trajectory B 图片，从而保持参考实现的多模态证据路径。
 
 OMP 的 `--max-time` 是整个 agent loop 的绝对截止时间，候选生成与 PPT 共享这份总预算。普通交互会话省略该参数时，agent deadline 保持未设置状态。高思考强度的 headless/CI 运行应给完整的多轮 action 留足预算，例如 `--max-time 15m`；插件的单次验证 HTTP 上限为 10 分钟，同时服从 OMP 的会话取消信号。
 
