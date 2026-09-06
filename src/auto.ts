@@ -32,24 +32,6 @@ import type { ScoreDistributionQuality, ScoreSourceCounts } from "./cache.ts";
 export const AUTO_CANDIDATE_COUNT = 3;
 export const AUTO_CANDIDATE_COUNT_MIN = 2;
 export const AUTO_CANDIDATE_COUNT_MAX = 8;
-// Reference trace compaction (SWE-bench `_sb_format_trace`, MedAgentBench
-// `_med_format_trace`) truncates each block at a fixed character cap rather
-// than trimming the whole trajectory to an arbitrary total. Match the
-// reference SWE-bench cap so cached prefixes stay stable.
-const TRACE_BLOCK_MAX_CHARS = 2000;
-// Hard total budget for one candidate trace. The paper's best-of-3 pair prompt
-// holds problem + both traces; with problem capped at PROBLEM_MAX_CHARS we
-// bound the dynamic section of any pair prompt to ~32k chars so the unknown
-// per-call input cannot explode even for a many-block candidate.
-const TRACE_TOTAL_MAX_CHARS = 8000;
-// Long reasoning traces are kept out of the verifier prompt: the reference
-// formatters only keep the agent message and tool outputs, and the paper's
-// reward is read off the FINAL score block, not the reasoning.
-const THINKING_MAX_CHARS = 800;
-// Cap the task description (reference `problem`) so a very long user request
-// cannot dominate every pairwise prompt. 16k chars is far past any task
-// statement while staying far below context limits.
-const PROBLEM_MAX_CHARS = 16000;
 const CANDIDATE_TRANSIENT_RETRIES = 1;
 const CANDIDATE_RETRY_BASE_DELAY_MS = 500;
 const CANDIDATE_RETRY_STAGGER_MS = 100;
@@ -1063,29 +1045,24 @@ function exactActionMajority(
  * TurboAgent action identity: visible text plus tool name/arguments, with
  * provider-generated call IDs treated as transport metadata. This string is
  * intentionally unbounded so a shared long prefix cannot create a false exact
- * majority; bounded traces remain a verifier-prompt concern.
+ * majority. Verifier traces preserve the same full visible evidence.
  */
 function serializeActionIdentity(message: AssistantMessage): string {
-  if (!message || !Array.isArray(message.content)) return "(empty response)";
-  const parts: string[] = [];
-  for (const block of message.content) {
-    if (!block || typeof block !== "object") continue;
-    const value = block as unknown as Record<string, unknown>;
-    if (value.type === "text" && typeof value.text === "string" && value.text) {
-      parts.push(value.text);
-    } else if (value.type === "toolCall") {
-      const toolCall = value as unknown as ToolCall;
-      parts.push(
-        "[tool_call: " + toolCall.name + "(" + compactJson(toolCall.arguments) + ")]",
-      );
-    } else if (
-      value.type === "image" && typeof value.mimeType === "string" &&
-      typeof value.data === "string"
-    ) {
-      parts.push("[image: " + value.mimeType + ":" + value.data + "]");
+  const content = message.content.flatMap<Record<string, unknown>>((block) => {
+    if (block.type === "text") return [{ type: "text", text: block.text }];
+    if (block.type === "toolCall") {
+      return [{ type: "toolCall", name: block.name, arguments: block.arguments }];
     }
-  }
-  return parts.join("\n") || "(empty response)";
+    if (block.type === "image") {
+      return [{ type: "image", mimeType: block.mimeType, data: block.data }];
+    }
+    return [];
+  });
+  return JSON.stringify({ stopReason: message.stopReason, content }, (_key, value) =>
+    value && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]]))
+      : value,
+  );
 }
 
 function cloneContext(context: Context): Context {
@@ -1115,69 +1092,15 @@ function cloneMessageData(value: unknown): unknown {
   );
 }
 
-/**
- * Extract the task description shown to the verifier as `problem`.
- *
- * Mirrors the reference loaders: `_tb_extract_problem` and `_sb_extract_problem`
- * both derive `problem` from the USER's request, never from the system prompt,
- * tool schemas, or transport metadata. For the transparent wrapper the task is
- * the most recent user message (the request being answered). TurboAgent passes
- * the full request history, so any remaining budget is backfilled with the
- * most recent prior conversation. Shared images are carried separately to the
- * multimodal verifier and very long requests are capped so the prompt prefix
- * stays stable across repeated comparisons.
- *
- * The verifier's criteria instruct it to treat OBSERVED tool results as ground
- * truth, so the problem also carries a recency-bounded chronological slice of
- * the trajectory since that request: visible assistant actions and tool outputs
- * (per-block truncated), still excluding system/developer prompts, reasoning,
- * tool schemas, and image payloads. Conversation images travel separately in
- * chronological order. Prior context, the task, separators, and current
- * evidence share the 16k problem budget — the hard cap on every pairwise
- * prompt.
- */
+/** Preserve the observable conversation chronologically; images travel separately. */
 function serializeVerificationContext(
   context: Context,
 ): { problem: string; images: ImageContent[] } {
   const messages = context.messages ?? [];
-  let task = "";
-  let taskIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (!message || message.role !== "user") continue;
-    const parts: string[] = [];
-    const content = message.content;
-    if (typeof content === "string") {
-      parts.push(content);
-    } else if (Array.isArray(content)) {
-      for (const block of content) {
-        if (!block || typeof block !== "object") continue;
-        const value = block as unknown as Record<string, unknown>;
-        if (value.type === "text" && typeof value.text === "string") parts.push(value.text);
-      }
-    }
-    if (parts.length) {
-      task = parts.join("\n").trim();
-      taskIndex = index;
-      break;
-    }
-  }
-  const images = sharedContextImages(messages, 0);
-  if (!task) return { problem: "(no user request captured)", images };
-  const currentTask = truncateWithMarker(task, PROBLEM_MAX_CHARS, "\n... [task truncated]");
-
-  const separator = "\n\n";
-  const evidenceBudget = PROBLEM_MAX_CHARS - currentTask.length - separator.length;
-  const currentEvidence = evidenceBudget > 0
-    ? recentTrajectoryEvidence(messages, taskIndex, evidenceBudget)
-    : "";
-  const used = currentTask.length + (currentEvidence ? separator.length + currentEvidence.length : 0);
-  const priorBudget = PROBLEM_MAX_CHARS - used - separator.length;
-  const priorContext = taskIndex > 0 && priorBudget > 0
-    ? recentTrajectoryEvidence(messages, -1, priorBudget, taskIndex)
-    : "";
-  const problem = [priorContext, currentTask, currentEvidence].filter(Boolean).join(separator);
-  return { problem, images };
+  return {
+    problem: trajectoryEvidence(messages) || "(no user request captured)",
+    images: sharedContextImages(messages, 0),
+  };
 }
 
 function imagesFromContent(content: unknown): ImageContent[] {
@@ -1211,126 +1134,30 @@ export function serializeContext(context: Context): string {
   return serializeVerificationContext(context).problem;
 }
 
-/** Truncate `text` to at most `max` chars, folding in `marker` when cut. */
-function truncateWithMarker(text: string, max: number, marker: string): string {
-  const cap = Math.max(0, max);
-  if (text.length <= cap) return text;
-  if (marker.length >= cap) return marker.slice(0, cap);
-  return text.slice(0, cap - marker.length) + marker;
-}
-
-const TRACE_SEPARATOR_LEN = "\n\n".length;
-
-/**
- * Recency-bounded slice of observable agent actions and tool outputs after the
- * current request (the verifier's ground-truth signal). Selection walks from
- * newest to oldest, then restores chronological order for the verifier.
- * Reasoning, system/developer messages, tool schemas, and image payloads stay outside
- * the text budget; image markers remain here while payloads travel separately.
- */
-function recentTrajectoryEvidence(
-  messages: Message[],
-  afterIndex: number,
-  budget: number,
-  beforeIndex = messages.length,
-): string {
-  if (budget <= 0) return "";
+/** Keep user instructions, visible actions, and observed results without a lossy budget. */
+function trajectoryEvidence(messages: Message[]): string {
   const parts: string[] = [];
-  let used = 0;
-  const append = (piece: string): void => {
-    if (used >= budget) return;
-    const sepCost = parts.length ? TRACE_SEPARATOR_LEN : 0;
-    const room = budget - used - sepCost;
-    if (room <= 0) return;
-    parts.push(truncateWithMarker(piece, room, "\n... [truncated]"));
-    used += sepCost + parts[parts.length - 1]!.length;
-  };
-
-  for (let index = Math.min(messages.length, beforeIndex) - 1; index > afterIndex; index -= 1) {
-    const message = messages[index];
-    if (!message || typeof message !== "object") continue;
-    if (message.role === "assistant") {
-      const messageParts: string[] = [];
-      const messageBudget = Math.max(
-        0,
-        budget - used - (parts.length ? TRACE_SEPARATOR_LEN : 0),
-      );
-      let messageUsed = 0;
-      const appendMessagePart = (piece: string): void => {
-        const separatorCost = messageParts.length ? 1 : 0;
-        const room = messageBudget - messageUsed - separatorCost;
-        if (room <= 0) return;
-        const bounded = truncateWithMarker(piece, room, "\n... [truncated]");
-        messageParts.push(bounded);
-        messageUsed += separatorCost + bounded.length;
-      };
-      for (const block of (message as unknown as AssistantMessage).content ?? []) {
-        if (messageUsed >= messageBudget) break;
-        if (!block) continue;
-        const value = block as unknown as Record<string, unknown>;
-        if (value.type === "text" && typeof value.text === "string") {
-          const text = String(value.text).trim();
-          if (text) appendMessagePart(truncateBlock(text));
-        } else if (value.type === "toolCall") {
-          const toolCall = value as unknown as ToolCall;
-          appendMessagePart(
-            "[tool call] " + toolCall.name + " " + truncateBlock(compactJson(toolCall.arguments)),
-          );
-        } else if (value.type === "image") {
-          appendMessagePart("[image attached]");
+  for (const message of messages) {
+    if (!message || !["user", "assistant", "toolResult"].includes(message.role)) continue;
+    const content = message.content;
+    const blocks: string[] = [];
+    if (typeof content === "string") blocks.push(content);
+    else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block.type === "text") blocks.push(block.text);
+        else if (block.type === "image") blocks.push("[image attached]");
+        else if (block.type === "toolCall") {
+          blocks.push("[tool call] " + block.name + " " + compactJson(block.arguments));
         }
-      }
-      if (messageParts.length) append("[assistant]\n" + messageParts.join("\n"));
-    } else if (message.role === "user") {
-      const messageParts: string[] = [];
-      const content = message.content;
-      if (typeof content === "string") {
-        const text = content.trim();
-        if (text) messageParts.push(truncateBlock(text));
-      } else if (Array.isArray(content)) {
-        for (const block of content) {
-          if (!block || typeof block !== "object") continue;
-          const value = block as unknown as Record<string, unknown>;
-          if (value.type === "text" && typeof value.text === "string") {
-            const text = value.text.trim();
-            if (text) messageParts.push(truncateBlock(text));
-          } else if (value.type === "image") {
-            messageParts.push("[image attached]");
-          }
-        }
-      }
-      if (messageParts.length) append("[user]\n" + messageParts.join("\n"));
-    } else if (message.role === "toolResult") {
-      const toolName = (message as unknown as { toolName?: string }).toolName;
-      const isError = (message as unknown as { isError?: boolean }).isError === true;
-      const textBlocks: string[] = [];
-      const content = (message as unknown as { content?: unknown }).content;
-      if (typeof content === "string") {
-        const trimmed = content.trim();
-        if (trimmed) textBlocks.push(trimmed);
-      } else if (Array.isArray(content)) {
-        for (const block of content) {
-          if (!block || typeof block !== "object") continue;
-          const value = block as unknown as Record<string, unknown>;
-          if (value.type === "text" && typeof value.text === "string") {
-            const text = String(value.text).trim();
-            if (text) textBlocks.push(text);
-          } else if (value.type === "image") {
-            textBlocks.push("[image attached]");
-          }
-        }
-      }
-      if (textBlocks.length) {
-        const kind = isError ? "[tool error]" : "[tool output]";
-        append(
-          kind + (toolName ? " " + toolName : "") + "\n" +
-          textBlocks.map(truncateBlock).join("\n"),
-        );
       }
     }
-    if (used >= budget) break;
+    if (!blocks.length) continue;
+    const label = message.role === "toolResult"
+      ? (message.isError ? "[tool error]" : "[tool output]") + " " + message.toolName
+      : "[" + message.role + "]";
+    parts.push(label + "\n" + blocks.join("\n"));
   }
-  return parts.reverse().join("\n\n");
+  return parts.join("\n\n");
 }
 
 export function serializeAssistantMessage(message: AssistantMessage): string {
@@ -1341,56 +1168,20 @@ export function serializeAssistantMessage(message: AssistantMessage): string {
   return "(no candidate content)";
 }
 
-/**
- * Build the compact candidate trace, per-block capped then bounded to a total
- * budget. The per-block cap matches the reference SWE-bench truncation; the
- * total cap keeps a many-block candidate from dominating every pairwise prompt
- * while the paper's high-effort / 32k verifier budget is untouched.
- */
+/** Preserve every visible candidate block so selection can distinguish full actions. */
 function serializeTrace(
   message: AssistantMessage,
 ): { trace: string; fallbackReasoning: string } {
   const chunks: string[] = [];
-  let used = 0;
   let fallbackReasoning = "";
-  const appendWithinBudget = (chunk: string): void => {
-    if (used >= TRACE_TOTAL_MAX_CHARS) return;
-    const trimmed = chunk.trim();
-    if (!trimmed) return;
-    const sepCost = chunks.length ? TRACE_SEPARATOR_LEN : 0;
-    const room = TRACE_TOTAL_MAX_CHARS - used - sepCost;
-    if (room <= 0) return;
-    chunks.push(truncateWithMarker(trimmed, room, "\n... [truncated]"));
-    used += sepCost + chunks[chunks.length - 1]!.length;
-  };
   for (const block of message.content) {
-    if (used >= TRACE_TOTAL_MAX_CHARS) break;
-    if (!block || typeof block !== "object") continue;
-    const value = block as unknown as Record<string, unknown>;
-    if (value.type === "text" && typeof value.text === "string") {
-      appendWithinBudget(truncateBlock(value.text));
-    } else if (value.type === "thinking" && typeof value.thinking === "string" && !fallbackReasoning) {
-      const thinking = value.thinking;
-      fallbackReasoning = thinking.length <= THINKING_MAX_CHARS
-        ? thinking
-        : thinking.slice(0, THINKING_MAX_CHARS) + "\n... [reasoning truncated]";
-    } else if (value.type === "toolCall") {
-      const toolCall = value as unknown as ToolCall;
-      appendWithinBudget(
-        "[proposed tool call] " + toolCall.name + " " + truncateBlock(compactJson(toolCall.arguments)),
-      );
-    } else if (value.type === "image") {
-      appendWithinBudget("[image attached]");
-    }
+    if (block.type === "text") chunks.push(block.text);
+    else if (block.type === "thinking") fallbackReasoning ||= block.thinking;
+    else if (block.type === "toolCall") {
+      chunks.push("[proposed tool call] " + block.name + " " + compactJson(block.arguments));
+    } else if (block.type === "image") chunks.push("[image attached]");
   }
   return { trace: chunks.join("\n\n"), fallbackReasoning };
-}
-
-/** Truncate one content block at the reference per-block cap. */
-function truncateBlock(text: string): string {
-  return text.length <= TRACE_BLOCK_MAX_CHARS
-    ? text
-    : text.slice(0, TRACE_BLOCK_MAX_CHARS) + "\n... [truncated]";
 }
 
 /** Compact JSON for tool-call arguments, rendered inline without indentation. */

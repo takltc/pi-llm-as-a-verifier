@@ -15,29 +15,17 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
-  rmdirSync,
   statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { FileLock } from "@oh-my-pi/pi-natives";
 
-export const CACHE_VERSION = 6;
+export const CACHE_VERSION = 7;
 const LOCK_TIMEOUT_MS = 30_000;
-const LOCK_STALE_MS = 120_000;
-
-interface LockHandle {
-  lockDir: string;
-  token: string;
-}
-
-interface LockMetadata {
-  pid: number;
-  token: string;
-  createdAt: number;
-}
-
 export interface CachedEntry {
   score_A: number;
   score_B: number;
@@ -216,22 +204,29 @@ export function summarizeScoreSources(
 export function summarizeScoreDistribution(
   entries: Iterable<CachedEntry | undefined>,
 ): ScoreDistributionQuality {
-  const supports: number[] = [];
-  const masses: number[] = [];
+  let count = 0;
+  let minSupport = Infinity;
+  let minMass = Infinity;
+  let totalSupport = 0;
+  let totalMass = 0;
   for (const entry of entries) {
     for (const side of ["A", "B"] as const) {
       if (resolvedScoreSource(entry, side) !== "logprobs") continue;
-      supports.push((side === "A" ? entry?.support_A : entry?.support_B)!);
-      masses.push((side === "A" ? entry?.probability_mass_A : entry?.probability_mass_B)!);
+      const support = (side === "A" ? entry?.support_A : entry?.support_B)!;
+      const mass = (side === "A" ? entry?.probability_mass_A : entry?.probability_mass_B)!;
+      count += 1;
+      minSupport = Math.min(minSupport, support);
+      minMass = Math.min(minMass, mass);
+      totalSupport += support;
+      totalMass += mass;
     }
   }
-  const count = supports.length;
   return {
     logprobScores: count,
-    minSupport: count ? Math.min(...supports) : 0,
-    meanSupport: count ? supports.reduce((sum, value) => sum + value, 0) / count : 0,
-    minProbabilityMass: count ? Math.min(...masses) : 0,
-    meanProbabilityMass: count ? masses.reduce((sum, value) => sum + value, 0) / count : 0,
+    minSupport: count ? minSupport : 0,
+    meanSupport: count ? totalSupport / count : 0,
+    minProbabilityMass: count ? minMass : 0,
+    meanProbabilityMass: count ? totalMass / count : 0,
   };
 }
 
@@ -273,115 +268,27 @@ function sleepSync(milliseconds: number): void {
   Atomics.wait(signal, 0, 0, milliseconds);
 }
 
-function readLockMetadata(lockDir: string): LockMetadata | undefined {
+/** OS ownership survives contention and is released automatically on process exit. */
+function acquireLock(cacheFile: string): FileLock {
+  const lockPath = join(realpathSync(dirname(cacheFile)), `${basename(cacheFile)}.lock`);
   try {
-    const parsed: unknown = JSON.parse(readFileSync(join(lockDir, "owner"), "utf8"));
-    if (!parsed || typeof parsed !== "object") return undefined;
-    const metadata = parsed as Record<string, unknown>;
-    if (
-      typeof metadata.pid !== "number" ||
-      !Number.isInteger(metadata.pid) ||
-      metadata.pid < 1 ||
-      typeof metadata.token !== "string" ||
-      metadata.token.length === 0 ||
-      typeof metadata.createdAt !== "number" ||
-      !Number.isFinite(metadata.createdAt)
-    ) {
-      return undefined;
+    if (statSync(lockPath).isDirectory()) {
+      throw new Error(
+        `Legacy cache lock directory: ${lockPath}. Stop old verifier processes before removing it and retrying`,
+      );
     }
-    return {
-      pid: metadata.pid,
-      token: metadata.token,
-      createdAt: metadata.createdAt,
-    };
-  } catch {
-    return undefined;
-  }
-}
-
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-/** Move a stale lock aside atomically before removing it. */
-function reclaimStaleLock(lockDir: string): boolean {
-  let lockStat: ReturnType<typeof statSync>;
-  try {
-    lockStat = statSync(lockDir);
-  } catch {
-    return true;
-  }
-  if (Date.now() - lockStat.mtimeMs <= LOCK_STALE_MS) return false;
-  const metadata = readLockMetadata(lockDir);
-  if (metadata && processIsAlive(metadata.pid)) return false;
-  const quarantine = `${lockDir}.reclaim-${process.pid}-${randomBytes(8).toString("hex")}`;
-  try {
-    renameSync(lockDir, quarantine);
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT";
-  }
-  try {
-    unlinkSync(join(quarantine, "owner"));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  rmdirSync(quarantine);
-  return true;
-}
-
-function acquireLock(lockDir: string): LockHandle {
   const started = Date.now();
-  mkdirSync(dirname(lockDir), { recursive: true });
   while (true) {
-    try {
-      mkdirSync(lockDir);
-      const token = `${process.pid}:${Date.now()}:${randomBytes(16).toString("hex")}`;
-      const fd = openSync(join(lockDir, "owner"), "wx", 0o600);
-      try {
-        writeAll(
-          fd,
-          Buffer.from(
-            JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }) + "\n",
-          ),
-        );
-        fsyncSync(fd);
-        return { lockDir, token };
-      } finally {
-        closeSync(fd);
-      }
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") {
-        try {
-          unlinkSync(join(lockDir, "owner"));
-          rmdirSync(lockDir);
-        } catch {
-          // Preserve the original lock initialization error.
-        }
-        throw error;
-      }
-      if (reclaimStaleLock(lockDir)) continue;
-      if (Date.now() - started >= LOCK_TIMEOUT_MS) {
-        throw new Error(`Timed out waiting for cache lock: ${lockDir}`);
-      }
-      sleepSync(10);
+    // Keep the lock file in place: unlinking it would split Unix inode ownership.
+    const lock = FileLock.tryAcquire(lockPath);
+    if (lock.acquired) return lock;
+    if (Date.now() - started >= LOCK_TIMEOUT_MS) {
+      throw new Error(`Timed out waiting for cache lock: ${lockPath}`);
     }
-  }
-}
-
-function releaseLock(handle: LockHandle): void {
-  try {
-    const metadata = readLockMetadata(handle.lockDir);
-    if (metadata?.token !== handle.token) return;
-    unlinkSync(join(handle.lockDir, "owner"));
-    rmdirSync(handle.lockDir);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    sleepSync(10);
   }
 }
 
@@ -421,7 +328,7 @@ function writeAtomic(cacheFile: string, cache: ScoreCache): void {
 /** Merge with the latest on-disk state while holding an inter-process lock. */
 export function saveCache(cacheFile: string, cache: ScoreCache): void {
   mkdirSync(dirname(cacheFile), { recursive: true });
-  const lock = acquireLock(`${cacheFile}.lock`);
+  const lock = acquireLock(cacheFile);
   try {
     const merged: ScoreCache = { ...readCacheFile(cacheFile) };
     for (const [key, entry] of Object.entries(cache)) {
@@ -429,7 +336,7 @@ export function saveCache(cacheFile: string, cache: ScoreCache): void {
     }
     writeAtomic(cacheFile, merged);
   } finally {
-    releaseLock(lock);
+    lock.release();
   }
 }
 

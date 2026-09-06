@@ -300,6 +300,83 @@ describe("automatic process-reward provider", () => {
     }
   });
 
+  test("retries a request timeout as a transient failure before parsing logprobs", async () => {
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (async (_url: unknown, init: unknown) => {
+      attempts += 1;
+      if (attempts === 1) {
+        return await new Promise<Response>((_, reject) => {
+          const abort = () => reject((init as { signal?: AbortSignal }).signal?.reason);
+          if ((init as { signal?: AbortSignal }).signal?.aborted) abort();
+          else (init as { signal?: AbortSignal }).signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { content: "A" },
+          finish_reason: "stop",
+          logprobs: { content: [{ token: "A", logprob: -0.1, top_logprobs: [{ token: "A", logprob: -0.1 }] }] },
+        }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    try {
+      const reply = await new VerifierClient(clientConfig()).scoreReply("Return A.", { timeoutMs: 20 });
+      expect(reply.positionLogprobs).toHaveLength(1);
+      expect(attempts).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("keeps the startup capability probe single-attempt on timeout", async () => {
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (async (_url: unknown, init: unknown) => {
+      attempts += 1;
+      return await new Promise<Response>((_, reject) => {
+        const abort = () => reject((init as { signal?: AbortSignal }).signal?.reason);
+        if ((init as { signal?: AbortSignal }).signal?.aborted) abort();
+        else (init as { signal?: AbortSignal }).signal?.addEventListener("abort", abort, { once: true });
+      });
+    }) as unknown as typeof fetch;
+    try {
+      let error: unknown;
+      try {
+        await new VerifierClient(clientConfig()).probeLogprobs({ timeoutMs: 20 });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(String(error)).toContain("timed out");
+      expect(attempts).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("retries a transient 500 before parsing verifier logprobs", async () => {
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      if (attempts === 1) return new Response("boom", { status: 500 });
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { content: "A" },
+          finish_reason: "stop",
+          logprobs: { content: [{ token: "A", logprob: -0.1, top_logprobs: [{ token: "A", logprob: -0.1 }] }] },
+        }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    try {
+      const reply = await new VerifierClient(clientConfig()).scoreReply("Return A.");
+      expect(reply.positionLogprobs).toHaveLength(1);
+      expect(attempts).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("does not retry a non-transient verifier error", async () => {
     const originalFetch = globalThis.fetch;
     let attempts = 0;
@@ -2198,7 +2275,7 @@ describe("automatic process-reward provider", () => {
     expect(decisions[0]).toMatchObject({ path: "fallback" });
   });
 
-  test("bounds a many-block candidate trace to the total budget", () => {
+  test("preserves every large candidate text and tool argument block", () => {
     const hugeArgs = { command: "build ".repeat(20_000) }; // ~130k chars
     const giant = "x".repeat(100_000);
     const content: AssistantMessage["content"] = [];
@@ -2218,13 +2295,12 @@ describe("automatic process-reward provider", () => {
       timestamp: 1,
     } as AssistantMessage;
     const serialized = serializeAssistantMessage(candidate);
-    // Per-block (2k) and per-trace (8k, separators included) caps keep one
-    // oversized candidate from blowing up every pairwise verifier prompt.
-    expect(serialized.length).toBeLessThanOrEqual(8_000);
-    expect(serialized).toContain("[truncated]");
+    expect(serialized).toBe(Array.from({ length: 6 }, () =>
+      giant + "\n\n[proposed tool call] bash " + JSON.stringify(hugeArgs),
+    ).join("\n\n"));
   });
 
-  test("keeps many near-cap text blocks within the 8k trace budget", () => {
+  test("preserves candidate text blocks in their original order", () => {
     const cap = 1950; // just under the 2000 per-block cap
     const slabs: Array<string> = [];
     for (let i = 0; i < 20; i++) slabs.push("block-" + i + " " + "y".repeat(cap));
@@ -2240,12 +2316,10 @@ describe("automatic process-reward provider", () => {
       stopReason: "stop",
       timestamp: 1,
     } as AssistantMessage;
-    // 20 blocks at ~1950 chars each would join to ~39k without the total cap;
-    // separators (every join) must count against the 8k budget.
-    expect(serializeAssistantMessage(candidate).length).toBeLessThanOrEqual(8_000);
+    expect(serializeAssistantMessage(candidate)).toBe(slabs.join("\n\n"));
   });
 
-  test("keeps the serialized problem within the 16k input budget", () => {
+  test("preserves the full task and observed results throughout a long session", () => {
     const hugeArgs = { command: "build ".repeat(20_000) }; // ~130k chars
     const giant = "x".repeat(100_000);
     const messages: Context["messages"] = [
@@ -2280,10 +2354,11 @@ describe("automatic process-reward provider", () => {
       });
     }
     const serialized = serializeContext({ ...context(), messages });
-    // Task + trajectory evidence share a hard 16k char budget, so no pair
-    // prompt can exceed it even for a very long session.
-    expect(serialized.length).toBeLessThanOrEqual(16_000);
-    expect(serialized).toContain("... [task truncated]");
+    expect(serialized).toContain(messages[0]!.content as string);
+    expect(serialized.split(giant)).toHaveLength(9);
+    expect(serialized.split(JSON.stringify(hugeArgs))).toHaveLength(9);
+    expect(serialized.split("result ".repeat(50_000))).toHaveLength(9);
+    expect(serialized).not.toContain("let me reason");
   });
 });
 

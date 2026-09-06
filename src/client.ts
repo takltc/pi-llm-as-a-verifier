@@ -20,7 +20,12 @@ export const DEFAULT_OUTPUT_MAX_TOKENS = 4096;
 /** Keep startup capability probing comfortably inside OMP's 30 s extension-handler deadline. */
 export const CAPABILITY_PROBE_TIMEOUT_MS = 10_000;
 const VERIFIER_TRANSIENT_RETRIES = 3;
-const VERIFIER_TRANSIENT_STATUSES = new Set([429, 502, 503, 504]);
+// 500 joins 429/502/503/504: the reference implementation rides the OpenAI SDK
+// transport, whose default retry policy re-issues >=500 responses, so the
+// executable contract retries generic server errors too.
+const VERIFIER_TRANSIENT_STATUSES = new Set([429, 500, 502, 503, 504]);
+/** One extra attempt for a timed-out request; probes never retry (see probeLogprobs). */
+const VERIFIER_TIMEOUT_RETRIES = 1;
 type VerifierHttpError = Error & { status?: number; retryAfterMs?: number };
 export interface VerifierConfig {
   baseUrl: string;
@@ -79,8 +84,8 @@ export function diffUsage(after: UsageSnapshot, before: UsageSnapshot): UsageSna
   };
 }
 
-/** Process-wide, thread-safe verifier token counter (mirrors llm_verifier.USAGE). */
-class TokenUsage {
+/** Counter used both per selection and for process-wide reference-compatible totals. */
+export class TokenUsage {
   calls = 0;
   inputTokens = 0;
   cachedInputTokens = 0;
@@ -117,7 +122,7 @@ interface ParsedPositionLogprobs {
   positionLogprobs: Array<Array<[string, number]>>;
 }
 
-function parsePositionLogprobs(raw: unknown): ParsedPositionLogprobs | undefined {
+function parsePositionLogprobs(raw: unknown, text: string): ParsedPositionLogprobs | undefined {
   if (!Array.isArray(raw) || raw.length === 0) return undefined;
   const tokens: string[] = [];
   const positionLogprobs: Array<Array<[string, number]>> = [];
@@ -128,7 +133,7 @@ function parsePositionLogprobs(raw: unknown): ParsedPositionLogprobs | undefined
       continue;
     }
     const position = rawPosition as Record<string, unknown>;
-    const token = String(position.token ?? "");
+    const token = typeof position.token === "string" ? position.token : "";
     tokens.push(token);
     const alternatives: Array<[string, number]> = [];
     if (Array.isArray(position.top_logprobs)) {
@@ -137,17 +142,37 @@ function parsePositionLogprobs(raw: unknown): ParsedPositionLogprobs | undefined
           continue;
         }
         const alternative = rawAlternative as Record<string, unknown>;
-        const logprob = Number(alternative.logprob);
-        if (!Number.isFinite(logprob)) continue;
-        alternatives.push([String(alternative.token ?? ""), logprob]);
+        const logprob = alternative.logprob;
+        if (typeof logprob !== "number" || !Number.isFinite(logprob) || logprob > 0) continue;
+        if (typeof alternative.token !== "string") continue;
+        alternatives.push([alternative.token, logprob]);
       }
     }
     if (alternatives.length > 0) {
       positionLogprobs.push(alternatives);
       continue;
     }
-    const logprob = Number(position.logprob);
-    positionLogprobs.push(token && Number.isFinite(logprob) ? [[token, logprob]] : []);
+    const logprob = position.logprob;
+    positionLogprobs.push(
+      token && typeof logprob === "number" && Number.isFinite(logprob) && logprob <= 0
+        ? [[token, logprob]] : [],
+    );
+  }
+  if (!positionLogprobs.some((position) => position.length > 0)) return undefined;
+  const joined = tokens.join("");
+  // Some hosted responses omit only the opening '<' of score tags from
+  // token/bytes metadata. Restore those delimiters only when the ENTIRE
+  // answer agrees, retaining every original probability position.
+  if (joined !== text && text.replace(/<(?=score_[AB]>)/g, "") === joined) {
+    let offset = 0;
+    for (let i = 0; i < tokens.length; i++) {
+      const start = offset;
+      for (let j = 0; j < tokens[i]!.length; j++) {
+        if (text.startsWith("<score_A>", offset) || text.startsWith("<score_B>", offset)) offset++;
+        offset++;
+      }
+      tokens[i] = text.slice(start, offset);
+    }
   }
   return { tokens, positionLogprobs };
 }
@@ -319,6 +344,9 @@ export class VerifierClient {
       maxTokens?: number;
       timeoutMs?: number;
       images?: readonly ImageContent[];
+      /** Capability probes stay single-attempt so a timeout cannot breach OMP's handler deadline. */
+      timeoutRetries?: number;
+      usage?: TokenUsage;
     } = {},
   ): Promise<VerifierReply> {
     if (!prompt.trim()) throw new Error("Verifier prompt must be non-empty");
@@ -395,37 +423,61 @@ export class VerifierClient {
       this.applyChatReasoning(body, effort, reasoningEnabled);
     }
 
-    const requestAbort = mergeAbortSignals(opts.signal, opts.timeoutMs ?? 600_000);
-    try {
-      const credential = this.apiKeyResolver ?? (this.keyless ? "N/A" : this.apiKey);
-      const fetchBody = () => withAuth(
-        credential,
-        async (apiKey) => {
-          const endpoint = this.baseUrl + "/" + (responses ? "responses" : "chat/completions");
-          return this.requestJsonWithRetry(endpoint, body, apiKey, requestAbort.signal);
-        },
-        {
-          isAuthError: isAuthRetryableError,
-          signal: requestAbort.signal,
-          missingKeyMessage: "The active OMP model has no usable credentials.",
-        },
-      );
-      let data = await fetchBody();
-      this.recordUsage(data);
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          return responses ? this.parseResponsesReply(data) : this.parseChatReply(data);
-        } catch (error) {
-          if (!isVerifierLogprobsUnsupportedError(error)) throw error;
-          if (error instanceof VerifierLogprobsUnsupportedError && !error.retryable) throw error;
-          if (attempt >= VERIFIER_TRANSIENT_RETRIES) throw error;
-          await waitForRetry(verifierBackoffMs(attempt + 1), requestAbort.signal);
-          data = await fetchBody();
-          this.recordUsage(data);
-        }
+    const timeoutBudget = opts.timeoutRetries ?? VERIFIER_TIMEOUT_RETRIES;
+    let attempt = 0;
+    for (;;) {
+      // Each attempt owns a fresh timeout budget: the previous request already
+      // consumed its whole allowance, so reusing one merged signal would leave
+      // the retry with no time of its own. External aborts still propagate.
+      const requestAbort = mergeAbortSignals(opts.signal, opts.timeoutMs ?? 600_000);
+      try {
+        return await this.scoreReplyOnce(body, requestAbort.signal, opts.usage);
+      } catch (error) {
+        const timedOut = error instanceof DOMException && error.name === "TimeoutError";
+        if (!timedOut || attempt >= timeoutBudget) throw error;
+        attempt += 1;
+        // Wait on the external signal only: this attempt's merged signal is
+        // already aborted (the timeout fired), so it would reject instantly.
+        await waitForRetry(verifierBackoffMs(attempt), opts.signal ?? new AbortController().signal);
+      } finally {
+        requestAbort.dispose();
       }
-    } finally {
-      requestAbort.dispose();
+    }
+  }
+
+  private async scoreReplyOnce(
+    body: Record<string, unknown>,
+    abortSignal: AbortSignal,
+    usage?: TokenUsage,
+  ): Promise<VerifierReply> {
+    const credential = this.apiKeyResolver ?? (this.keyless ? "N/A" : this.apiKey);
+    const fetchBody = () => withAuth(
+      credential,
+      async (apiKey) => {
+        const endpoint = this.baseUrl + "/" + (this.api === "openai-responses" ? "responses" : "chat/completions");
+        return this.requestJsonWithRetry(endpoint, body, apiKey, abortSignal, usage);
+      },
+      {
+        isAuthError: isAuthRetryableError,
+        signal: abortSignal,
+        missingKeyMessage: "The active OMP model has no usable credentials.",
+      },
+    );
+    let data = await fetchBody();
+    this.recordUsage(data, usage);
+    for (let parseAttempt = 0; ; parseAttempt += 1) {
+      try {
+        return this.api === "openai-responses"
+          ? this.parseResponsesReply(data)
+          : this.parseChatReply(data);
+      } catch (error) {
+        if (!isVerifierLogprobsUnsupportedError(error)) throw error;
+        if (error instanceof VerifierLogprobsUnsupportedError && !error.retryable) throw error;
+        if (parseAttempt >= VERIFIER_TRANSIENT_RETRIES) throw error;
+        await waitForRetry(verifierBackoffMs(parseAttempt + 1), abortSignal);
+        data = await fetchBody();
+        this.recordUsage(data, usage);
+      }
     }
   }
 
@@ -441,7 +493,7 @@ export class VerifierClient {
     const logprobs = choice.logprobs as
       | { content?: Array<Record<string, unknown>> }
       | undefined;
-    const parsedLogprobs = parsePositionLogprobs(logprobs?.content);
+    const parsedLogprobs = parsePositionLogprobs(logprobs?.content, text);
     const tokens = parsedLogprobs?.tokens;
     const positionLogprobs = parsedLogprobs?.positionLogprobs;
     if (!positionLogprobs || positionLogprobs.length === 0) {
@@ -470,7 +522,8 @@ export class VerifierClient {
         if (Array.isArray(part.logprobs)) positions.push(...part.logprobs);
       }
     }
-    const parsedLogprobs = parsePositionLogprobs(positions);
+    const text = textParts.join("") || (typeof data.output_text === "string" ? data.output_text : "");
+    const parsedLogprobs = parsePositionLogprobs(positions, text);
     if (!parsedLogprobs || parsedLogprobs.positionLogprobs.length === 0) {
       const status = typeof data.status === "string" ? data.status : "?";
       throw new VerifierLogprobsUnsupportedError(
@@ -478,9 +531,7 @@ export class VerifierClient {
       );
     }
     return {
-      text:
-        textParts.join("") ||
-        (typeof data.output_text === "string" ? data.output_text : ""),
+      text,
       tokens: parsedLogprobs.tokens,
       positionLogprobs: parsedLogprobs.positionLogprobs,
     };
@@ -495,6 +546,9 @@ export class VerifierClient {
       ...opts,
       maxTokens: opts.maxTokens ?? 1024,
       timeoutMs: opts.timeoutMs ?? CAPABILITY_PROBE_TIMEOUT_MS,
+      // A probe timeout must surface immediately so the 60 s retry loop stays
+      // inside OMP's extension-handler deadline; only scoring retries timeouts.
+      timeoutRetries: 0,
     });
   }
   private requestHeaders(apiKey: string): Record<string, string> {
@@ -515,6 +569,7 @@ export class VerifierClient {
     body: Record<string, unknown>,
     apiKey: string,
     signal: AbortSignal,
+    usage?: TokenUsage,
   ): Promise<Record<string, unknown>> {
     const secrets = [
       apiKey,
@@ -526,6 +581,9 @@ export class VerifierClient {
     // and transient-status retries must not re-stringify the same body.
     const bodyText = JSON.stringify(body);
     for (let attempt = 0; attempt <= VERIFIER_TRANSIENT_RETRIES; attempt += 1) {
+      signal.throwIfAborted();
+      USAGE.add();
+      usage?.add();
       const res = await fetch(endpoint, {
         method: "POST",
         headers: this.requestHeaders(apiKey),
@@ -558,6 +616,7 @@ export class VerifierClient {
         }
         return parsed as Record<string, unknown>;
       } catch (error) {
+        signal.throwIfAborted();
         const detail = error instanceof Error ? error.message : String(error);
         throw new Error("Verifier API returned invalid JSON: " + detail);
       }
@@ -632,7 +691,7 @@ export class VerifierClient {
     }
   }
 
-  private recordUsage(data: Record<string, unknown>): void {
+  private recordUsage(data: Record<string, unknown>, counter?: TokenUsage): void {
     const usage = data.usage as
       | {
           prompt_tokens?: number;
@@ -657,12 +716,11 @@ export class VerifierClient {
     const reasoning =
       numberOrZero(usage.completion_tokens_details?.reasoning_tokens) ||
       numberOrZero(usage.output_tokens_details?.reasoning_tokens);
-    USAGE.add(
-      numberOrZero(usage.prompt_tokens ?? usage.input_tokens),
-      cached,
-      numberOrZero(usage.completion_tokens ?? usage.output_tokens),
-      reasoning,
-    );
+    const input = numberOrZero(usage.prompt_tokens ?? usage.input_tokens);
+    const output = numberOrZero(usage.completion_tokens ?? usage.output_tokens);
+    cached = Math.min(cached, input);
+    USAGE.add(input, cached, output, reasoning, 0);
+    counter?.add(input, cached, output, reasoning, 0);
   }
 }
 

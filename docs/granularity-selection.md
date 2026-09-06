@@ -4,6 +4,20 @@
 
 ## 结论
 
+### 2026-09-05 默认选择：关键动作批次 PRM
+
+当前插件选择的可交付默认是**一次完整动作批次，而非每个工具调用**：观测阶段使用 `N_t=1`；同一 assistant response 内的多个独立声明式编辑/工具调用作为一个候选批次，只进行一次选择，再执行胜出批次。默认保留 `N=3、PPT pivots=2、C=1、K=1、G=20`。同一决策下互不依赖的编辑可以组合；依赖前一步工具结果的动作必须等真实观测返回后再决定。
+
+这在现有 provider 接入点保留执行前选择能力，不需要每个文件/每个 tool call 单独评审，也不声称能比较已经在同一工作区执行过的不同代码版本。代码已按整条 response 分类、选择和回放；本轮用 `test/granularity.test.ts` 固定观测免评审、多工具只选一次及混合批次边界。回放测试的请求减少仅证明计算调度，不是任务通过率或真实时延的消融结果。
+
+论文的理论边界必须分开：§2 与 Appendix B.3 支持动作/轨迹前缀的 PRM；§4 的延迟预算调节直接讨论 G/K/C，不能据此声称阶段间隔已经被实验验证；§6 TurboAgent 是每请求 fan-out；作者 `checkpoint_steps` 是已有轨迹的进度观测，并不提供可互换的阶段候选。这里的观测/关键批次调度是明确的 Coding Agent 工程选择，没有论文证明的普遍“最佳”粒度。[固定论文 v2](https://arxiv.org/html/2607.05391v2)
+
+暂不采用“先执行所有编辑，到阶段末再生成三条总结”的方案：它只能选择总结，不能改变已经落盘的实现。要真正比较多步实现阶段，需要从同一初始状态建立隔离工作区、分别执行候选和测试，再接纳 winner；这是新的执行架构，当前插件不冒充已支持。
+
+实际延迟还受验证器推理预算影响：本轮一例自动选择共用 20,958 个输出 token（其中 20,603 为 reasoning），整条决策耗时 122.566 秒。粒度优化不能让昂贵模型检查点自动变成实时交互；本轮保留用户模型与显式推理配置，没有以降低推理强度替代粒度控制。完整记录见 [真实运行验证](runtime-validation-2026-09-05.md)。
+
+### 原研究结论与推导
+
 本插件推荐采用**按影响面触发的稀疏 PRM 检查点**：纯本地观测步骤使用单候选 `N_t=1`；代码/工作区写入、命令执行、外部副作用、控制流提交和终态回复使用用户配置的 `N` 个候选（当前产品约束为 `2..8`）并在执行前完成精确多数决或 PPT。验证对象必须是共同的已选轨迹前缀 `h_t` 加候选动作 `a_t^i`，即 `h_t ⊕ a_t^i`。读文件、搜索和检查输出留在 `h_t` 中，后续检查点据此判断写入或结论是否得到真实证据支持。
 
 这个方案的奖励范围属于论文的 PRM。操作类型路由属于工程侧计算分配策略；论文 Appendix B.3 直接验证了逐步 PRM 以及每步候选数 `1/3/5/9`，作者代码直接支持选择轨迹 checkpoint，论文尚未给出“按 OMP 工具影响面动态选择 `N_t`”的消融结果。实现和文档应使用“PRM checkpoint scheduling”描述它，避免创造新的奖励模型粒度。
@@ -54,9 +68,9 @@ TurboAgent 官方代码对每个模型配置读取 `num_candidates`，据此建�
 - `p`：PPT pivot 数，避免与论文 Appendix B.3 的 sampled-actions `k` 混淆；
 - `C`、`K`：公式 (3.1) 的标准数和重复数；
 - `T`：一条 coding-agent 轨迹的模型步骤数；
-- `Q(N,p)=N+p(N-p)+p(p-1)/2`：论文给出的 PPT pair 数。
+- `Q(N,p)=N+p(N-p)+p(p-1)/2`：论文正文给出的 PPT pair 数上界；Algorithm 1 的实际数 `L` 还要扣除有向 ring 与 pivot pair 集的交集。
 
-PPT pair 数来源于论文 §3.2，完整流程见 Appendix B.2 Algorithm 1；每个 pair 的每个 criterion/repeat 在作者实现中独立调用 verifier，因此 score cache 之前的 verifier 请求量为 `Q(N,p)·C·K`。[论文 §3.2、Appendix B.2 Algorithm 1](https://arxiv.org/html/2607.05391v2)；HTML 第 155–168、434–476 行；`_ref/llm_verifier/fine_grained_reward.py:812-829`、`:838-856`。`Q` 只统计 verifier pair，候选生成另行计费。
+PPT pair 数来源于论文 §3.2，完整流程见 Appendix B.2 Algorithm 1；每个 pair 的每个 criterion/repeat 在作者实现中独立调用 verifier，因此无重试、无 score cache 时的 verifier 请求量为 `L·C·K ≤ Q(N,p)·C·K`。[论文 §3.2、Appendix B.2 Algorithm 1](https://arxiv.org/html/2607.05391v2)；HTML 第 155–168、434–476 行；`_ref/llm_verifier/fine_grained_reward.py:812-829`、`:838-856`。`Q` 只统计 verifier pair，候选生成另行计费。
 
 ### 2.1 ORM：最终结果级 Best-of-N
 

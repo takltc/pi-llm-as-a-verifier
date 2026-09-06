@@ -8,9 +8,11 @@
 
 论文定义 ORM（结果奖励模型）、PRM（过程奖励模型）和 TRM（轨迹奖励模型）三种奖励范围。本插件在交互式 coding agent 路径选择 PRM，并在高影响检查点应用 20 级 token logprob 评分和 Probabilistic Pivot Tournament。每一步先采样一个动作：所有调用都属于经过审计的 OMP 观测工具时，该步骤直接使用这一个样本；终态回复以及状态提交、控制流提交、`write`、`exec`、未知、格式异常或无法分类的工具动作会扩展至 `candidateCount` 个总样本，范围为 2–8、默认值为 3，随后通过精确多数决或 PPT 选择 winner。agent loop 只会执行被选中的高影响工具动作。
 
-这套边界属于论文的 PRM 方案，并采用自适应采样预算。论文 Appendix B.3 对逐步动作采样的 `k=1,3,5,9` 做了实验，§4 明确把验证计算量作为可按下游延迟预算调节的参数；OMP 参数级 approval tier 与经过审计的 effect adapter 共同确定产品检查点。按操作影响面路由是 PRM 内部的工程调度策略，其收益与论文报告结果分开测量。验证器算法、20 级 token-logprob 期望和 PPT 均保持论文语义。来源见[论文](https://arxiv.org/html/2607.05391v2)、[粒度选择研究](docs/granularity-selection.md)和[理论基线](docs/theory-baseline.md)。
+这套边界属于论文的 PRM 方案，并采用自适应采样预算。论文 Appendix B.3 对逐步动作采样的 `k=1,3,5,9` 做了实验，§4 讨论按延迟预算调节 G/K/C 评分轴，并未证明某种检查点间隔最优；OMP 参数级 approval tier 与经过审计的 effect adapter 共同确定产品检查点。按操作影响面路由是 PRM 内部的工程调度策略，其收益与论文报告结果分开测量。验证器算法、20 级 token-logprob 期望和 PPT 均保持论文语义。来源见[论文](https://arxiv.org/html/2607.05391v2)、[粒度选择研究](docs/granularity-selection.md)和[理论基线](docs/theory-baseline.md)。
 
 版本化来源、形式化不变量、产品边界和防漂移门禁记录在 [docs/theory-baseline.md](docs/theory-baseline.md)。
+
+Coding Agent 的推荐粒度是**关键动作批次 PRM**：读、搜等观测不扩展候选；一条回复里的整组声明式编辑/工具调用只选择一次，再回放完整胜出批次。依赖前一步输出的操作保持下一决策边界；不会按固定步数跳过验证，也不会把事后挑选总结当作挑选代码实现。默认 `N=3、pivots=2、C=K=1、G=20`；完整依据及调用量对照见[粒度选择](docs/granularity-selection.md)。
 
 ## OMP 安装与使用
 
@@ -60,6 +62,10 @@ omp plugin enable omp-llm-verifier
 OMP 的 `--max-time` 是整个 agent loop 的绝对截止时间，候选生成与 PPT 共享这份总预算。普通交互会话省略该参数时，agent deadline 保持未设置状态。高思考强度的 headless/CI 运行应给完整的多轮 action 留足预算，例如 `--max-time 15m`；插件的单次验证 HTTP 上限为 10 分钟，同时服从 OMP 的会话取消信号。
 
 已验证的比较结果会缓存在项目根目录的 `.omp-llm-verifier-cache.json`，缓存键覆盖任务、有序共享图片、候选专属图片、两个候选轨迹、评分标准、模型和 prompt 版本的内容指纹，因此相同内容的重复验证不消耗验证器 token。该文件可以直接删除，建议加入 gitignore。
+
+缓存写入复用 OMP 的原生进程锁，在锁内合并并原子替换文件；进程异常退出会自动释放锁。升级前应停止旧版 OMP 会话。如果提示旧 `.lock` 目录，确认旧写入进程停止后再清理该目录；程序不会自动删除它。原生锁使用的 `.lock` 文件应保留，不要在运行中删除。缓存版本 7 会重新评分旧键，以排除旧版非法概率解析产生的结果。
+
+验证器保留完整可见用户消息、动作、工具结果及候选内容，不按字符数静默截断。超出服务端上下文限制时按显式错误或降级处理。`usage.calls` 统计本次选择实际发起的 HTTP 尝试（包含重试及缺少 usage 的响应）；token 数只累加服务端返回的用量，并发选择相互隔离。
 
 每个过程步骤都有可观测遥测：OMP 控制台会针对每次 coding-agent 模型请求输出一行
 `event:decision` JSON，包含 `granularity=prm` 与 `path`（`single`

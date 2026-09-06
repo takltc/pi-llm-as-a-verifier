@@ -626,3 +626,98 @@ describe("theory-gate cache identity and aggregation invariants", () => {
     }
   });
 });
+
+describe("scoreDirectedPairs prefix-dependency scheduling", () => {
+  // Deterministic microtask drain: every scheduler transition between a gate
+  // release and the next observation runs through a bounded promise chain.
+  const flush = async (): Promise<void> => {
+    for (let round = 0; round < 20; round += 1) await Promise.resolve();
+  };
+
+  const gatedReply = (a: string, b: string): VerifierReply => ({
+    text: `<score_A> ${a} </score_A>\n<score_B> ${b} </score_B>`,
+    tokens: ["<score_A>", ` ${a}`, " </score_A>\n<score_B>", ` ${b}`, " </score_B>"],
+    positionLogprobs: [
+      [["<score_A>", 0]],
+      [[a, 0]],
+      [[" </score_A>\n<score_B>", 0]],
+      [[b, 0]],
+      [[" </score_B>", 0]],
+    ],
+  });
+
+  test("a follower starts once its own prefix head settles, before other heads finish", async () => {
+    const traces = ["t0", "t1", "t2"];
+    const tasks = {
+      task: traces.map((trace, index) => ({
+        trialName: `c${index}`,
+        reward: 0 as const,
+        problem: "p",
+        trace,
+      })),
+    };
+    const criteria = [
+      { id: "alpha", name: "Alpha", description: "alpha criterion" },
+      { id: "beta", name: "Beta", description: "beta criterion" },
+    ];
+    const calls: string[] = [];
+    const release: Record<string, () => void> = {};
+    const gatePromises: Record<string, Promise<void>> = {};
+    for (const key of ["t0|t1", "t1|t2"]) {
+      let open!: () => void;
+      const promise = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+      release[key] = open;
+      gatePromises[key] = promise;
+    }
+    const client = {
+      provider: "prov",
+      api: "openai-completions",
+      model: "m",
+      effort: "off",
+      maxTokens: 4096,
+      baseUrl: "https://example.test/v1",
+      requestIdentity: "id",
+      supportsImages: true,
+      scoreReply: async (prompt: string) => {
+        const a = /Trajectory A:\*\*\n(\S+)/.exec(prompt)?.[1] ?? "?";
+        const b = /Trajectory B:\*\*\n(\S+)/.exec(prompt)?.[1] ?? "?";
+        calls.push(`${a}|${b}:${prompt.includes("Alpha") ? "alpha" : "beta"}`);
+        await gatePromises[`${a}|${b}`];
+        return gatedReply("A", "T");
+      },
+    } as unknown as VerifierClient;
+
+    const run = scoreDirectedPairs(
+      client,
+      tasks,
+      { task: [[0, 1], [1, 2]] },
+      criteria,
+      "note",
+      1,
+      4,
+      undefined,
+      { progress: false },
+    );
+    await flush();
+    // Only the two unique-prefix heads run initially; each follower waits on
+    // its own prefix rather than a global warm barrier.
+    expect(calls).toEqual(["t0|t1:alpha", "t1|t2:alpha"]);
+
+    release["t1|t2"]!();
+    await flush();
+    // The freed prefix's follower starts even though the other head still waits.
+    expect(calls).toEqual(["t0|t1:alpha", "t1|t2:alpha", "t1|t2:beta"]);
+
+    release["t0|t1"]!();
+    const scores = await run;
+    expect(calls).toEqual(["t0|t1:alpha", "t1|t2:alpha", "t1|t2:beta", "t0|t1:beta"]);
+    expect(Object.keys(scores)).toHaveLength(4);
+    for (const entry of Object.values(scores)) {
+      expect(entry.source_A).toBe("logprobs");
+      expect(entry.score_A).toBe(1);
+      expect(entry.score_B).toBe(0);
+    }
+  });
+});

@@ -207,11 +207,11 @@ function scoreFromPosition(
   const probs: Record<number, number> = {};
   if (position) {
     for (const [tokStr, logprob] of position) {
-      if (!Number.isFinite(logprob)) continue;
+      if (!Number.isFinite(logprob) || logprob > 0) continue;
       let tok = tokStr.trim();
       if (tok.startsWith(">")) tok = tok.slice(1).trim();
       const raw = LETTER_VALUES[tok];
-      if (raw !== undefined) {
+      if (typeof raw === "number") {
         const probability = Math.exp(logprob);
         if (Number.isFinite(probability) && probability > 0) {
           probs[raw] = Math.max(probs[raw] ?? 0, probability);
@@ -252,7 +252,7 @@ function scoreFromPosition(
         }
       }
     }
-    if (raw !== undefined) {
+    if (typeof raw === "number") {
       return {
         score: normalize(raw),
         source: "text_fallback",

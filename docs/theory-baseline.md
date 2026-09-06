@@ -46,7 +46,7 @@ TurboAgent 的 per-request fan-out 是 coding-agent 部署 seam，评分范围�
 1. 每个 coding-agent 步骤先生成一个 proposal。proposal 只包含经审计的 OMP 观测工具时，本步骤使用 PRM 的 k=1 基线并直接执行；该路径不触发 candidate warning、插件 working 文案或 verifier 请求。
 2. 终态回复与任一状态/控制提交、`write`、`exec`、未知工具、未分类 read-tier 工具、缺失工具或 approval 解析异常构成高影响检查点。插件随后补充生成 N-1 个候选，使总样本数达到 N=`candidateCount`（2–8，默认 3）。
 3. OMP 的参数级 approval tier 与受测试的 effect adapter 共同确定动作影响：动态本地 read/grep、LSP 查询、只读 debug/GitHub/computer 与 job list/logs 等保持观测语义；SSH read 等由 OMP 归入 `exec`；ask/yield/checkpoint/rewind/todo/长期记忆提交及 worker cancel/send 等 read-tier 控制工具进入检查点；省略 approval 的工具按 OMP 契约归入 `exec`。
-4. 高影响检查点采用 TurboAgent 的精确动作多数决，剩余分歧进入 G=20 的 PPT。在线默认 k=2、K=1、C=1；工具调用 ID 不进入动作身份，工具名与参数进入身份。
+4. 高影响检查点采用源自 TurboAgent 的严格多数条件，并按 OMP 结构动作身份计数（具体兼容差异见 §6）；剩余分歧进入 G=20 的 PPT。在线默认 k=2、K=1、C=1；工具调用 ID 不进入动作身份，工具名与参数进入身份。
 5. proposal 完成后才并发派发 N-1 个额外样本。该调度保持相同采样分布和候选总数，并先预热完整消息历史、工具 schema、session ID、prompt-cache key 与 provider session state 形成的公共前缀。
 6. `granularity=prm` 标识 PRM，`path=single` 标识 k=1 观测步骤；`sampledCandidates` 与 `checkpointReason` 公开真实计算量和调度原因。
 7. effect-gated 检查点策略是 OMP 场景的产品映射。论文为 PRM、可调 sampled actions 和 PPT 提供理论与实验依据；该策略的端到端收益由插件 benchmark 与真实 OMP 运行数据验证。
@@ -73,6 +73,8 @@ p_\theta(v_g\mid x,c,\tau,r)\,\phi(v_g).
 3. 作者实现从服务端返回的候选 token 中筛选有效 A–T，执行 `exp(logprob)`，再按有效评分 token 的已返回概率质量归一化并求期望。[作者实现 L621–668](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L621-L668)
 4. `top_logprobs=20` 是传输上限配置，服务端可能返回少于请求数量的候选，且返回列表还可能包含 A–T 之外的 token。因此实现需要记录有效评分 token 数量与概率质量，缺失有效支持时进入显式降级路径。[OpenAI Chat Completions 官方规范](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)；[DeepSeek Chat Completions 官方规范](https://api-docs.deepseek.com/api/create-chat-completion/)
 
+兼容边界：作者固定实现对映射到同一数值的大小写、空白等 token 别名取最大概率，而不是累加不同 token 的概率；本插件保持该规则。这里的期望是对返回且按别名去重的有效概率质量归一化后的兼容估计，不保证完整词表或全部 20 级的精确期望。`paperEquivalent=true` 表示全部评分走该 logprob/PPT 契约，不能代替 `scoreDistribution` 的支持数与概率质量检查。[作者 `extract_score`](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/8db8a114355a9d7fdf9a8d1d5c87f6aeebd18770/llm_verifier/fine_grained_reward.py)
+
 ### 3.2 C、K、G 的语义
 
 | 轴 | 固定语义 | 可调范围与证据 |
@@ -94,12 +96,18 @@ p_\theta(v_g\mid x,c,\tau,r)\,\phi(v_g).
 
 上述行为来自[作者提取实现 L621–668](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L621-L668)。
 
+本插件另有一项服务商传输兼容处理：本轮真实响应中，正文包含完整 `<score_A>`/`<score_B>`，但 token/bytes 元数据遗漏其开头的 `<`。仅当“正文移除这些明确开标签的 `<`”与全部 token 拼接结果严格相等时，客户端才将字符恢复至相应 token 文本；token 数量、概率数组和位置索引全部保持不变。已完整的 token 不改写，跨 token 或同 token 的标签按原位置恢复，其他缺文不做猜测并保留显式降级来源。这是传输元数据对齐，未改评分字母或概率值，不使用模糊标签匹配。Chat/Responses fixture 覆盖整体一致与额外缺文；真实响应证据见[本轮运行验证](runtime-validation-2026-09-05.md)。
+
+概率输入仅接受有限且不大于零的数值 logprob；空值、布尔值、字符串和正值不转成概率。若所有位置均无有效分布，Chat/Responses 能力探测必须拒绝；部分空位置保留索引并由评分来源标记处理。评分尺度仅接纳自身的数值映射，`constructor` 等继承属性不能进入奖励计算。
+
 A/B 偏差由两层机制控制：
 
 1. PPT ring 是随机有向 Hamiltonian cycle，每个候选恰好一次处于 A、一次处于 B，位置偏差在环上平衡。[论文 §3.2，pp. 6–7](https://arxiv.org/pdf/2607.05391#page=6)
 2. 作者实现按重复编号交替位置：偶数重复使用 `(a,b)`，奇数重复交换 prompt slot，再把结果映射回候选身份。K≥2 时，同一个有向比较也获得位置平衡。[作者实现 L748–758、L796–910](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L748-L758)
 
 缓存键必须保留方向、criterion、任务、重复编号、模型、prompt/scale 版本及影响输入语义的上下文摘要。`(a,b)` 与 `(b,a)` 是不同实验条件。失败调用产生的 0.5/0.5 只服务当前运行，持久缓存保持成功观测集合。[作者实现 L757–811、L826–910](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L757-L811)
+
+当前缓存身份版本为 `CACHE_VERSION=7`，旧版本评分键不能命中新版本观测。磁盘写入使用 OMP 原生 OS 锁，在规范化父目录对应的同一锁身份内读取、合并、原子替换；进程退出释放所有权，旧目录锁不自动删除，升级时不可混跑旧锁协议的进程。每次 `select`/`runBenchmark` 独立持有用量计数器，ring/pivot 共用本次计数；每次实际 HTTP 派发均计入 calls（包括重试与未返回 usage 的响应），只累计服务商实际返回的 token 数，不以全局计数差计算并发请求成本。没有返回的 usage 不被臆测为已知计费量。
 
 ## 5. Probabilistic Pivot Tournament
 
@@ -169,12 +177,15 @@ TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确�
 - 高影响检查点的候选采样相互独立，并共享相同任务、前置证据、工具 schema 和缓存身份。候选请求关闭 server-side turn chaining，保留 session/prompt cache affinity，并使用 TurboAgent 的 temperature=1 默认采样温度。
 - 每个步骤先完成 proposal。OMP 参数级 approval tier 与 effect adapter 只将已知无状态的 `read` 调用归为观测步骤；终态、read-tier 状态/控制提交、未分类扩展工具、`write`、`exec`、未知或解析异常调用归为高影响检查点。混合工具批次按最高影响 effect 处理。
 - 同一在线 PPT 的候选处于同一个 PRM 检查点；工具调用、代码相关动作文本和终态回复统一进入选择。胜出响应保留原始 tool-call ID 与 provider payload，agent loop 只看到这一条响应。
-- 精确动作多数决使用序列化后的可见文本、工具名和工具参数；provider 生成的调用 ID 不影响一致性判断。多数决采用独立 `path=majority`，PPT 的 `paperEquivalent` 指标保持独立。
+- 精确动作多数决使用 OMP 的结构身份：保留 `stopReason`、内容块类型与顺序、完整可见文本、工具名与参数、图片 MIME 与载荷；递归排序对象键，数组顺序不变，调用 ID 与 reasoning 不进入身份。文本伪造的工具标记不等于真实工具调用，不同结束状态不能合票。OMP 已解析 JSON 参数，因此对象键顺序被规范化，这是本插件明确的等价关系；TurboAgent 对原始参数字符串计数，不具备该规范化，两者并非字节级 parity。多数条件仍为严格超过半数，采用独立 `path=majority`，不混入 PPT 的 `paperEquivalent` 指标。
+- 验证证据使用按时间顺序的完整可见 user/assistant/tool-result 内容，以及完整候选文本与工具参数；不再按固定字符预算截断。图片按共享与候选 A/B 归属单独传递，reasoning 不作为正常可见轨迹。system prompt 与工具 schema 仍仅用于候选生成，不作为这份可见证据；此范围不等于 generator 的全部条件信息。若实际 verifier 上下文窗口不足，应显式走错误/降级路径，不能静默切掉证据冒充完整验证。
 - no-logprobs 电路断路：同一选择内所有评分 job 共享同一请求形态，前 2 个独立 job 均以 logprobs 不支持失败（各自已耗尽客户端内部重试）后，未启动的 job 直接进入运行期 0.5 平局、不再发起 provider 调用；平局不持久化，`paperEquivalent` 保持 false。属于成本护栏，不改动 Eq. (3.1) 期望、PPT pair 集或失败语义。
-- 缓存写入节流：一个阶段内部最多约 5 次中间 checkpoint 落盘加末尾一次，避免把每次评分完成都变成同步锁+fsync 重写；崩溃最多丢失最近一小批分数。
+- 前缀依赖调度：共享 provider prompt-cache 前缀的评分任务在该前缀首个请求完成后再启动（provider 只能从已完成的响应中命中缓存前缀），不同前缀之间互不等待；每组只指定一个先行任务，后续任务等待其结束；实际缓存冷热取决于服务商与该请求结果。该调度只改变请求的启动时机，观测集合、缓存身份与三类成本计数零改动。相比旧的两阶段 warm/rest 全局屏障（所有 follower 等待全部 head 完成），在 head 时延存在方差时消除相位尾部空转（本轮以调度顺序与并发上限测试验证，不将历史模拟时延作为本轮实测收益）。
+- 缓存写入节流：每次评分调度最多约 5 次中间 checkpoint 落盘加末尾一次，避免把每次评分完成都变成同步锁+fsync 重写；崩溃最多丢失最近一小批分数。
 - 全缓存命中跳过落盘：`scoreDirectedPairs` 以脏标记跟踪本阶段新产生的持久分数；全部评分命中缓存时，末尾的锁+fsync 全文件重写被整体跳过（磁盘内容本就与内存一致），中间 checkpoint 同样只在脏标记置位后落盘，中性平局仍保持运行期作用域。图片指纹按 trials 数组引用做 WeakMap 记忆化、候选多数决身份串在候选收集期按候选索引只序列化一次并跨边界复用于精确多数决（身份恒含可见文本、工具名/参数与图片载荷；行为测试钉定不同截图必须进入 PPT 而非伪多数决）、verifier 请求体在瞬态重试间只序列化一次：三者均为位等价纯性能护栏，缓存身份、Eq. (3.1)、PPT pair 集与失败语义零改动。
 - 插件把 K（`nEvaluations`，1–16）与 k（`pivots`，1–8）暴露为在线配置项，默认 K=1、k=2。K 是论文 §4.2 的质量/成本轴，k 是论文 §3.2 的 PPT 参数；上调后按论文语义增加验证计算。`k` 在运行时按候选数 `min(k,N)` 收敛。
 - 候选生成 transient 重试（工程护栏）：每个候选在 provider 瞬时故障（可重试状态或等价错误）时重试一次，等待时间按候选索引错开并顺从外部分流 `signal` 的 abort；重试是同一候选索引的新独立采样，采样分布与关闭 server-side turn-chaining 的 side-channel 语义不变，`successfulCandidates` 仍按成功候选数上报。护栏不掉 `temperature=1`、不改变 Eq. (3.1) 期望与 PPT pair 集，只扩充失败容错路径。
+- 评分请求超时重试（工程护栏）：verifier 评分请求在整次尝试超时（TimeoutError）后获得一次额外尝试（退避 250 ms），每次尝试独立持有完整 timeout 预算，等待与重试顺从外部分流 `signal` 的 abort；瞬态状态码集合同时纳入 500——作者实现经由 OpenAI SDK 传输，其默认重试策略本就重发 ≥500 响应，可执行契约因此包含通用服务端错误重试。超时与 500 都是此前直接落入运行期中性平局的降级源；重试耗尽仍走原有运行期中性平局，平局不持久化、`paperEquivalent` 保持 false 的语义零改动，Eq. (3.1) 期望、PPT pair 集与缓存身份不受影响。能力探测路径保持单次尝试：探测超时必须立即浮出，以守住 OMP 30 秒扩展 handler 期限和 60 秒重探循环。
 - 能力探测时序（生命周期护栏）：启动期 logprobs 能力探测使用 `CAPABILITY_PROBE_TIMEOUT_MS=10_000` 超时，为 OMP 30 秒扩展 handler 期限留下充裕余量；探测只作绑定判断，不影响评分请求形态或 Eq. (3.1) 期望。
 - proposal 前缀预热（工程延迟/成本护栏）：proposal 完成后再并发启动 N-1 个高影响候选。所有调用保留相同 prompt-cache identity，因此 proposal 的已完成请求可预热公共 coding-context 前缀；候选总数和后续多数决/PPT 语义保持一致。
 - 候选多数即决（工程延迟/成本护栏）：额外候选 fan-out 采用竞速收集，并把已完成 proposal 纳入计数；某动作的严格多数不可逆（`count > N/2`）时，立即结束等待并通过私有信号取消剩余在途候选，随后按多数决回放胜者。剩余候选的生成结果被丢弃、不进入 `successfulCandidates`，决策以 `discardedCandidates` 遥测报告取消数量。多数行动作唯一，剩余候选无法改变该判定，因此胜者与等待全部 N 个候选的结果一致；外部 `signal` 的 abort 语义与 PPT 路径保持不变。
@@ -203,7 +214,7 @@ TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确�
 | INV-10 | `N+k(N-k)+C(k,2)` 是比较数上界；精确计数扣除 ring 与原始 pivot edge 集的有向交集。N=3、k=1 固定为 4，N=3、k=2 为 4–5。 | 多组 N/k/ring 验证集合差与上界；离线与在线配置均固定调用计数；另报 unique keys/provider calls。 | [论文 §3.2，p. 7](https://arxiv.org/pdf/2607.05391#page=7)；[Appendix B.2，Algorithm 1，p. 27](https://arxiv.org/pdf/2607.05391#page=27) |
 | INV-11 | 真实 verifier 路径必须取得 token logprobs；文本字母回退、空支持和解析失败进入显式来源统计。论文等价决策要求全部 score tag 来自 logprob 期望，并记录有效 A–T 支持数与返回概率质量。 | Chat/Responses/DeepSeek/Vertex 响应契约 fixture；断言 `scoreSources`、`scoreDistribution` 与 `paperEquivalent`，使文本回退和中性平局排除在论文等价统计之外。 | [Appendix B.6，pp. 30–31](https://arxiv.org/pdf/2607.05391#page=30)；[OpenAI Chat](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)；[DeepSeek](https://api-docs.deepseek.com/api/create-chat-completion/)；[Vertex GenerationConfig](https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1beta1/GenerationConfig) |
 | INV-12 | pair、criterion、rep、模型、prompt/scale、任务证据、图片摘要和方向共同决定缓存身份；缓存项携带评分来源，失败平局保持运行期作用域。 | 缓存碰撞测试、方向测试、版本失效测试、来源持久化测试、失败后重试测试。 | [作者实现 L748–811、L862–910](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L748-L811) |
-| INV-13 | 候选携带可判断任务完成度的证据；图片输入在候选与 verifier 条件中保持一致。 | 证据截断标记、图片顺序/摘要测试、能力前置校验。 | [论文 §3.1–§3.2，pp. 4–5](https://arxiv.org/pdf/2607.05391#page=4)；[作者实现 L403–447、L696–745](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L403-L447) |
+| INV-13 | 候选携带可判断任务完成度的完整可见证据；图片输入在候选与 verifier 条件中保持一致。 | 超长任务/工具结果/候选尾部保留、图片顺序/摘要测试、能力前置校验。 | [论文 §3.1–§3.2，pp. 4–5](https://arxiv.org/pdf/2607.05391#page=4)；[作者实现 L403–447、L696–745](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L403-L447) |
 | INV-14 | 每个 coding-agent 步骤先采样一个 proposal；只有全部工具同时满足 OMP `read` tier 与受审计 observation effect 时使用 PRM 单样本路径。终态、read-tier 状态/控制提交、未分类工具、`write`/`exec`/未知或解析异常动作扩展至配置 N。 | 静态与参数级动态 approval fixture；本地 read、SSH read、ask、未分类 extension tool、approval error、未知工具、终态、混合批次；断言观测路径 1 次 generator、0 次 verifier、无 degraded warning与插件 working 文案，并记录 `path=single`。 | [论文 §2](https://arxiv.org/html/2607.05391v2#S2)；[论文 §4](https://arxiv.org/html/2607.05391v2#S4)；[Appendix B.3 PRM](https://arxiv.org/html/2607.05391v2)；[OMP effect 映射研究](granularity-selection.md#42-哪些操作进入验证边界) |
 | INV-15 | 高影响检查点的首个 proposal 完成后并发启动 N-1 个额外候选；所有样本共享完整上下文与 prompt-cache 身份，随后统一进入严格多数决/PPT，agent loop 只接收 winner。side-channel 候选关闭 turn chaining/cache-refresh ownership；生成期原生工具执行在采样前终止。 | proposal/额外候选双屏障、总样本数 2–8、session/cache identity、temperature、cache refresh ownership、全工具候选、混合 stop reason、胜出 tool-call 回放、`execHandlers` 零调用；严格多数提前结束仍选同一 winner。 | [论文 Appendix B.3](https://arxiv.org/html/2607.05391v2)；[论文 §6 Coding Agent Extension](https://arxiv.org/html/2607.05391v2)；[TurboAgent `_gather_completions`](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py#L146-L176) |
 
@@ -223,7 +234,7 @@ TurboAgent 的参考在线配置使用 N=3、k=2、K=1、C=1，并开启精确�
 | 混用在线与离线默认值 | Bo3 self-verification 使用 N=3、k=1、K=2；本插件在线路径使用 N=2–8（默认 3）、k=2、K=1、C=1。配置、criteria 与遥测分别标记来源。 | [作者 Bo3 脚本](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/scripts/run_bo3.py)；[TurboAgent 配置](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo-agent.yaml) |
 | 丢失完整轨迹、终端输出或图片证据 | verifier 的条件信息发生变化，候选正确性可能无法识别。截断策略应保留最终验证证据并输出截断遥测。 | [论文 §3.1–§3.2，pp. 4–5](https://arxiv.org/pdf/2607.05391#page=4)；[作者 loader L155–184](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/loaders.py#L155-L184) |
 | 持久化失败调用生成的 0.5 平局 | 暂时性接口故障会固化为未来评分证据。失败 tie 仅用于当前运行，并允许后续重试。 | [作者实现 L796–910](https://github.com/llm-as-a-verifier/llm-as-a-verifier/blob/115de305f23ed89bc42e86e010853c40059f3f7d/llm_verifier/fine_grained_reward.py#L796-L910) |
-| 对近似文本或语义相似动作使用多数决 | TurboAgent 只接受序列化动作的严格字符串多数；扩大等价关系会改变捷径的错误边界。动作身份固定为可见文本、工具名与参数，调用 ID 作为传输元数据。 | [TurboAgent `_try_majority_voting`](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/verifier/verifier.py#L163-L185)；[TurboAgent `format_action`](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py#L314-L325) |
+| 对近似文本或语义相似动作使用多数决 | TurboAgent 使用原始动作字符串；本插件仅按 §6 的结构身份规范化对象键，保留块类型、顺序与结束状态。不使用文本相似度，不把自然语言工具标记当作调用。 | [TurboAgent `_try_majority_voting`](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/verifier/verifier.py#L163-L185)；[TurboAgent `format_action`](https://github.com/llm-as-a-verifier/TurboAgent/blob/eeb61be9cb618ea9c52262cebf15092e7c185146/turbo_agent/proxy/backend.py#L314-L325) |
 | 对观测与高影响动作统一使用 N | 文件读取、搜索等可恢复观测承担完整 BoN+PPT 延迟，在线体验和调用成本随工具步数线性放大。PRM 调度将经审计的 observation tools 固定为一个样本，并把 N 集中到终态、状态/控制提交、`write`/`exec` 与未知检查点。 | [论文 §4 的延迟预算调节](https://arxiv.org/html/2607.05391v2#S4)；[Appendix B.3 的 sampled actions per step](https://arxiv.org/html/2607.05391v2) |
 | 只在 session 或终态回答结束时触发在线验证 | 中间 `write`/`exec` 动作直接越过选择边界，coding-agent 修改质量失去过程级改进信号。每个高影响 PRM 检查点统一扩展与选择。 | [论文 Appendix B.3 PRM](https://arxiv.org/html/2607.05391v2)；[论文 §6 Coding Agent Extension](https://arxiv.org/html/2607.05391v2) |
 | 把插件检查点选择结果直接外推为论文 benchmark 提升 | 候选生成、检查点策略、轨迹长度、证据截断、模型和任务分布均影响外部效度。发布指标需使用本插件固定协议复测。 | [论文 §5 与 Appendix A，pp. 10–22、26](https://arxiv.org/pdf/2607.05391#page=10) |

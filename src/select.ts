@@ -1,7 +1,7 @@
 /** Single-task public API for Probabilistic Pivot Tournament selection. */
 
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { VerifierClient, USAGE, diffUsage, type UsageSnapshot } from "./client.ts";
+import { VerifierClient, TokenUsage, type UsageSnapshot } from "./client.ts";
 import {
   GROUND_TRUTH_NOTE,
   normalizeCriteria,
@@ -116,7 +116,7 @@ export async function select(
     seed: opts.seed,
     maxWorkers: opts.maxWorkers,
   });
-  const usageBefore = USAGE.snapshot();
+  const usage = new TokenUsage();
   const rng = mulberry32(seed);
   const ring = ringCycle(candidates.length, rng);
   // A no-logprobs rejection is a property of the shared request shape, so the
@@ -138,6 +138,7 @@ export async function select(
       progress: opts.progress,
       signal: opts.signal,
       unsupportedBreaker,
+      usage,
     },
   );
 
@@ -174,6 +175,7 @@ export async function select(
       signal: opts.signal,
       initialCache: scores,
       unsupportedBreaker,
+      usage,
     },
   );
   // Phase B was seeded with the phase-A cache, so its result already carries
@@ -209,6 +211,6 @@ export async function select(
     scoreSources,
     scoreDistribution,
     paperEquivalent,
-    usage: diffUsage(USAGE.snapshot(), usageBefore),
+    usage: usage.snapshot(),
   };
 }

@@ -8,8 +8,7 @@
 
 import {
   VerifierClient,
-  USAGE,
-  diffUsage,
+  TokenUsage,
   isVerifierLogprobsUnsupportedError,
   type UsageSnapshot,
 } from "./client.ts";
@@ -97,23 +96,29 @@ interface Job {
 // Image payloads are multi-megabyte base64 strings, and one selection hashes
 // the same trial images repeatedly (jobs, evidence summary, ring and pivot
 // accumulation each rebuild cache contexts). Trials keep stable array
-// references, so memoizing per reference keeps fingerprints bit-identical
-// while hashing each payload once per process.
-const imageFingerprintMemo = new WeakMap<readonly ImageContent[], string>();
+// references. Keep a value snapshot too: readonly does not stop a caller
+// from mutating the same array or image between selections.
+const imageFingerprintMemo = new WeakMap<readonly ImageContent[], {
+  fingerprint: string;
+  images: ImageContent[];
+}>();
 
 function imagesFingerprint(images: readonly ImageContent[] | undefined): string {
   if (!images || images.length === 0) return "";
   const memoized = imageFingerprintMemo.get(images);
-  if (memoized !== undefined) return memoized;
-  const fingerprint = stableFingerprint(
-    images.map((image) => ({
+  if (memoized && images.length === memoized.images.length && images.every((image, index) => {
+    const previous = memoized.images[index]!;
+    return image.type === previous.type && image.mimeType === previous.mimeType &&
+      image.detail === previous.detail && image.data === previous.data;
+  })) return memoized.fingerprint;
+  const snapshot = images.map((image) => ({
       type: image.type,
       mimeType: image.mimeType,
       detail: image.detail,
       data: image.data,
-    })),
-  );
-  imageFingerprintMemo.set(images, fingerprint);
+    }));
+  const fingerprint = stableFingerprint(snapshot);
+  imageFingerprintMemo.set(images, { fingerprint, images: snapshot });
   return fingerprint;
 }
 
@@ -359,6 +364,7 @@ export async function scoreDirectedPairs(
     initialCache?: ScoreCache;
     /** Shared across the ring and pivot phases of one selection. */
     unsupportedBreaker?: UnsupportedBreaker;
+    usage?: TokenUsage;
   } = {},
 ): Promise<ScoreCache> {
   validateTasks(tasks);
@@ -446,18 +452,27 @@ export async function scoreDirectedPairs(
     return available;
   }
 
-  const seenPrefixes = new Set<string>();
-  const warm: Job[] = [];
-  const rest: Job[] = [];
-  for (const job of jobs) {
-    if (seenPrefixes.has(job.prefix)) rest.push(job);
-    else {
-      seenPrefixes.add(job.prefix);
-      warm.push(job);
+  // Prefix-dependency scheduling: jobs sharing a provider prompt-cache prefix
+  // start only after that prefix's first request settles (a provider can serve
+  // a warm prefix only from a completed response), while unrelated prefixes
+  // never wait on each other. The previous two-barrier warm/rest split delayed
+  // every follower until ALL heads finished; per-head readiness keeps the same
+  // warming semantics with a shorter makespan.
+  const prefixHeads = new Map<string, number>();
+  const followersOfJob = new Array<number[]>(jobs.length);
+  const ready: number[] = [];
+  for (let index = 0; index < jobs.length; index += 1) {
+    const job = jobs[index]!;
+    const head = prefixHeads.get(job.prefix);
+    if (head === undefined) {
+      prefixHeads.set(job.prefix, index);
+      ready.push(index);
+    } else {
+      (followersOfJob[head] ??= []).push(index);
     }
   }
   log(
-    `  ${jobs.length} scoring jobs (${Object.keys(available).length} available); warming ${warm.length} prefixes`,
+    `  ${jobs.length} scoring jobs (${Object.keys(available).length} available); warming ${prefixHeads.size} prefixes`,
   );
 
   const results: ScoreCache = mergeCaches(available);
@@ -509,6 +524,7 @@ export async function scoreDirectedPairs(
       reply = await client.scoreReply(prompt, {
         signal: executionAbort.signal,
         images: job.images,
+        usage: opts.usage,
       });
       // One linear scan locates both score-tag distributions (the reference
       // reads <score_A> and <score_B> from the same reply).
@@ -584,69 +600,94 @@ export async function scoreDirectedPairs(
     cacheDirty = true;
   }
 
-  async function runPhase(phaseJobs: Job[]): Promise<void> {
-    if (phaseJobs.length === 0) return;
-    let next = 0;
-    const workers = Math.min(workersLimit, phaseJobs.length);
-    // Persist at most ~5 checkpoints per phase (plus the final save in the
-    // outer finally). The previous every-job checkpoint turned the wrapper's
-    // 24 scoring jobs into 24 synchronous lock+fsync disk rewrites per final
-    // answer; coarser checkpoints keep crash resilience without the storm.
-    const checkpoint = Math.max(4, Math.floor(phaseJobs.length / 20));
-    async function worker(): Promise<void> {
-      while (true) {
-        if (executionAbort.signal.aborted) return;
-        const index = next++;
-        if (index >= phaseJobs.length) return;
-        if (breaker.skip) {
-          // The verifier already confirmed it cannot return token logprobs for
-          // the shared request shape (every job sends identical scoring
-          // parameters). Turn this unstarted job into a neutral tie without a
-          // provider call; the tie stays in-memory and never reaches disk.
-          const job = phaseJobs[index]!;
-          if (!results[job.key]) {
-            results[job.key] = {
-              score_A: 0.5,
-              score_B: 0.5,
-              source_A: "neutral_tie",
-              source_B: "neutral_tie",
-            };
-            skipped += 1;
-          }
-          continue;
+  let cursor = 0;
+  let active = 0;
+  let pumping = false;
+  // Persist at most ~5 intermediate checkpoints per scoring run (plus the
+  // final save in the outer finally). The previous every-job checkpoint turned
+  // the wrapper's 24 scoring jobs into 24 synchronous lock+fsync disk rewrites
+  // per final answer; coarser checkpoints keep crash resilience without the
+  // storm, and a per-run bound stays stable while dependency waves interleave.
+  const checkpoint = Math.max(4, Math.ceil(jobs.length / 5));
+  let pump: () => void = () => {};
+
+  async function runJob(jobIndex: number): Promise<void> {
+    const job = jobs[jobIndex]!;
+    try {
+      if (breaker.skip) {
+        // The verifier already confirmed it cannot return token logprobs for
+        // the shared request shape (every job sends identical scoring
+        // parameters). Turn this unstarted job into a neutral tie without a
+        // provider call; the tie stays in-memory and never reaches disk.
+        if (!results[job.key]) {
+          results[job.key] = {
+            score_A: 0.5,
+            score_B: 0.5,
+            source_A: "neutral_tie",
+            source_B: "neutral_tie",
+          };
+          skipped += 1;
         }
-        try {
-          await scoreOne(phaseJobs[index]);
-          completed += 1;
-          // Same dirty-flag discipline as the final save: `cached` only grows
-          // through successful scoring, so with no durable writes since load
-          // the on-disk file already holds exactly this content and the
-          // lock+fsync rewrite would reproduce it byte for byte.
-          if (
-            cacheFile && cacheDirty &&
-            completed % checkpoint === 0 &&
-            Object.keys(cached).length > 0
-          ) {
-            saveCache(cacheFile, cached);
-          }
-        } catch (error) {
-          firstError ??= error;
-          abortExecution(firstError);
-          return;
-        }
+        return;
       }
+      try {
+        await scoreOne(job);
+        completed += 1;
+        // Same dirty-flag discipline as the final save: `cached` only grows
+        // through successful scoring, so with no durable writes since load
+        // the on-disk file already holds exactly this content and the
+        // lock+fsync rewrite would reproduce it byte for byte.
+        if (
+          cacheFile && cacheDirty &&
+          completed % checkpoint === 0
+        ) {
+          saveCache(cacheFile, cached);
+          cacheDirty = false;
+        }
+      } catch (error) {
+        firstError ??= error;
+        abortExecution(firstError);
+        return;
+      }
+    } finally {
+      const followers = followersOfJob[jobIndex];
+      if (followers) for (const follower of followers) ready.push(follower);
+      active -= 1;
+      pump();
     }
-    await Promise.allSettled(Array.from({ length: workers }, () => worker()));
-    if (firstError) throw firstError;
   }
 
   try {
     if (firstError) throw firstError;
-    await runPhase(warm);
-    await runPhase(rest);
+    await new Promise<void>((resolveRun, rejectRun) => {
+      const settle = (): void => {
+        if (active > 0) return;
+        if (cursor < ready.length && !executionAbort.signal.aborted) return;
+        if (firstError) rejectRun(firstError);
+        else resolveRun();
+      };
+      pump = (): void => {
+        // Skipped jobs settle synchronously; let the current loop drain them
+        // instead of recursively re-entering the scheduler for every job.
+        if (pumping) return;
+        pumping = true;
+        while (
+          !executionAbort.signal.aborted &&
+          active < workersLimit &&
+          cursor < ready.length
+        ) {
+          const jobIndex = ready[cursor++]!;
+          active += 1;
+          void runJob(jobIndex);
+        }
+        pumping = false;
+        settle();
+      };
+      pump();
+    });
   } finally {
     externalAbort?.removeEventListener("abort", onExternalAbort);
-    if (cacheFile && cacheDirty && Object.keys(cached).length > 0) saveCache(cacheFile, cached);
+    if (cacheFile && cacheDirty) saveCache(cacheFile, cached);
   }
   log(`  Done (${errors} errors, ${skipped} skipped)`);
   return results;
@@ -694,7 +735,7 @@ export async function runBenchmark(
     throw new Error("runBenchmark requires a verifier client for the OMP default model.");
   }
   const criteriaIds = criteria.map((criterion) => criterion.id);
-  const usageBefore = USAGE.snapshot();
+  const usage = new TokenUsage();
   const { allPass, swing } = classify(tasks);
   const nTasks = Object.keys(tasks).length;
   const nRuns = Math.max(...Object.values(tasks).map((trials) => trials.length));
@@ -722,7 +763,7 @@ export async function runBenchmark(
     nReps,
     maxWorkers,
     opts.cacheFile,
-    { ...opts, unsupportedBreaker },
+    { ...opts, unsupportedBreaker, usage },
   );
 
   const directed = (scoreCache: ScoreCache, taskName: string, a: number, b: number): [number, number] =>
@@ -759,7 +800,7 @@ export async function runBenchmark(
     nReps,
     maxWorkers,
     opts.cacheFile,
-    { ...opts, initialCache: scores, unsupportedBreaker },
+    { ...opts, initialCache: scores, unsupportedBreaker, usage },
   );
   // Phase B was seeded with the phase-A cache, so its result already carries
   // every ring score.
@@ -825,7 +866,7 @@ export async function runBenchmark(
     avgComparisons: totalComparisons / Math.max(1, swing.length),
     totalComparisons,
     ...scoreEvidence,
-    usage: diffUsage(USAGE.snapshot(), usageBefore),
+    usage: usage.snapshot(),
     bestPerTask,
   };
 }
